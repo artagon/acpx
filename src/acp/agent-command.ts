@@ -6,6 +6,11 @@ import {
   resolveWindowsExecutablePath,
 } from "../spawn-command-options.js";
 import { type AcpClientOptions } from "../types.js";
+import {
+  fingerprintExecutable,
+  readCachedCapability,
+  writeCachedCapability,
+} from "./capability-cache.js";
 import { basenameToken, splitCommandLine } from "./client-process.js";
 
 const DEFAULT_AGENT_CLOSE_AFTER_STDIN_END_MS = 100;
@@ -288,13 +293,39 @@ async function buildCopilotAcpUnsupportedMessage(command: string): Promise<strin
   return parts.join(" ");
 }
 
+const COPILOT_ACP_CAPABILITY_KEY = "copilot.acp-stdio";
+
 export async function ensureCopilotAcpSupport(command: string): Promise<void> {
-  const helpOutput = await readCommandOutput(command, ["--help"], COPILOT_HELP_TIMEOUT_MS);
-  if (typeof helpOutput === "string" && !helpOutput.includes("--acp")) {
-    throw new CopilotAcpUnsupportedError(await buildCopilotAcpUnsupportedMessage(command), {
-      retryable: false,
-    });
+  // `copilot --help` costs a whole extra process (~380ms measured) for an
+  // answer that only changes when the binary does, so it is cached against a
+  // fingerprint of that binary.
+  const fingerprint = await fingerprintExecutable(command);
+  const cached = await readCachedCapability(COPILOT_ACP_CAPABILITY_KEY, fingerprint);
+  if (cached === true) {
+    return;
   }
+
+  if (cached === undefined) {
+    const helpOutput = await readCommandOutput(command, ["--help"], COPILOT_HELP_TIMEOUT_MS);
+    // Only a definite answer is cacheable: a timeout or spawn failure yields a
+    // non-string result, which must not be recorded as "supported".
+    if (typeof helpOutput === "string") {
+      await writeCachedCapability(
+        COPILOT_ACP_CAPABILITY_KEY,
+        fingerprint,
+        helpOutput.includes("--acp"),
+      );
+      if (helpOutput.includes("--acp")) {
+        return;
+      }
+    } else {
+      return;
+    }
+  }
+
+  throw new CopilotAcpUnsupportedError(await buildCopilotAcpUnsupportedMessage(command), {
+    retryable: false,
+  });
 }
 
 export function buildClaudeCodeOptionsMeta(

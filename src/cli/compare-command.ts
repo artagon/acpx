@@ -10,7 +10,10 @@ import {
   PromptInputValidationError,
   textPrompt,
 } from "../prompt-content.js";
-import { runOnce } from "../session/session.js";
+// Type-only: the value is imported at the call site so the ACP SDK stays out of
+// the eager startup graph. This edge is part of a three-edge cut set — see also
+// src/cli/flags.ts and src/cli/queue/owner-env.ts.
+import type { runOnce } from "../session/session.js";
 import type {
   AcpJsonRpcMessage,
   OutputErrorAcpPayload,
@@ -356,6 +359,7 @@ async function runAgentForCompare(params: {
 
   try {
     const agent = resolveAgentInvocation(params.agentName, params.globalFlags, params.config);
+    const { runOnce } = await import("../session/session.js");
     const result = await runOnce({
       agentCommand: agent.agentCommand,
       cwd: agent.cwd,
