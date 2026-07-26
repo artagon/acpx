@@ -9,7 +9,10 @@ name: Release binaries
 # repository or dependency code. `build` runs that code with read-only
 # permissions and no OIDC. `attest` holds the signing identity but runs no repo
 # code at all — no checkout, no install — and signs only bytes it downloaded.
-# `publish` writes the release and never touches OIDC.
+# `publish` writes the release and never touches OIDC. The same split repeats
+# for the Homebrew formula: `formula` renders it from the immutable tag with
+# read-only permissions, and `formula-pr` holds the contents-write credential
+# while executing no repository code.
 #
 # Release shape: this repository has immutable releases enabled, so assets and
 # the Git tag are frozen the moment a release is published. Assets are therefore
@@ -79,7 +82,12 @@ jobs:
             process.exit(1);
           }
 
-          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          // From the tagged commit, not the checkout: on workflow_dispatch the
+          // checkout is the dispatch branch, whose package.json can disagree
+          // with the tag being released.
+          const pkg = JSON.parse(
+            execFileSync("git", ["show", `${tag}:package.json`], { encoding: "utf8" }),
+          );
           if (tag !== `v${pkg.version}`) {
             console.error(`Tag ${tag} does not match package.json version ${pkg.version}.`);
             process.exit(1);
@@ -371,30 +379,24 @@ jobs:
           gh release edit "$TAG" --draft=false
           echo "Published $TAG; assets and tag are now immutable."
 
+  # The formula pipeline mirrors the build/attest split above: `formula`
+  # executes the repository's generator script, so it gets no write credential;
+  # `formula-pr` holds the write credential, so it executes no repository code
+  # at all — it commits bytes it downloaded from the render job.
   formula:
-    name: Update Homebrew formula
+    name: Render Homebrew formula
     needs: publish
     runs-on: ubuntu-24.04
-    # Writes a branch and opens a PR; requires "Allow GitHub Actions to create
-    # and approve pull requests" in the repository's Actions settings.
-    #
-    # Trust model: this job holds a contents-write token, so it runs only
-    # committed repository scripts — no dependency install, no freshly built
-    # code. The generator reads the checksum manifest of the now-immutable
-    # release and the npm registry tarball, both fetched over TLS from their
-    # canonical origins.
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # main, not the tag: the formula PR targets main, and the generator
-          # script that runs here is the reviewed one on main.
-          ref: main
-          # The push below authenticates with this credential. Acceptable here
-          # only because the job executes no third-party or built code.
-          persist-credentials: true
+          # The validated tag, not main: the gate proved this ref is on main
+          # and matches the released version, and it cannot move afterwards —
+          # a branch checkout would run whatever landed on main since.
+          ref: ${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -452,6 +454,43 @@ jobs:
             --version "${TAG#v}" \
             --npm-sha256 "$NPM_SHA256" \
             --sums "${RUNNER_TEMP}/SHA256SUMS"
+          # The bot PR is created by GITHUB_TOKEN, so CI does not run on it and
+          # a syntax error would otherwise surface only at merge review. Ruby is
+          # on the runner image; a full `brew audit` is not available on Linux.
+          ruby -c Formula/acpx.rb
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: formula
+          path: Formula/acpx.rb
+          if-no-files-found: error
+
+  formula-pr:
+    name: Propose formula update
+    needs: formula
+    runs-on: ubuntu-24.04
+    # Writes a branch and opens a PR; requires "Allow GitHub Actions to create
+    # and approve pull requests" in the repository's Actions settings.
+    #
+    # This job holds the write credential, so it runs no repository code: the
+    # checkout is only a git work tree for the commit below, and every command
+    # is an inline git/gh invocation. The formula bytes come exclusively from
+    # the render job's artifact.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR targets main, so the branch forks from it. Nothing from this
+          # checkout is executed.
+          ref: main
+          persist-credentials: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formula
+          path: Formula
 
       - name: Open a pull request
         env:
@@ -475,9 +514,10 @@ jobs:
           git push --force origin "$branch"
           # A PR rather than a direct push: the formula names the bytes every
           # brew user installs, so it goes through the same review path as any
-          # other change to main.
+          # other change to main. Note: PRs created with GITHUB_TOKEN get no CI
+          # runs — the render job's checks stand in; review before merging.
           if ! gh pr view "$branch" >/dev/null 2>&1; then
             gh pr create \
               --title "chore(brew): point the formula at $TAG" \
-              --body "$(printf 'Regenerated by the formula job of release-binaries.yml from the %s release assets and npm tarball.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$TAG")"
+              --body "$(printf 'Regenerated by the formula jobs of release-binaries.yml from the %s release assets and the attestation-verified npm tarball.\n\nNote: bot PRs from GITHUB_TOKEN do not trigger CI; the render job syntax-checked the formula.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$TAG")"
           fi

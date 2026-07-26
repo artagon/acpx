@@ -72,6 +72,9 @@ for (const line of fs.readFileSync(sumsPath, "utf8").split("\n")) {
   if (!SLOTS.includes(asset[2])) {
     throw new Error(`Tarball "${name}" names unknown target "${asset[2]}".`);
   }
+  if (shaByTarget.has(asset[2])) {
+    throw new Error(`Duplicate tarball for target "${asset[2]}"; refusing to pick one silently.`);
+  }
   shaByTarget.set(asset[2], sha);
 }
 
