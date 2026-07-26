@@ -2,6 +2,7 @@ import { AcpClient, type SessionCreateResult } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { modelStateFromConfigOptions } from "../../acp/model-support.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
+import { measurePerf } from "../../perf-metrics.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
@@ -242,23 +243,31 @@ export async function listAgentSessions(options: SessionListOptions): Promise<Se
     authPolicy: options.authPolicy,
     terminal: options.terminal,
     verbose: options.verbose,
+    // Listing is read-only and single-shot: the agent holds nothing that needs
+    // flushing, so do not wait out the full SIGTERM grace for adapters that
+    // ignore stdin-end (measured at ~1.6s teardown for copilot).
+    fastTeardown: true,
   });
 
   try {
     return await withInterrupt(
       async () => {
-        await withTimeout(client.start(), options.timeoutMs);
+        await measurePerf("sessions.list.client_start", () =>
+          withTimeout(client.start(), options.timeoutMs),
+        );
         if (!client.supportsListSessions()) {
           return undefined;
         }
 
         const cwd = options.filterCwd ? absolutePath(options.filterCwd) : undefined;
-        const response = await withTimeout(
-          client.listSessions({
-            ...(cwd ? { cwd } : {}),
-            ...(options.cursor ? { cursor: options.cursor } : {}),
-          }),
-          options.timeoutMs,
+        const response = await measurePerf("sessions.list.rpc", () =>
+          withTimeout(
+            client.listSessions({
+              ...(cwd ? { cwd } : {}),
+              ...(options.cursor ? { cursor: options.cursor } : {}),
+            }),
+            options.timeoutMs,
+          ),
         );
 
         return {
@@ -275,7 +284,7 @@ export async function listAgentSessions(options: SessionListOptions): Promise<Se
       },
     );
   } finally {
-    await client.close();
+    await measurePerf("sessions.list.close", () => client.close());
   }
 }
 

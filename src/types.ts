@@ -212,6 +212,14 @@ export type AcpClientOptions = {
   terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
+  /**
+   * Shorten the shutdown grace ladder. Only safe for read-only, single-shot
+   * operations (e.g. `sessions list`) where the agent holds no state worth
+   * flushing: adapters that ignore stdin-end otherwise cost the full SIGTERM
+   * grace on every invocation. Escalation to SIGKILL is unchanged, so the child
+   * is still reaped either way.
+   */
+  fastTeardown?: boolean;
   sessionOptions?: {
     model?: string;
     allowedTools?: string[];
