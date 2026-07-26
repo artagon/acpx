@@ -10,6 +10,7 @@ const outDir = path.join(repoRoot, "dist-sea");
 const bundlePath = path.join(outDir, "entry.cjs");
 const blobPath = path.join(outDir, "acpx-sea.blob");
 const binaryPath = path.join(outDir, "acpx");
+const sbomPath = path.join(outDir, "sbom.json");
 
 // Matches the fuse string Node compiles into its own binary.
 const SENTINEL_FUSE = "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2";
@@ -58,6 +59,20 @@ run("pnpm", ["exec", "tsdown", "-c", path.join(here, "tsdown.sea.config.ts")]);
 
 fs.writeFileSync(bundlePath, CJS_WRAPPER_SHIM + fs.readFileSync(bundlePath, "utf8"));
 
+/**
+ * The SBOM is emitted by rollup-plugin-sbom during the bundle above, from the
+ * bundler's own module graph. Assert it landed: a plugin that silently stopped
+ * running would leave the release attesting an SBOM from a previous build, or
+ * publishing none at all while the job stayed green.
+ */
+if (!fs.existsSync(sbomPath)) {
+  throw new Error(`${sbomPath} was not emitted; rollup-plugin-sbom did not run.`);
+}
+const sbomComponents = JSON.parse(fs.readFileSync(sbomPath, "utf8")).components ?? [];
+if (sbomComponents.length === 0) {
+  throw new Error(`${sbomPath} lists no components; the SBOM describes nothing.`);
+}
+
 run(seaNode, ["--experimental-sea-config", path.join(here, "sea-config.json")]);
 
 // Inject the blob into a copy of the host Node binary.
@@ -103,4 +118,6 @@ if (reported !== expectedVersion) {
   );
 }
 
-process.stdout.write(`\nBuilt ${binaryPath} (verified acpx ${reported})\n`);
+process.stdout.write(
+  `\nBuilt ${binaryPath} (verified acpx ${reported}, SBOM lists ${sbomComponents.length} components)\n`,
+);

@@ -90,6 +90,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@cyclonedx/cyclonedx-library": "10.1.0",
     "@stryker-mutator/core": "^9.6.1",
     "@types/node": "^26.1.1",
     "@types/react": "^19.2.17",
@@ -108,10 +109,12 @@
     "oxfmt": "^0.60.0",
     "oxlint": "^1.75.0",
     "oxlint-tsgolint": "^7.0.2001",
+    "packageurl-js": "2.0.1",
     "postject": "1.0.0-alpha.6",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-test-renderer": "^19.2.8",
+    "rollup-plugin-sbom": "4.0.0",
     "tsdown": "^0.22.14",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "vite": "^8.1.5",
