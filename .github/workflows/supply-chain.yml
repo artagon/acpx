@@ -1,16 +1,18 @@
 name: Supply chain
 
-# Repo-level supply-chain checks that are cheap enough to run on every change.
-# Release-artifact provenance and SBOM attestation live in
-# release-binaries.yml, next to the artifacts they describe.
+# Repo-level supply-chain checks. Release-artifact provenance lives in
+# release-binaries.yml, next to the artifacts it describes.
+#
+# This repository is a public fork, so anyone can open a pull request. Every job
+# here is written on the assumption that PR content is hostile.
 
 on:
   push:
     branches: [main]
   pull_request:
   schedule:
-    # Scorecard's findings drift as GitHub settings and dependencies change, so
-    # it is scheduled rather than only run on push.
+    # Scorecard's findings drift with repo settings and dependencies, so it runs
+    # on a schedule rather than only on push.
     - cron: "27 4 * * 1"
 
 permissions:
@@ -18,49 +20,22 @@ permissions:
 
 env:
   PNPM_VERSION: 10.33.2
+  NODE_VERSION: 24.11.0
 
 jobs:
-  dependency-review:
-    name: Dependency review
-    # Only meaningful on a pull request: it diffs the manifest against the base.
-    if: github.event_name == 'pull_request'
+  policy:
+    name: Policy invariants
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
-          # Fail on known-vulnerable additions rather than only reporting them.
-          fail-on-severity: high
-          # Copyleft licences would change acpx's distribution terms, and the
-          # single executable ships every dependency inside one binary.
-          deny-licenses: AGPL-3.0, GPL-3.0
+          persist-credentials: false
 
-  audit:
-    name: Dependency audit
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-        with:
-          version: ${{ env.PNPM_VERSION }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-
-      - name: Audit production dependencies
-        # Production only: a dev-tool advisory does not ship to users, and
-        # failing the build on one trains people to ignore this job.
-        run: pnpm audit --prod --audit-level high
-
-      - name: Assert the release-age guard is still in force
+      # Runs before anything installs. A guard that fires after the install it
+      # protects is decorative.
+      - name: Release-age guard is still in force
         run: |
           set -euo pipefail
-          # minimumReleaseAge is the repo's defence against a compromised
-          # just-published version being pulled straight into a build. If it is
-          # ever removed, that should be a deliberate, reviewed change rather
-          # than a silent one.
           node - <<'NODE'
           const { readFileSync } = require("node:fs");
           const workspace = readFileSync("pnpm-workspace.yaml", "utf8");
@@ -77,24 +52,118 @@ jobs:
           console.log(`minimumReleaseAge = ${minutes} minutes.`);
           NODE
 
+      - name: Build tools are lockfile-pinned
+        run: |
+          set -euo pipefail
+          # npx / pnpm dlx resolve from the registry at run time and bypass both
+          # the lockfile and minimumReleaseAge. In scripts/sea/** that would
+          # hand an unpinned download write access to the released binary.
+          if grep -rn --include='*.mjs' --include='*.ts' --include='*.js' -E '\b(npx|pnpm dlx)\b' scripts/; then
+            echo "::error::Use 'pnpm exec' so build tooling resolves from the lockfile."
+            exit 1
+          fi
+          node - <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          const dev = pkg.devDependencies ?? {};
+          for (const tool of ["postject", "tsdown"]) {
+            if (!dev[tool]) {
+              console.error(`${tool} must be a pinned devDependency; it writes the released binary.`);
+              process.exit(1);
+            }
+          }
+          console.log("Build tooling is declared.");
+          NODE
+
+      - name: Action pins match their version comments
+        run: |
+          set -euo pipefail
+          # A pin that names a tag object rather than a commit fails to resolve;
+          # a pin that names an unrelated commit resolves to unintended code.
+          # Both have happened here.
+          fail=0
+          while IFS= read -r line; do
+            ref="${line#*uses: }"
+            action="${ref%%@*}"; rest="${ref#*@}"
+            sha="${rest%% *}"; tag="${rest##*# }"
+            [ "$sha" = "$rest" ] && continue
+            repo="$(cut -d/ -f1,2 <<<"$action")"
+            actual="$(gh api "repos/${repo}/commits/${sha}" --jq .sha 2>/dev/null || true)"
+            if [ -z "$actual" ]; then
+              echo "::error::${repo}@${sha} (${tag}) is not a commit in that repository."
+              fail=1
+            fi
+          done < <(grep -rhoE 'uses: [^@]+@[0-9a-f]{40} # \S+' .github/workflows/)
+          exit "$fail"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  dependency-review:
+    name: Dependency review
+    # Diffs the manifest against the base, so only meaningful on a PR.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Advisory-database matching only. It will not catch a deliberately
+          # malicious package, which is the real threat to a distributed binary.
+          fail-on-severity: high
+          # Copyleft terms would change acpx's distribution terms, and the
+          # single executable ships every dependency inside one file.
+          deny-licenses: AGPL-3.0, GPL-3.0
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # --ignore-scripts is load-bearing, not hygiene. --frozen-lockfile
+      # constrains the dependency graph but not `scripts`; package.json declares
+      # a root `prepare` hook, so without this a fork PR gets code execution on
+      # a runner simply by opening the PR.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Audit production dependencies
+        # Production only: a dev-tool advisory does not reach users, and failing
+        # the build on one trains people to ignore this job.
+        run: pnpm audit --prod --audit-level high
+
   scorecard:
     name: OpenSSF Scorecard
+    # Never on pull_request: fork tokens are read-only so upload-sarif cannot
+    # work, and Scorecard rates repo-wide posture rather than the diff.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       security-events: write
-      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # No id-token: that is only needed for publish_results, which is off.
       - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
         with:
           results_file: scorecard.sarif
           results_format: sarif
           publish_results: false
 
-      - uses: github/codeql-action/upload-sarif@e34fc2711fb7964ca6850c8a8382121f34745f3b # v4.32.4
+      - uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:
           sarif_file: scorecard.sarif

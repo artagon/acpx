@@ -2,9 +2,13 @@ name: Release binaries
 
 # Builds the single-executable artifacts consumed by Formula/acpx.rb.
 #
-# Deliberately separate from release.yml: that workflow publishes the npm
-# package with provenance and asserts upstream metadata, so it must not be
-# entangled with binary packaging. This one only produces release assets.
+# Separate from release.yml, which publishes the npm package with provenance
+# and asserts upstream metadata; binary packaging must not be entangled with it.
+#
+# Trust model: the signing identity is kept away from every step that executes
+# repository or dependency code. The build job runs that code with read-only
+# permissions and no OIDC; a later job that runs no repo code at all downloads
+# the artifact and attests the exact bytes it publishes.
 
 on:
   push:
@@ -17,21 +21,78 @@ on:
         required: true
 
 concurrency:
-  group: release-binaries-${{ github.ref }}
+  # Keyed on the tag, not github.ref: on workflow_dispatch github.ref is the
+  # dispatch branch, so a tag-push run and a dispatch run for the same tag would
+  # otherwise land in different groups and race each other's uploads.
+  group: release-binaries-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   PNPM_VERSION: 10.33.2
+  # Pinned exactly. The shipped binary *is* this Node build with a blob injected,
+  # so a floating version silently changes the release's largest attack surface
+  # (V8, OpenSSL, zlib) and makes builds non-reproducible.
+  NODE_VERSION: 24.11.0
 
 jobs:
+  gate:
+    name: Validate tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag shape, version match, and ancestry
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Mirrors release.yml's gate. Without it a tag pointing at an
+          # unreviewed commit — including a fork PR head, which is reachable in
+          # this repo's object network — would produce a signed, published
+          # binary that never existed on main.
+          git fetch --no-tags origin main --depth=1
+
+          node - <<'NODE'
+          const { execFileSync } = require("node:child_process");
+          const { readFileSync } = require("node:fs");
+
+          const tag = process.env.RELEASE_TAG ?? "";
+          if (!/^v\d+\.\d+\.\d+$/.test(tag)) {
+            console.error(`Release tags must match vX.Y.Z; received ${tag || "<missing>"}.`);
+            process.exit(1);
+          }
+
+          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          if (tag !== `v${pkg.version}`) {
+            console.error(`Tag ${tag} does not match package.json version ${pkg.version}.`);
+            process.exit(1);
+          }
+
+          const sha = execFileSync("git", ["rev-list", "-n", "1", tag], { encoding: "utf8" }).trim();
+          try {
+            execFileSync("git", ["merge-base", "--is-ancestor", sha, "origin/main"], { stdio: "ignore" });
+          } catch {
+            console.error(`Tagged commit ${sha} is not contained in origin/main.`);
+            process.exit(1);
+          }
+          console.log(`${tag} validated.`);
+          NODE
+
   build:
     name: ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.runner }}
+    # Read-only, and deliberately no id-token: this job runs pnpm install,
+    # the bundler, and the freshly built binary. Granting it OIDC would let any
+    # of that code mint provenance for bytes this workflow never produced.
     permissions:
       contents: read
-      # Required to mint Sigstore-backed provenance and SBOM attestations.
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -48,20 +109,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: ${{ env.PNPM_VERSION }}
 
-      # Must be an official nodejs.org build. Single-executable support is
-      # compiled out of Homebrew's node and some distro builds;
-      # scripts/sea/build.mjs fails fast with an explanatory message when the
-      # chosen Node cannot produce a SEA.
+      # Must be an official nodejs.org build: single-executable support is
+      # compiled out of Homebrew's node and some distro builds. No pnpm cache
+      # here — a signed release should not restore a mutable, multi-writer cache.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
-          check-latest: true
-          cache: pnpm
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
@@ -73,6 +133,13 @@ jobs:
         run: |
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
+          # Validate before use: node -p prints the raw string, so an embedded
+          # newline would write extra key=value pairs into $GITHUB_OUTPUT and
+          # forge step outputs consumed as action inputs below.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Refusing to package malformed version '$version'."
+            exit 1
+          fi
           asset="acpx-${version}-${{ matrix.target }}.tar.gz"
           mkdir -p dist-sea/pkg
           cp dist-sea/acpx dist-sea/pkg/acpx
@@ -85,19 +152,16 @@ jobs:
           ASSET: ${{ steps.package.outputs.asset }}
         run: |
           set -euo pipefail
-          # Verify the TARBALL, not dist-sea/acpx: that is what users install,
-          # and packaging is itself a step that can go wrong.
+          # Verify the TARBALL: that is what users install, and packaging is
+          # itself a step that can fail.
           #
           # Assert the reported version, never just the exit code. A failed
-          # injection leaves a plain Node copy that starts fine, exits 0, and
-          # answers --version with Node's version. That artifact has shipped
-          # once already because this check only looked at the exit status.
+          # injection leaves a plain Node copy that starts, exits 0, and answers
+          # --version with Node's version. That artifact shipped once because
+          # this check only looked at the exit status.
           expected="$(node -p "require('./package.json').version")"
           workdir="$(mktemp -d)"
           tar -xzf "dist-sea/${ASSET}" -C "$workdir"
-
-          # Scrubbed environment: a SEA that quietly needs an ambient Node would
-          # defeat the reason for shipping a ~122MB artifact.
           reported="$(env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --version)"
           if [ "$reported" != "$expected" ]; then
             echo "::error::Artifact reported '$reported', expected '$expected' — the SEA blob was not injected."
@@ -106,43 +170,22 @@ jobs:
           env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --help > /dev/null
           echo "Verified acpx $reported"
 
-      # SBOM is generated from the source tree, not the binary: the SEA bundles
-      # every dependency into one file, so scanning the artifact alone would
-      # report a single opaque blob and lose the dependency graph that makes an
-      # SBOM useful for vulnerability matching.
-      - name: Generate SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          path: .
-          format: spdx-json
-          artifact-name: acpx-${{ matrix.target }}.spdx.json
-          output-file: dist-sea/acpx-${{ matrix.target }}.spdx.json
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: dist-sea/${{ steps.package.outputs.asset }}
-
-      - name: Attest SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
-        with:
-          subject-path: dist-sea/${{ steps.package.outputs.asset }}
-          sbom-path: dist-sea/acpx-${{ matrix.target }}.spdx.json
-
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
-          path: |
-            dist-sea/${{ steps.package.outputs.asset }}
-            dist-sea/acpx-${{ matrix.target }}.spdx.json
+          path: dist-sea/${{ steps.package.outputs.asset }}
           if-no-files-found: error
 
   publish:
-    name: Attach assets
+    name: Attest and publish
     needs: build
     runs-on: ubuntu-24.04
+    # This job holds the signing identity, so it must run no repository code:
+    # no checkout, no install, no build. It only moves bytes it downloaded.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -153,12 +196,19 @@ jobs:
         run: |
           set -euo pipefail
           cd assets
-          # Single signed-adjacent manifest so a consumer can verify every asset
-          # with one file rather than transcribing hashes per platform.
           shasum -a 256 *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Attach to release
+      # Attest the exact bytes about to be uploaded, in the same job, so there
+      # is no gap between what was signed and what ships.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            assets/*.tar.gz
+            assets/SHA256SUMS
+
+      - name: Publish assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -166,7 +216,19 @@ jobs:
         run: |
           set -euo pipefail
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
-          gh release upload "$TAG" assets/*.tar.gz assets/*.spdx.json assets/SHA256SUMS --clobber
+
+          # No --clobber. Replacing an asset of an already-published release
+          # would silently swap bytes users may already have verified; a failed
+          # upload is the correct outcome, and re-releasing is a deliberate act.
+          existing="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          for file in assets/*.tar.gz assets/SHA256SUMS; do
+            name="$(basename "$file")"
+            if grep -Fxq "$name" <<<"$existing"; then
+              echo "::error::$name already exists on $TAG. Cut a new version instead of replacing a published asset."
+              exit 1
+            fi
+          done
+          gh release upload "$TAG" assets/*.tar.gz assets/SHA256SUMS
 
       - name: Formula checksums
         run: |
