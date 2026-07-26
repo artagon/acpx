@@ -9,29 +9,19 @@ class Acpx < Formula
   # dependency on a system Node install and startup is ~50ms versus ~77ms for
   # the npm package.
   #
-  # Release assets are produced by `pnpm run sea` on each target; see
-  # docs/packaging.md. Homebrew's own node is built without single-executable
-  # support and cannot produce them, which is why this formula ships a
-  # prebuilt binary rather than building from source.
+  # Assets are built by .github/workflows/release.yml (`pnpm run sea` per
+  # target) and attached to the tagged release. Homebrew's own node is compiled
+  # without single-executable support and cannot build them, which is why this
+  # formula ships prebuilt binaries rather than building from source.
+  #
+  # Only the platforms with a published asset are listed. Adding a url/sha256
+  # pair for a platform whose asset does not exist turns a clear "unsupported"
+  # message into a download failure, so new platforms are added by the release
+  # workflow, not by hand.
   on_macos do
     on_arm do
       url "https://github.com/artagon/acpx/releases/download/v0.12.0/acpx-0.12.0-darwin-arm64.tar.gz"
-      sha256 "REPLACE_ON_RELEASE"
-    end
-    on_intel do
-      url "https://github.com/artagon/acpx/releases/download/v0.12.0/acpx-0.12.0-darwin-x64.tar.gz"
-      sha256 "REPLACE_ON_RELEASE"
-    end
-  end
-
-  on_linux do
-    on_arm do
-      url "https://github.com/artagon/acpx/releases/download/v0.12.0/acpx-0.12.0-linux-arm64.tar.gz"
-      sha256 "REPLACE_ON_RELEASE"
-    end
-    on_intel do
-      url "https://github.com/artagon/acpx/releases/download/v0.12.0/acpx-0.12.0-linux-x64.tar.gz"
-      sha256 "REPLACE_ON_RELEASE"
+      sha256 "a1da90a25d5e92b6d0060984eda066836556a72f573697fd5a30d86e4f2d445a"
     end
   end
 
@@ -42,9 +32,8 @@ class Acpx < Formula
   test do
     assert_match version.to_s, shell_output("#{bin}/acpx --version")
 
-    # The CLI must answer without a system Node on PATH — that is the whole
-    # point of shipping a single executable.
-    ENV.delete("NODE")
+    # The binary must answer without a system Node on PATH — that is the
+    # property that justifies shipping a ~122MB single executable.
     assert_match "Usage", shell_output("#{bin}/acpx --help")
   end
 end
