@@ -9,10 +9,14 @@ class Acpx < Formula
   # dependency on a system Node install and startup is ~50ms versus ~77ms for
   # the npm package.
   #
-  # Assets are built by .github/workflows/release.yml (`pnpm run sea` per
-  # target) and attached to the tagged release. Homebrew's own node is compiled
-  # without single-executable support and cannot build them, which is why this
-  # formula ships prebuilt binaries rather than building from source.
+  # Assets are built by .github/workflows/release-binaries.yml (`pnpm run sea`
+  # per target) and attached to the tagged release. Homebrew's own node is
+  # compiled without single-executable support and cannot build them, which is
+  # why this formula ships prebuilt binaries rather than building from source.
+  #
+  # Every asset carries build-provenance and SBOM attestations, and releases are
+  # immutable, so the sha256 below pins bytes that cannot be replaced upstream.
+  # See docs/verifying-releases.md.
   #
   # Only the platforms with a published asset are listed. Adding a url/sha256
   # pair for a platform whose asset does not exist turns a clear "unsupported"
