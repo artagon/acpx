@@ -121,7 +121,9 @@ jobs:
         include:
           - runner: macos-14
             target: darwin-arm64
-          - runner: macos-13
+          # macos-13 was the last plain Intel label but is retired; the -intel
+          # variants are the supported Intel images.
+          - runner: macos-15-intel
             target: darwin-x64
           - runner: ubuntu-24.04
             target: linux-x64
@@ -324,7 +326,7 @@ jobs:
           # A convenience index only. Each tarball carries its own provenance and
           # SBOM attestation, so `gh attestation verify` — not this file — is the
           # integrity mechanism.
-          shasum -a 256 *.tar.gz *.cdx.json > SHA256SUMS
+          shasum -a 256 -- *.tar.gz *.cdx.json > SHA256SUMS
           cat SHA256SUMS
 
       - name: Attach assets to a draft, then publish
@@ -364,9 +366,106 @@ jobs:
           gh release edit "$TAG" --draft=false
           echo "Published $TAG; assets and tag are now immutable."
 
-      - name: Formula checksums
+  formula:
+    name: Update Homebrew formula
+    needs: publish
+    runs-on: ubuntu-24.04
+    # Writes a branch and opens a PR; requires "Allow GitHub Actions to create
+    # and approve pull requests" in the repository's Actions settings.
+    #
+    # Trust model: this job holds a contents-write token, so it runs only
+    # committed repository scripts — no dependency install, no freshly built
+    # code. The generator reads the checksum manifest of the now-immutable
+    # release and the npm registry tarball, both fetched over TLS from their
+    # canonical origins.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # main, not the tag: the formula PR targets main, and the generator
+          # script that runs here is the reviewed one on main.
+          ref: main
+          # The push below authenticates with this credential. Acceptable here
+          # only because the job executes no third-party or built code.
+          persist-credentials: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+
+      - name: Fetch the release checksum manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          # Paste into Formula/acpx.rb. A stale checksum makes `brew install`
-          # fail loudly instead of installing a wrong artifact.
-          grep 'tar\.gz$' assets/SHA256SUMS
+          # From the published release, not the build artifacts: the release is
+          # immutable, so this is the manifest users can verify against.
+          gh release download "$TAG" --pattern SHA256SUMS --dir "${RUNNER_TEMP}"
+
+      - name: Wait for the npm tarball and record its checksum
+        id: npm
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # release.yml publishes the npm package in a parallel workflow, so the
+          # tarball may lag this job by a few minutes. Fail after ~10 minutes:
+          # a formula whose fallback URL 404s must not be proposed.
+          for _ in $(seq 1 30); do
+            if curl -fsSL -o "${RUNNER_TEMP}/acpx.tgz" \
+              "https://registry.npmjs.org/acpx/-/acpx-${version}.tgz"; then
+              sha="$(sha256sum "${RUNNER_TEMP}/acpx.tgz" | cut -d' ' -f1)"
+              echo "sha256=${sha}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "npm tarball for ${version} not available yet; retrying in 20s."
+            sleep 20
+          done
+          echo "::error::acpx@${version} never appeared on the npm registry."
+          exit 1
+
+      - name: Regenerate the formula
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          NPM_SHA256: ${{ steps.npm.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          node scripts/sea/generate-formula.mjs \
+            --version "${TAG#v}" \
+            --npm-sha256 "$NPM_SHA256" \
+            --sums "${RUNNER_TEMP}/SHA256SUMS"
+
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/acpx.rb; then
+            echo "Formula already matches $TAG; nothing to propose."
+            exit 0
+          fi
+          branch="bot/homebrew-formula-${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Formula/acpx.rb
+          git commit -m "chore(brew): point the formula at $TAG"
+          # Plain --force: a fresh clone has no remote-tracking ref for the bot
+          # branch, so --force-with-lease would reject every re-run. The branch
+          # is namespaced to this job and carries generated content only.
+          git push --force origin "$branch"
+          # A PR rather than a direct push: the formula names the bytes every
+          # brew user installs, so it goes through the same review path as any
+          # other change to main.
+          if ! gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr create \
+              --title "chore(brew): point the formula at $TAG" \
+              --body "$(printf 'Regenerated by the formula job of release-binaries.yml from the %s release assets and npm tarball.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$TAG")"
+          fi
