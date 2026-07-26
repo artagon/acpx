@@ -2,10 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseOptionalMcpServers } from "../../mcp-servers.js";
-import {
-  runSessionQueueOwner,
-  type QueueOwnerRuntimeOptions,
-} from "../session/queue-owner-runtime.js";
+import type { QueueOwnerRuntimeOptions } from "../session/queue-owner-runtime.js";
 
 const QUEUE_OWNER_PAYLOAD_FILE_ENV = "ACPX_QUEUE_OWNER_PAYLOAD_FILE";
 const QUEUE_OWNER_PAYLOAD_ENV = "ACPX_QUEUE_OWNER_PAYLOAD";
@@ -200,6 +197,9 @@ function assignSessionEnv(
 export async function runQueueOwnerFromEnv(env: NodeJS.ProcessEnv): Promise<void> {
   const payload = await readQueueOwnerPayloadFromEnv(env);
   const options = parseQueueOwnerPayload(payload);
+  // Deferred: the queue-owner runtime drags in the ACP SDK (and zod), which no
+  // other CLI entry path needs. Only the detached owner process reaches here.
+  const { runSessionQueueOwner } = await import("../session/queue-owner-runtime.js");
   await runSessionQueueOwner(options);
 }
 

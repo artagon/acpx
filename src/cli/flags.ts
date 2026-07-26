@@ -9,7 +9,6 @@ import {
   resolveAgentCommand as resolveAgentCommandFromRegistry,
 } from "../agent-registry.js";
 import type { SystemPromptOption } from "../runtime/engine/session-options.js";
-import { DEFAULT_QUEUE_OWNER_TTL_MS } from "../session/session.js";
 import {
   AUTH_POLICIES,
   NON_INTERACTIVE_PERMISSION_POLICIES,
@@ -21,6 +20,10 @@ import {
   type PermissionMode,
 } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
+// Import from the type-only leaf rather than the session barrel: the barrel
+// re-exports the ACP client, which drags the ACP SDK (and zod) into the eager
+// startup graph for the sake of one numeric constant.
+import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./session/contracts.js";
 import { toTimerMilliseconds } from "./timer-duration.js";
 
 export type PermissionFlags = {
