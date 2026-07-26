@@ -1,0 +1,100 @@
+name: Supply chain
+
+# Repo-level supply-chain checks that are cheap enough to run on every change.
+# Release-artifact provenance and SBOM attestation live in
+# release-binaries.yml, next to the artifacts they describe.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Scorecard's findings drift as GitHub settings and dependencies change, so
+    # it is scheduled rather than only run on push.
+    - cron: "27 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  PNPM_VERSION: 10.33.2
+
+jobs:
+  dependency-review:
+    name: Dependency review
+    # Only meaningful on a pull request: it diffs the manifest against the base.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Fail on known-vulnerable additions rather than only reporting them.
+          fail-on-severity: high
+          # Copyleft licences would change acpx's distribution terms, and the
+          # single executable ships every dependency inside one binary.
+          deny-licenses: AGPL-3.0, GPL-3.0
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Audit production dependencies
+        # Production only: a dev-tool advisory does not ship to users, and
+        # failing the build on one trains people to ignore this job.
+        run: pnpm audit --prod --audit-level high
+
+      - name: Assert the release-age guard is still in force
+        run: |
+          set -euo pipefail
+          # minimumReleaseAge is the repo's defence against a compromised
+          # just-published version being pulled straight into a build. If it is
+          # ever removed, that should be a deliberate, reviewed change rather
+          # than a silent one.
+          node - <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const workspace = readFileSync("pnpm-workspace.yaml", "utf8");
+          const match = workspace.match(/^minimumReleaseAge:\s*(\d+)/m);
+          if (!match) {
+            console.error("pnpm-workspace.yaml no longer sets minimumReleaseAge.");
+            process.exit(1);
+          }
+          const minutes = Number(match[1]);
+          if (minutes < 1440) {
+            console.error(`minimumReleaseAge is ${minutes} minutes; expected at least 1440 (24h).`);
+            process.exit(1);
+          }
+          console.log(`minimumReleaseAge = ${minutes} minutes.`);
+          NODE
+
+  scorecard:
+    name: OpenSSF Scorecard
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false
+
+      - uses: github/codeql-action/upload-sarif@e34fc2711fb7964ca6850c8a8382121f34745f3b # v4.32.4
+        with:
+          sarif_file: scorecard.sarif

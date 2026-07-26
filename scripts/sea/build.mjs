@@ -78,4 +78,24 @@ if (process.platform === "darwin") {
   run("codesign", ["--sign", "-", binaryPath]);
 }
 
-process.stdout.write(`\nBuilt ${binaryPath}\n`);
+/**
+ * Prove the blob is actually in there.
+ *
+ * A failed or skipped injection leaves behind a plain copy of the Node binary,
+ * which still starts, still exits 0, and answers `--version` with Node's own
+ * version. That artifact is indistinguishable from success unless the output is
+ * checked, and it has shipped once already.
+ */
+const expectedVersion = JSON.parse(
+  fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+).version;
+const reported = execFileSync(binaryPath, ["--version"], { encoding: "utf8" }).trim();
+
+if (reported !== expectedVersion) {
+  throw new Error(
+    `Injection verification failed: ${binaryPath} reported "${reported}", expected "${expectedVersion}".\n` +
+      "A bare Node copy reports Node's version — the SEA blob was not injected.",
+  );
+}
+
+process.stdout.write(`\nBuilt ${binaryPath} (verified acpx ${reported})\n`);

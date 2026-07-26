@@ -27,6 +27,11 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      # Required to mint Sigstore-backed provenance and SBOM attestations.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -40,11 +45,11 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: linux-arm64
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
-      - uses: pnpm/action-setup@v6.0.9
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: ${{ env.PNPM_VERSION }}
 
@@ -52,7 +57,7 @@ jobs:
       # compiled out of Homebrew's node and some distro builds;
       # scripts/sea/build.mjs fails fast with an explanatory message when the
       # chosen Node cannot produce a SEA.
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           check-latest: true
@@ -74,22 +79,62 @@ jobs:
           tar -czf "dist-sea/${asset}" -C dist-sea/pkg acpx
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify the binary runs without a system Node
+      - name: Verify the packaged artifact is a real SEA
         shell: bash
+        env:
+          ASSET: ${{ steps.package.outputs.asset }}
         run: |
           set -euo pipefail
-          # A SEA that silently depends on an ambient Node would defeat the
-          # reason for shipping a ~122MB artifact, so prove it with a scrubbed
-          # environment rather than trusting the build.
+          # Verify the TARBALL, not dist-sea/acpx: that is what users install,
+          # and packaging is itself a step that can go wrong.
+          #
+          # Assert the reported version, never just the exit code. A failed
+          # injection leaves a plain Node copy that starts fine, exits 0, and
+          # answers --version with Node's version. That artifact has shipped
+          # once already because this check only looked at the exit status.
+          expected="$(node -p "require('./package.json').version")"
           workdir="$(mktemp -d)"
-          cp dist-sea/acpx "$workdir/acpx"
-          env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --version
-          env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --help > /dev/null
+          tar -xzf "dist-sea/${ASSET}" -C "$workdir"
 
-      - uses: actions/upload-artifact@v4
+          # Scrubbed environment: a SEA that quietly needs an ambient Node would
+          # defeat the reason for shipping a ~122MB artifact.
+          reported="$(env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --version)"
+          if [ "$reported" != "$expected" ]; then
+            echo "::error::Artifact reported '$reported', expected '$expected' — the SEA blob was not injected."
+            exit 1
+          fi
+          env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --help > /dev/null
+          echo "Verified acpx $reported"
+
+      # SBOM is generated from the source tree, not the binary: the SEA bundles
+      # every dependency into one file, so scanning the artifact alone would
+      # report a single opaque blob and lose the dependency graph that makes an
+      # SBOM useful for vulnerability matching.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: acpx-${{ matrix.target }}.spdx.json
+          output-file: dist-sea/acpx-${{ matrix.target }}.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist-sea/${{ steps.package.outputs.asset }}
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist-sea/${{ steps.package.outputs.asset }}
+          sbom-path: dist-sea/acpx-${{ matrix.target }}.spdx.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
-          path: dist-sea/${{ steps.package.outputs.asset }}
+          path: |
+            dist-sea/${{ steps.package.outputs.asset }}
+            dist-sea/acpx-${{ matrix.target }}.spdx.json
           if-no-files-found: error
 
   publish:
@@ -99,10 +144,19 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: assets
           merge-multiple: true
+
+      - name: Generate checksum manifest
+        run: |
+          set -euo pipefail
+          cd assets
+          # Single signed-adjacent manifest so a consumer can verify every asset
+          # with one file rather than transcribing hashes per platform.
+          shasum -a 256 *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Attach to release
         env:
@@ -112,11 +166,11 @@ jobs:
         run: |
           set -euo pipefail
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
-          gh release upload "$TAG" assets/*.tar.gz --clobber
+          gh release upload "$TAG" assets/*.tar.gz assets/*.spdx.json assets/SHA256SUMS --clobber
 
-      - name: Checksums for Formula/acpx.rb
+      - name: Formula checksums
         run: |
           set -euo pipefail
-          # Paste these into Formula/acpx.rb. A stale checksum makes
-          # `brew install` fail loudly instead of installing a wrong artifact.
-          shasum -a 256 assets/*.tar.gz
+          # Paste into Formula/acpx.rb. A stale checksum makes `brew install`
+          # fail loudly instead of installing a wrong artifact.
+          cat assets/SHA256SUMS

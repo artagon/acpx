@@ -21,7 +21,7 @@ class Acpx < Formula
   on_macos do
     on_arm do
       url "https://github.com/artagon/acpx/releases/download/v0.12.0/acpx-0.12.0-darwin-arm64.tar.gz"
-      sha256 "a1da90a25d5e92b6d0060984eda066836556a72f573697fd5a30d86e4f2d445a"
+      sha256 "823fea276f249b73c9305f0b36299f0af8f8936966208e5b52ef73f6f97e2c58"
     end
   end
 
