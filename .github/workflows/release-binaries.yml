@@ -15,10 +15,15 @@ name: Release binaries
 # the Git tag are frozen the moment a release is published. Assets are therefore
 # attached to a draft and the draft is published last.
 
+# Manual-only, deliberately: two of the four matrix legs need macOS runners,
+# which are billed at a premium on GitHub-hosted infrastructure, so binaries
+# are built when a human dispatches this workflow for a tag rather than on
+# every tag push. (The npm release in release.yml stays automatic — it runs on
+# a Linux runner.) Immutable releases force this to be all-or-nothing anyway:
+# every asset must exist before the one-shot publish, so the darwin legs could
+# not be deferred independently. If a self-hosted macOS runner is ever
+# registered, point the darwin legs at it and a tag-push trigger can return.
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
