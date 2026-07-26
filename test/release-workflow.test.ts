@@ -73,7 +73,7 @@ function jobBlocks(workflow: string, keepComments = false): Map<string, string> 
 
 test("release-binaries separates the signing identity from repository code", () => {
   const jobs = jobBlocks(readWorkflow("release-binaries.yml"));
-  assert.deepEqual([...jobs.keys()], ["gate", "build", "attest", "publish", "formula"]);
+  assert.deepEqual([...jobs.keys()], ["gate", "build", "attest", "publish", "formula", "formula-pr"]);
 
   // `build` runs pnpm install, the bundler, and the freshly built binary. OIDC
   // there would let any of that code mint provenance for bytes the workflow
@@ -90,11 +90,19 @@ test("release-binaries separates the signing identity from repository code", () 
   assert.doesNotMatch(jobs.get("publish") ?? "", /id-token/);
   assert.doesNotMatch(jobs.get("publish") ?? "", /actions\/checkout|pnpm install/);
 
-  // `formula` holds a contents-write credential to push the formula PR, so it
-  // must never sign and never execute dependency code — committed repository
-  // scripts only.
+  // `formula` executes the repository's generator script, so it must be
+  // read-only: no OIDC, no write permission, no persisted credential, and it
+  // must render from the immutable tag rather than a movable branch.
   assert.doesNotMatch(jobs.get("formula") ?? "", /id-token/);
+  assert.match(jobs.get("formula") ?? "", /permissions:\n\s+contents: read/);
+  assert.match(jobs.get("formula") ?? "", /persist-credentials: false/);
+  assert.doesNotMatch(jobs.get("formula") ?? "", /ref: main/);
   assert.doesNotMatch(jobs.get("formula") ?? "", /pnpm install|npm install|npm ci\b/);
+
+  // `formula-pr` holds the contents-write credential, so it must execute no
+  // repository code: no script invocations, no dependency installs, no signing.
+  assert.doesNotMatch(jobs.get("formula-pr") ?? "", /id-token/);
+  assert.doesNotMatch(jobs.get("formula-pr") ?? "", /node scripts|pnpm|npm install|npm ci\b/);
 });
 
 test("the formula pins only verified bytes", () => {
