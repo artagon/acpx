@@ -100,6 +100,41 @@ jobs:
           console.log("Build tooling is declared.");
           NODE
 
+      - name: Every action is pinned to a commit
+        run: |
+          set -euo pipefail
+          # A tag is a movable pointer: whoever controls the action repository
+          # can repoint v7 at new code that then runs with this workflow's
+          # permissions. Only a commit SHA is immutable.
+          #
+          # This check has to exist separately from the one below, which can
+          # only validate pins that are already SHAs — an unpinned action is
+          # invisible to it.
+          node - <<'NODE'
+          const { readdirSync, readFileSync } = require("node:fs");
+
+          // Match the `uses:` key at the start of a line, not the substring:
+          // this file quotes `uses:` inside its own grep patterns, and a naive
+          // scan flags those. That failure mode has already broken this job.
+          const USES = /^\s*-?\s*uses: [a-zA-Z]/;
+          const PINNED = /uses: [^@]+@[0-9a-f]{40} # \S+/;
+
+          const offenders = [];
+          for (const file of readdirSync(".github/workflows")) {
+            readFileSync(`.github/workflows/${file}`, "utf8").split("\n").forEach((line, i) => {
+              if (USES.test(line) && !PINNED.test(line)) {
+                offenders.push(`.github/workflows/${file}:${i + 1}: ${line.trim()}`);
+              }
+            });
+          }
+
+          if (offenders.length > 0) {
+            for (const o of offenders) console.error(`::error::${o}: pin to a 40-character commit SHA with a '# vX.Y.Z' comment.`);
+            process.exit(1);
+          }
+          console.log("All action references are SHA-pinned.");
+          NODE
+
       - name: Action pins match their version comments
         run: |
           set -euo pipefail
