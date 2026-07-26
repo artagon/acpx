@@ -73,7 +73,7 @@ function jobBlocks(workflow: string, keepComments = false): Map<string, string> 
 
 test("release-binaries separates the signing identity from repository code", () => {
   const jobs = jobBlocks(readWorkflow("release-binaries.yml"));
-  assert.deepEqual([...jobs.keys()], ["gate", "build", "attest", "publish"]);
+  assert.deepEqual([...jobs.keys()], ["gate", "build", "attest", "publish", "formula"]);
 
   // `build` runs pnpm install, the bundler, and the freshly built binary. OIDC
   // there would let any of that code mint provenance for bytes the workflow
@@ -89,6 +89,25 @@ test("release-binaries separates the signing identity from repository code", () 
   // `publish` writes the release; it signs nothing.
   assert.doesNotMatch(jobs.get("publish") ?? "", /id-token/);
   assert.doesNotMatch(jobs.get("publish") ?? "", /actions\/checkout|pnpm install/);
+
+  // `formula` holds a contents-write credential to push the formula PR, so it
+  // must never sign and never execute dependency code — committed repository
+  // scripts only.
+  assert.doesNotMatch(jobs.get("formula") ?? "", /id-token/);
+  assert.doesNotMatch(jobs.get("formula") ?? "", /pnpm install|npm install|npm ci\b/);
+});
+
+test("the formula pins only verified bytes", () => {
+  const formula = jobBlocks(readWorkflow("release-binaries.yml")).get("formula") ?? "";
+
+  // The binary checksums come from the immutable release's manifest, not from
+  // build artifacts that could be swapped between jobs.
+  assert.match(formula, /gh release download .*SHA256SUMS/);
+
+  // The npm checksum must not be trust-on-first-use: the tarball has to carry
+  // this repository's provenance attestation (created by release.yml before
+  // publish) before its sha256 is pinned into the formula.
+  assert.match(formula, /gh attestation verify/);
 });
 
 test("every artifact gets both provenance and an SBOM attestation", () => {

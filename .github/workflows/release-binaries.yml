@@ -412,9 +412,11 @@ jobs:
           # immutable, so this is the manifest users can verify against.
           gh release download "$TAG" --pattern SHA256SUMS --dir "${RUNNER_TEMP}"
 
-      - name: Wait for the npm tarball and record its checksum
+      - name: Wait for the npm tarball, verify it, and record its checksum
         id: npm
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
@@ -425,6 +427,11 @@ jobs:
           for _ in $(seq 1 30); do
             if curl -fsSL -o "${RUNNER_TEMP}/acpx.tgz" \
               "https://registry.npmjs.org/acpx/-/acpx-${version}.tgz"; then
+              # Not trust-on-first-use: whatever the registry served must carry
+              # this repository's provenance attestation — created by release.yml
+              # over the exact packed tarball before publish — before its
+              # checksum is pinned into a formula every brew user will install.
+              gh attestation verify "${RUNNER_TEMP}/acpx.tgz" --repo "$GH_REPO"
               sha="$(sha256sum "${RUNNER_TEMP}/acpx.tgz" | cut -d' ' -f1)"
               echo "sha256=${sha}" >> "$GITHUB_OUTPUT"
               exit 0
