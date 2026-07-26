@@ -43,7 +43,9 @@ function packageNameOf(specifier) {
 }
 
 if (!fs.existsSync(entry)) {
-  console.error(`check-eager-graph: ${path.relative(repoRoot, entry)} not found — run the build first.`);
+  console.error(
+    `check-eager-graph: ${path.relative(repoRoot, entry)} not found — run the build first.`,
+  );
   process.exit(2);
 }
 
