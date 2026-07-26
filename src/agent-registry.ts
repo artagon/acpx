@@ -2,6 +2,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+/**
+ * Pinned adapter ranges. `codex` and `claude` are also declared as
+ * dependencies in package.json at these same ranges, so a normal install
+ * places them under acpx's own node_modules where
+ * `resolveInstalledBuiltInAgentLaunch` finds them and spawns them directly.
+ * Keep the two in sync: if they drift, the installed adapter silently wins over
+ * the declared pin, because resolution does not compare versions.
+ *
+ * That direct path matters — falling through to the `npx` form puts npm's
+ * dependency resolution on the critical path of every agent launch, measured at
+ * ~2s of added latency before the adapter can answer `initialize`.
+ */
 const ACP_ADAPTER_PACKAGE_RANGES = {
   pi: "^0.0.31",
   codex: "^1.1.5",

@@ -2,8 +2,15 @@ node_modules/
 .pnpm-store/
 .crabbox/
 dist/
+dist-sea/
 dist-test/
 examples/flows/replay-viewer/dist/
 *.tgz
 .worktrees/
 coverage/
+
+# OpenSpec init artifacts (local only — not committed)
+.agent/
+.claude/
+.codex/
+openspec/

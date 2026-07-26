@@ -120,14 +120,39 @@ test("default agent is codex", () => {
   assert.equal(DEFAULT_AGENT_NAME, "codex");
 });
 
-test("claude built-in uses the current ACP adapter package range", () => {
-  assert.equal(BUILT_IN_AGENT_PACKAGES.claude.packageRange, "^0.60.0");
-  assert.equal(AGENT_REGISTRY.claude, "npx -y @agentclientprotocol/claude-agent-acp@^0.60.0");
+/**
+ * The built-in adapters are also declared as dependencies so a normal install
+ * places them under acpx's own node_modules, where
+ * `resolveInstalledBuiltInAgentLaunch` finds them and spawns them directly. If
+ * the two drift, resolution silently launches whatever is installed — it never
+ * compares versions — and the declared pin becomes fiction. Assert against
+ * package.json rather than a literal so this cannot rot on the next bump.
+ */
+const declaredDependencies = (
+  JSON.parse(fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+    dependencies: Record<string, string>;
+  }
+).dependencies;
+
+test("built-in adapter ranges match the declared dependencies", () => {
+  for (const spec of Object.values(BUILT_IN_AGENT_PACKAGES)) {
+    assert.equal(
+      spec.packageRange,
+      declaredDependencies[spec.packageName],
+      `${spec.packageName}: registry range must match package.json`,
+    );
+  }
 });
 
-test("npm-backed built-ins use current adapter package ranges", () => {
-  assert.equal(BUILT_IN_AGENT_PACKAGES.codex.packageRange, "^1.1.5");
-  assert.equal(AGENT_REGISTRY.codex, "npx -y @agentclientprotocol/codex-acp@^1.1.5");
+test("npm-backed built-ins embed their pinned range in the fallback command", () => {
+  assert.equal(
+    AGENT_REGISTRY.claude,
+    `npx -y @agentclientprotocol/claude-agent-acp@${BUILT_IN_AGENT_PACKAGES.claude.packageRange}`,
+  );
+  assert.equal(
+    AGENT_REGISTRY.codex,
+    `npx -y @agentclientprotocol/codex-acp@${BUILT_IN_AGENT_PACKAGES.codex.packageRange}`,
+  );
   assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.31");
 });
 
