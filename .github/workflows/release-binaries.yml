@@ -1,0 +1,122 @@
+name: Release binaries
+
+# Builds the single-executable artifacts consumed by Formula/acpx.rb.
+#
+# Deliberately separate from release.yml: that workflow publishes the npm
+# package with provenance and asserts upstream metadata, so it must not be
+# entangled with binary packaging. This one only produces release assets.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach assets to (e.g. v0.12.0)
+        required: true
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PNPM_VERSION: 10.33.2
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: darwin-arm64
+          - runner: macos-13
+            target: darwin-x64
+          - runner: ubuntu-24.04
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: pnpm/action-setup@v6.0.9
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      # Must be an official nodejs.org build. Single-executable support is
+      # compiled out of Homebrew's node and some distro builds;
+      # scripts/sea/build.mjs fails fast with an explanatory message when the
+      # chosen Node cannot produce a SEA.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          check-latest: true
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: pnpm run sea
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          asset="acpx-${version}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist-sea/pkg
+          cp dist-sea/acpx dist-sea/pkg/acpx
+          tar -czf "dist-sea/${asset}" -C dist-sea/pkg acpx
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the binary runs without a system Node
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A SEA that silently depends on an ambient Node would defeat the
+          # reason for shipping a ~122MB artifact, so prove it with a scrubbed
+          # environment rather than trusting the build.
+          workdir="$(mktemp -d)"
+          cp dist-sea/acpx "$workdir/acpx"
+          env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --version
+          env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --help > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist-sea/${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Attach assets
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" assets/*.tar.gz --clobber
+
+      - name: Checksums for Formula/acpx.rb
+        run: |
+          set -euo pipefail
+          # Paste these into Formula/acpx.rb. A stale checksum makes
+          # `brew install` fail loudly instead of installing a wrong artifact.
+          shasum -a 256 assets/*.tar.gz
