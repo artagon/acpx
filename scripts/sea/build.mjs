@@ -50,7 +50,11 @@ function assertSeaCapable(nodePath) {
 const seaNode = process.env.ACPX_SEA_NODE ?? process.execPath;
 assertSeaCapable(seaNode);
 
-run("npx", ["tsdown", "-c", path.join(here, "tsdown.sea.config.ts")]);
+// `pnpm exec`, never `npx`: npx resolves from the registry at run time, so a
+// compromised release of a build tool would be fetched unpinned and handed
+// write access to the exact bytes users install. pnpm exec resolves from the
+// lockfile and fails closed when the tool is absent.
+run("pnpm", ["exec", "tsdown", "-c", path.join(here, "tsdown.sea.config.ts")]);
 
 fs.writeFileSync(bundlePath, CJS_WRAPPER_SHIM + fs.readFileSync(bundlePath, "utf8"));
 
@@ -64,7 +68,8 @@ if (process.platform === "darwin") {
   run("codesign", ["--remove-signature", binaryPath]);
 }
 
-run("npx", [
+run("pnpm", [
+  "exec",
   "postject",
   binaryPath,
   "NODE_SEA_BLOB",
