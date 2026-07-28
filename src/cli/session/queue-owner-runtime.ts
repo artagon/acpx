@@ -74,6 +74,7 @@ async function submitToRunningOwner(
     waitForCompletion,
     verbose: options.verbose,
     sessionOptions: options.sessionOptions,
+    startupProbe: true,
     onQueueAccepted: extras?.onQueueAccepted,
   });
 }

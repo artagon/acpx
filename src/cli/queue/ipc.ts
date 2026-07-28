@@ -201,11 +201,12 @@ function parseQueueOwnerResponseLine(
 async function runQueueOwnerRequest<TResult>(options: {
   owner: QueueOwnerRecord;
   request: QueueRequest;
+  connectAttempts?: number;
   onAccepted?: (controls: QueueOwnerRequestControls<TResult>) => void;
   onMessage: (message: QueueOwnerMessage, controls: QueueOwnerRequestControls<TResult>) => void;
   onClose: (controls: QueueOwnerRequestControls<TResult>) => void;
 }): Promise<TResult | undefined> {
-  const socket = await connectToQueueOwner(options.owner);
+  const socket = await connectToQueueOwner(options.owner, options.connectAttempts);
   if (!socket) {
     return undefined;
   }
@@ -322,6 +323,8 @@ export type SubmitToQueueOwnerOptions = {
   waitForCompletion: boolean;
   verbose?: boolean;
   sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
+  /** Use a single connection probe and treat lease-before-bind as a startup miss. */
+  startupProbe?: boolean;
   /** Fires when the queue owner acknowledges the request (IPC accept), before completion. */
   onQueueAccepted?: () => void;
 };
@@ -415,6 +418,7 @@ async function submitToQueueOwner(
   return await runQueueOwnerRequest<SessionSendOutcome>({
     owner,
     request,
+    connectAttempts: options.startupProbe ? 1 : undefined,
     onAccepted: ({ resolve }) => {
       options.onQueueAccepted?.();
       options.outputFormatter.setContext({
@@ -707,6 +711,13 @@ function assertQueueOwnerMcpConfigMatches(
   );
 }
 
+function unavailableOwnerCountsAsMissing(
+  health: QueueOwnerHealth,
+  startupProbe: boolean | undefined,
+): boolean {
+  return !health.hasLease || startupProbe === true;
+}
+
 export async function trySubmitToRunningOwner(
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
@@ -744,7 +755,7 @@ export async function trySubmitToRunningOwner(
   }
 
   const health = await probeQueueOwnerHealth(options.sessionId);
-  if (!health.hasLease) {
+  if (unavailableOwnerCountsAsMissing(health, options.startupProbe)) {
     return undefined;
   }
 

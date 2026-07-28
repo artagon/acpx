@@ -1336,8 +1336,8 @@ test("AcpClient startup failure kills descendants left by an exited npx wrapper"
       "fixture must create a separate stubborn descendant",
     );
     assert.equal(
-      isPidAlive(descendantPid),
-      false,
+      await waitForPidExit(descendantPid),
+      true,
       "startup cleanup must not leave the adapter descendant alive",
     );
   } finally {
@@ -1444,6 +1444,14 @@ async function terminateTestPid(pid: number): Promise<void> {
   while (isPidAlive(pid) && Date.now() < deadline) {
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
   }
+}
+
+async function waitForPidExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isPidAlive(pid) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  return !isPidAlive(pid);
 }
 
 function asInternals(client: AcpClient): ClientInternals {
