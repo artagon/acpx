@@ -109,6 +109,14 @@ import {
   type SessionModelState,
 } from "./model-support.js";
 import {
+  captureProcessTreePids,
+  createManagedProcessTree,
+  rememberProcessTreePids,
+  signalProcessTree,
+  waitForProcessTreeExit,
+  type ManagedProcessTree,
+} from "./process-tree.js";
+import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
 } from "./session-control-errors.js";
@@ -414,6 +422,7 @@ export class AcpClient {
   private options: AcpClientOptions;
   private connection?: ClientSideConnection;
   private agent?: ChildProcessByStdio<Writable, Readable, Readable>;
+  private agentProcessTree?: ManagedProcessTree;
   private initResult?: InitializeResponse;
   private loadedSessionId?: string;
   private eventHandlers: Pick<
@@ -724,6 +733,11 @@ export class AcpClient {
       plan.args,
       buildSpawnCommandOptions(plan.spawnCommand, plan.spawnOptions),
     ) as ChildProcessByStdio<Writable, Readable, Readable>;
+    const processTree = createManagedProcessTree(spawnedChild.pid, true);
+    this.agentProcessTree = processTree;
+    spawnedChild.once("exit", () => {
+      rememberProcessTreePids(processTree);
+    });
     try {
       await waitForSpawn(spawnedChild);
     } catch (error) {
@@ -851,7 +865,7 @@ export class AcpClient {
       params.startupStderr,
     );
     try {
-      params.child.kill();
+      await this.terminateAgentProcess(params.child);
     } catch {
       // best effort
     }
@@ -1382,11 +1396,13 @@ export class AcpClient {
     this.initResult = undefined;
     this.connection = undefined;
     this.agent = undefined;
+    this.agentProcessTree = undefined;
   }
 
   private async terminateAgentProcess(
     child: ChildProcessByStdio<Writable, Readable, Readable>,
   ): Promise<void> {
+    const processTree = this.agentProcessTree ?? createManagedProcessTree(child.pid, true);
     const stdinCloseGraceMs = resolveAgentCloseAfterStdinEndMs(this.options.agentCommand);
     const termGraceMs = this.options.fastTeardown
       ? AGENT_CLOSE_FAST_TERM_GRACE_MS
@@ -1394,12 +1410,17 @@ export class AcpClient {
     const killGraceMs = this.options.fastTeardown
       ? AGENT_CLOSE_FAST_KILL_GRACE_MS
       : AGENT_CLOSE_KILL_GRACE_MS;
+    await captureProcessTreePids(processTree, isChildProcessRunning(child));
     this.endAgentStdin(child);
-    let exited = await waitForChildExit(child, stdinCloseGraceMs);
-    exited = await this.killAgentIfRunning(child, exited, "SIGTERM", termGraceMs);
+    let exited = await waitForProcessTreeExit(
+      processTree,
+      () => isChildProcessRunning(child),
+      stdinCloseGraceMs,
+    );
+    exited = await this.killAgentIfRunning(child, processTree, exited, "SIGTERM", termGraceMs);
     if (!exited) {
       this.log(`agent did not exit after ${termGraceMs}ms; forcing SIGKILL`);
-      exited = await this.killAgentIfRunning(child, exited, "SIGKILL", killGraceMs);
+      exited = await this.killAgentIfRunning(child, processTree, exited, "SIGKILL", killGraceMs);
     }
 
     // Ensure stdio handles don't keep this process alive after close() returns.
@@ -1420,19 +1441,20 @@ export class AcpClient {
 
   private async killAgentIfRunning(
     child: ChildProcessByStdio<Writable, Readable, Readable>,
+    processTree: ManagedProcessTree,
     alreadyExited: boolean,
     signal: NodeJS.Signals,
     waitMs: number,
   ): Promise<boolean> {
-    if (alreadyExited || !isChildProcessRunning(child)) {
-      return alreadyExited;
+    if (alreadyExited) {
+      return true;
     }
     try {
-      child.kill(signal);
+      await signalProcessTree(processTree, isChildProcessRunning(child), signal);
     } catch {
       // best effort
     }
-    return await waitForChildExit(child, waitMs);
+    return await waitForProcessTreeExit(processTree, () => isChildProcessRunning(child), waitMs);
   }
 
   private detachAgentHandles(agent: ChildProcess, unref: boolean): void {

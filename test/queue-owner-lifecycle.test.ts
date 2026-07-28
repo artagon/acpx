@@ -15,7 +15,7 @@ import net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
 import { describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isProcessAlive } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath, queueSocketPath } from "../src/cli/queue/paths.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
@@ -94,6 +94,45 @@ function waitForProcessExit(
       resolve({ code, signal });
     });
   });
+}
+
+async function writeLocalNpxAdapter(
+  homeDir: string,
+  processInfoPath: string,
+): Promise<{ binName: string; packageDir: string }> {
+  const packageDir = path.join(homeDir, "adapter-package");
+  const binName = "acpx-process-tree-fixture";
+  const adapterPath = path.join(packageDir, "adapter.cjs");
+  await fs.mkdir(packageDir, { recursive: true });
+  await fs.writeFile(
+    path.join(packageDir, "package.json"),
+    `${JSON.stringify({
+      name: binName,
+      version: "1.0.0",
+      bin: { [binName]: "adapter.cjs" },
+    })}\n`,
+  );
+  await fs.writeFile(
+    adapterPath,
+    [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `fs.writeFileSync(${JSON.stringify(processInfoPath)}, JSON.stringify({ pid: process.pid, parentPid: process.ppid }));`,
+      "setInterval(() => {}, 1_000);",
+      `void import(${JSON.stringify(pathToFileURL(MOCK_AGENT_PATH).href)});`,
+      "",
+    ].join("\n"),
+  );
+  await fs.chmod(adapterPath, 0o755);
+  return { binName, packageDir };
+}
+
+async function terminateFixturePid(pid: number): Promise<void> {
+  if (!isProcessAlive(pid)) {
+    return;
+  }
+  process.kill(pid, "SIGKILL");
+  await waitUntil(async () => !isProcessAlive(pid), 2_000);
 }
 
 describe("queue owner lifecycle — graceful SIGTERM shutdown", () => {
@@ -608,6 +647,116 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
         queueSocket?.destroy();
         if (child.exitCode == null && child.signalCode == null) {
           child.kill("SIGKILL");
+        }
+      }
+    });
+  });
+
+  it("kills a SIGTERM-resistant adapter grandchild launched through npx", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+
+    await withTempHome("acpx-lifecycle-npx-tree-", async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+
+      const processInfoPath = path.join(homeDir, "adapter-process.json");
+      const { binName: adapterBin, packageDir } = await writeLocalNpxAdapter(
+        homeDir,
+        processInfoPath,
+      );
+      const record = makeSessionRecord({
+        acpxRecordId: "lifecycle-npx-tree-test",
+        acpSessionId: "lifecycle-npx-tree-session",
+        agentCommand: `npx --yes --offline --package ${JSON.stringify(packageDir)} -- ${adapterBin} --ignore-sigterm`,
+        cwd,
+      });
+      await writeSessionRecordFile(homeDir, record);
+
+      const socketPath = queueSocketPath(record.acpxRecordId, homeDir);
+      const lockPath = queueLockFilePath(record.acpxRecordId, homeDir);
+      const child = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
+        env: {
+          ...process.env,
+          HOME: homeDir,
+          ACPX_QUEUE_OWNER_PAYLOAD: JSON.stringify({
+            sessionId: record.acpxRecordId,
+            permissionMode: "approve-reads",
+          }),
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      const stderrChunks: Buffer[] = [];
+      child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+
+      let queueSocket: net.Socket | undefined;
+      let adapterPid: number | undefined;
+      let wrapperPid: number | undefined;
+
+      try {
+        await waitUntil(
+          async () =>
+            (await fileExists(socketPath)) || child.exitCode != null || child.signalCode != null,
+        );
+        assert.equal(
+          await fileExists(socketPath),
+          true,
+          `queue owner must open its socket; stderr=${Buffer.concat(stderrChunks).toString("utf8")}`,
+        );
+        queueSocket = await new Promise<net.Socket>((resolve, reject) => {
+          const socket = net.createConnection(socketPath);
+          socket.once("connect", () => resolve(socket));
+          socket.once("error", reject);
+        });
+        queueSocket.write(
+          `${JSON.stringify({
+            type: "submit_prompt",
+            requestId: "req-npx-tree-test",
+            message: "sleep 10000",
+            permissionMode: "approve-reads",
+            waitForCompletion: true,
+          })}\n`,
+        );
+
+        await waitUntil(() => fileExists(processInfoPath), 8_000);
+        const processInfo = JSON.parse(await fs.readFile(processInfoPath, "utf8")) as {
+          pid: number;
+          parentPid: number;
+        };
+        adapterPid = processInfo.pid;
+        wrapperPid = processInfo.parentPid;
+        assert.notEqual(
+          wrapperPid,
+          child.pid,
+          "fixture must launch the adapter as an npx grandchild, not the queue owner's direct child",
+        );
+        assert.equal(isProcessAlive(adapterPid), true, "adapter grandchild must be alive");
+        assert.equal(isProcessAlive(wrapperPid), true, "npx wrapper must be alive");
+
+        child.kill("SIGTERM");
+        const { code, signal } = await waitForProcessExit(child, 10_000);
+        const stderr = Buffer.concat(stderrChunks).toString("utf8");
+
+        assert.equal(signal, null, `queue owner should exit gracefully; stderr=${stderr}`);
+        assert.equal(code, 0, `expected queue owner exit code 0; stderr=${stderr}`);
+        assert.equal(
+          isProcessAlive(adapterPid),
+          false,
+          "SIGTERM-resistant adapter grandchild must not survive npx wrapper teardown",
+        );
+        assert.equal(isProcessAlive(wrapperPid), false, "npx wrapper must be gone");
+        assert.equal(await fileExists(lockPath), false, "queue owner lease must be released");
+      } finally {
+        queueSocket?.destroy();
+        if (child.exitCode == null && child.signalCode == null) {
+          child.kill("SIGKILL");
+        }
+        if (adapterPid) {
+          await terminateFixturePid(adapterPid);
+        }
+        if (wrapperPid) {
+          await terminateFixturePid(wrapperPid);
         }
       }
     });

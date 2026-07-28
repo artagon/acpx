@@ -9,16 +9,24 @@ name: Release binaries
 # repository or dependency code. `build` runs that code with read-only
 # permissions and no OIDC. `attest` holds the signing identity but runs no repo
 # code at all — no checkout, no install — and signs only bytes it downloaded.
-# `publish` writes the release and never touches OIDC.
+# `publish` writes the release and never touches OIDC. The same split repeats
+# for the Homebrew formula: `formula` renders it from the immutable tag with
+# read-only permissions, and `formula-pr` holds the contents-write credential
+# while executing no repository code.
 #
 # Release shape: this repository has immutable releases enabled, so assets and
 # the Git tag are frozen the moment a release is published. Assets are therefore
 # attached to a draft and the draft is published last.
 
+# Manual-only, deliberately: two of the four matrix legs need macOS runners,
+# which are billed at a premium on GitHub-hosted infrastructure, so binaries
+# are built when a human dispatches this workflow for a tag rather than on
+# every tag push. (The npm release in release.yml stays automatic — it runs on
+# a Linux runner.) Immutable releases force this to be all-or-nothing anyway:
+# every asset must exist before the one-shot publish, so the darwin legs could
+# not be deferred independently. If a self-hosted macOS runner is ever
+# registered, point the darwin legs at it and a tag-push trigger can return.
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -74,7 +82,12 @@ jobs:
             process.exit(1);
           }
 
-          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          // From the tagged commit, not the checkout: on workflow_dispatch the
+          // checkout is the dispatch branch, whose package.json can disagree
+          // with the tag being released.
+          const pkg = JSON.parse(
+            execFileSync("git", ["show", `${tag}:package.json`], { encoding: "utf8" }),
+          );
           if (tag !== `v${pkg.version}`) {
             console.error(`Tag ${tag} does not match package.json version ${pkg.version}.`);
             process.exit(1);
@@ -121,7 +134,9 @@ jobs:
         include:
           - runner: macos-14
             target: darwin-arm64
-          - runner: macos-13
+          # macos-13 was the last plain Intel label but is retired; the -intel
+          # variants are the supported Intel images.
+          - runner: macos-15-intel
             target: darwin-x64
           - runner: ubuntu-24.04
             target: linux-x64
@@ -159,6 +174,7 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
+      - run: pnpm run build:test
 
       # rollup-plugin-sbom writes dist-sea/sbom.json during this build, from the
       # bundler's own module graph. These two variables are what it records as
@@ -209,6 +225,7 @@ jobs:
             exit 1
           fi
           env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --help > /dev/null
+          ACPX_TEST_PACKAGE_BIN="$workdir/acpx" node --test dist-test/test/packaged-bin.test.js
           echo "Verified acpx $reported"
 
       - name: Name and check the SBOM
@@ -324,7 +341,7 @@ jobs:
           # A convenience index only. Each tarball carries its own provenance and
           # SBOM attestation, so `gh attestation verify` — not this file — is the
           # integrity mechanism.
-          shasum -a 256 *.tar.gz *.cdx.json > SHA256SUMS
+          shasum -a 256 -- *.tar.gz *.cdx.json > SHA256SUMS
           cat SHA256SUMS
 
       - name: Attach assets to a draft, then publish
@@ -364,9 +381,145 @@ jobs:
           gh release edit "$TAG" --draft=false
           echo "Published $TAG; assets and tag are now immutable."
 
-      - name: Formula checksums
+  # The formula pipeline mirrors the build/attest split above: `formula`
+  # executes the repository's generator script, so it gets no write credential;
+  # `formula-pr` holds the write credential, so it executes no repository code
+  # at all — it commits bytes it downloaded from the render job.
+  formula:
+    name: Render Homebrew formula
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The validated tag, not main: the gate proved this ref is on main
+          # and matches the released version, and it cannot move afterwards —
+          # a branch checkout would run whatever landed on main since.
+          ref: ${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+
+      - name: Fetch the release checksum manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          # Paste into Formula/acpx.rb. A stale checksum makes `brew install`
-          # fail loudly instead of installing a wrong artifact.
-          grep 'tar\.gz$' assets/SHA256SUMS
+          # From the published release, not the build artifacts: the release is
+          # immutable, so this is the manifest users can verify against.
+          gh release download "$TAG" --pattern SHA256SUMS --dir "${RUNNER_TEMP}"
+
+      - name: Wait for the npm tarball, verify it, and record its checksum
+        id: npm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # release.yml publishes the npm package in a parallel workflow, so the
+          # tarball may lag this job by a few minutes. Fail after ~10 minutes:
+          # a formula whose fallback URL 404s must not be proposed.
+          for _ in $(seq 1 30); do
+            if curl -fsSL -o "${RUNNER_TEMP}/acpx.tgz" \
+              "https://registry.npmjs.org/acpx/-/acpx-${version}.tgz"; then
+              # Not trust-on-first-use: whatever the registry served must carry
+              # this repository's provenance attestation — created by release.yml
+              # over the exact packed tarball before publish — before its
+              # checksum is pinned into a formula every brew user will install.
+              gh attestation verify "${RUNNER_TEMP}/acpx.tgz" --repo "$GH_REPO"
+              sha="$(sha256sum "${RUNNER_TEMP}/acpx.tgz" | cut -d' ' -f1)"
+              echo "sha256=${sha}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "npm tarball for ${version} not available yet; retrying in 20s."
+            sleep 20
+          done
+          echo "::error::acpx@${version} never appeared on the npm registry."
+          exit 1
+
+      - name: Regenerate the formula
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          NPM_SHA256: ${{ steps.npm.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          node scripts/sea/generate-formula.mjs \
+            --version "${TAG#v}" \
+            --npm-sha256 "$NPM_SHA256" \
+            --sums "${RUNNER_TEMP}/SHA256SUMS"
+          # The bot PR is created by GITHUB_TOKEN, so CI does not run on it and
+          # a syntax error would otherwise surface only at merge review. Ruby is
+          # on the runner image; a full `brew audit` is not available on Linux.
+          ruby -c Formula/acpx.rb
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: formula
+          path: Formula/acpx.rb
+          if-no-files-found: error
+
+  formula-pr:
+    name: Propose formula update
+    needs: formula
+    runs-on: ubuntu-24.04
+    # Writes a branch and opens a PR; requires "Allow GitHub Actions to create
+    # and approve pull requests" in the repository's Actions settings.
+    #
+    # This job holds the write credential, so it runs no repository code: the
+    # checkout is only a git work tree for the commit below, and every command
+    # is an inline git/gh invocation. The formula bytes come exclusively from
+    # the render job's artifact.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR targets main, so the branch forks from it. Nothing from this
+          # checkout is executed.
+          ref: main
+          persist-credentials: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formula
+          path: Formula
+
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/acpx.rb; then
+            echo "Formula already matches $TAG; nothing to propose."
+            exit 0
+          fi
+          branch="bot/homebrew-formula-${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Formula/acpx.rb
+          git commit -m "chore(brew): point the formula at $TAG"
+          # Plain --force: a fresh clone has no remote-tracking ref for the bot
+          # branch, so --force-with-lease would reject every re-run. The branch
+          # is namespaced to this job and carries generated content only.
+          git push --force origin "$branch"
+          # A PR rather than a direct push: the formula names the bytes every
+          # brew user installs, so it goes through the same review path as any
+          # other change to main. Note: PRs created with GITHUB_TOKEN get no CI
+          # runs — the render job's checks stand in; review before merging.
+          if ! gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr create \
+              --title "chore(brew): point the formula at $TAG" \
+              --body "$(printf 'Regenerated by the formula jobs of release-binaries.yml from the %s release assets and the attestation-verified npm tarball.\n\nNote: bot PRs from GITHUB_TOKEN do not trigger CI; the render job syntax-checked the formula.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$TAG")"
+          fi
