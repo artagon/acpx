@@ -111,6 +111,11 @@ test("buildAgentSpawnOptions hides Windows console windows and preserves auth en
   });
 
   assert.equal(options.cwd, "/tmp/acpx-agent");
+  assert.equal(
+    (options as { detached?: boolean }).detached,
+    true,
+    "agent wrappers must lead an owned process group/tree for descendant cleanup",
+  );
   assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe"]);
   assert.equal(options.windowsHide, true);
   assert.equal(options.env.ACPX_AUTH_TOKEN, "secret-token");

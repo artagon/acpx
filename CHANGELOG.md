@@ -51,6 +51,9 @@ Repo: https://github.com/openclaw/acpx
 - Packaging/sessions: let Node single-executable builds self-spawn detached queue
   owners without repeating the embedded executable path, restoring persistent
   prompts for Homebrew and other SEA installs.
+- Runtime/agents: terminate the owned adapter process group/tree during normal
+  and failed startup cleanup so package-exec wrappers cannot leave descendants
+  running after ACPX exits.
 
 ## 2026.7.4 (v0.12.0)
 
