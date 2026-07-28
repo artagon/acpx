@@ -51,17 +51,21 @@ if (!/^[0-9a-f]{64}$/.test(npmSha)) {
 // The four slots Homebrew can address with on_macos/on_linux × on_arm/on_intel.
 // A manifest naming any other target fails the run: silently skipping it would
 // publish a formula that pretends the platform does not exist.
-const SLOTS = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"];
+const SLOTS = new Set(["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"]);
 
 const shaByTarget = new Map();
 for (const line of fs.readFileSync(sumsPath, "utf8").split("\n")) {
-  if (line.trim() === "") continue;
+  if (line.trim() === "") {
+    continue;
+  }
   const match = /^([0-9a-f]{64})\s+(\S+)$/.exec(line.trim());
   if (!match) {
     throw new Error(`Unparseable checksum line: "${line}".`);
   }
   const [, sha, name] = match;
-  if (!name.endsWith(".tar.gz")) continue;
+  if (!name.endsWith(".tar.gz")) {
+    continue;
+  }
   const asset = new RegExp(`^acpx-(\\d+\\.\\d+\\.\\d+)-([a-z0-9-]+)\\.tar\\.gz$`).exec(name);
   if (!asset) {
     throw new Error(`Tarball "${name}" does not match acpx-<version>-<target>.tar.gz.`);
@@ -69,7 +73,7 @@ for (const line of fs.readFileSync(sumsPath, "utf8").split("\n")) {
   if (asset[1] !== version) {
     throw new Error(`Tarball "${name}" is for version ${asset[1]}, expected ${version}.`);
   }
-  if (!SLOTS.includes(asset[2])) {
+  if (!SLOTS.has(asset[2])) {
     throw new Error(`Tarball "${name}" names unknown target "${asset[2]}".`);
   }
   if (shaByTarget.has(asset[2])) {
@@ -148,20 +152,20 @@ const formula = [
   ...osBlock("linux", "linux-arm64", "linux-x64"),
   "",
   "  def install",
-  "    if (buildpath/\"acpx\").exist?",
-  "      bin.install \"acpx\"",
+  '    if (buildpath/"acpx").exist?',
+  '      bin.install "acpx"',
   "    else",
-  "      system \"npm\", \"install\", *std_npm_args",
-  "      bin.install_symlink Dir[\"#{libexec}/bin/*\"]",
+  '      system "npm", "install", *std_npm_args',
+  '      bin.install_symlink Dir["#{libexec}/bin/*"]',
   "    end",
   "  end",
   "",
   "  test do",
-  "    assert_match version.to_s, shell_output(\"#{bin}/acpx --version\")",
+  '    assert_match version.to_s, shell_output("#{bin}/acpx --version")',
   "",
   "    # On binary platforms this must answer without a system Node on PATH —",
   "    # that is the property that justifies shipping a ~122MB executable.",
-  "    assert_match \"Usage\", shell_output(\"#{bin}/acpx --help\")",
+  '    assert_match "Usage", shell_output("#{bin}/acpx --help")',
   "  end",
   "end",
   "",
@@ -170,5 +174,9 @@ const formula = [
 fs.mkdirSync(path.dirname(outPath), { recursive: true });
 fs.writeFileSync(outPath, formula);
 
-const targets = [...shaByTarget.keys()].sort().join(", ");
-process.stdout.write(`Wrote ${outPath} for v${version} (binary: ${targets}; npm fallback elsewhere)\n`);
+const targets = [...shaByTarget.keys()]
+  .toSorted((left, right) => left.localeCompare(right))
+  .join(", ");
+process.stdout.write(
+  `Wrote ${outPath} for v${version} (binary: ${targets}; npm fallback elsewhere)\n`,
+);

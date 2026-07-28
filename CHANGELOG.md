@@ -48,6 +48,9 @@ Repo: https://github.com/openclaw/acpx
 ### Fixes
 
 - Session queue owner: capture a bounded owner stderr tail and exit status during cold start only (stop retaining at first IPC accept; keep draining the pipe so long-lived owners are not killed by EPIPE) so a dead owner reports the real failure instead of a silent timeout. Thanks @SebTardif.
+- Packaging/sessions: let Node single-executable builds self-spawn detached queue
+  owners without repeating the embedded executable path, restoring persistent
+  prompts for Homebrew and other SEA installs.
 
 ## 2026.7.4 (v0.12.0)
 

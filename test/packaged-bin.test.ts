@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { queuePaths } from "./queue-test-helpers.js";
 
 const DIST_CLI_PATH = path.join(process.cwd(), "dist", "cli.js");
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -20,6 +21,7 @@ type PackageJson = {
 
 type CliRunResult = {
   code: number | null;
+  signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
 };
@@ -50,6 +52,11 @@ function packageBinSpawnArgs(args: string[]): {
   command: string;
   args: string[];
 } {
+  const override = process.env.ACPX_TEST_PACKAGE_BIN;
+  if (override) {
+    return { command: path.resolve(override), args };
+  }
+
   const binPath = readPackageBinPath();
   if (process.platform === "win32") {
     return { command: process.execPath, args: [binPath, ...args] };
@@ -66,8 +73,12 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
   }
 }
 
-async function runPackageBin(args: string[], homeDir: string): Promise<CliRunResult> {
-  return await new Promise<CliRunResult>((resolve) => {
+async function runPackageBin(
+  args: string[],
+  homeDir: string,
+  timeoutMs = 15_000,
+): Promise<CliRunResult> {
+  return await new Promise<CliRunResult>((resolve, reject) => {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: homeDir,
@@ -93,8 +104,18 @@ async function runPackageBin(args: string[], homeDir: string): Promise<CliRunRes
       stderr += chunk;
     });
 
-    child.once("close", (code) => {
-      resolve({ code, stdout, stderr });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`packaged acpx timed out after ${timeoutMs}ms: ${args.join(" ")}`));
+    }, timeoutMs);
+
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
     });
   });
 }
@@ -155,5 +176,84 @@ test("packaged bin runs a mock-agent exec command through package executable map
 
     assert.equal(result.code, 0, result.stderr);
     assert.equal(result.stdout.trim(), "packaged-bin-ok");
+  });
+});
+
+test("packaged bin serializes concurrent cold prompts through one detached queue owner", async (t) => {
+  if (!process.env.ACPX_TEST_PACKAGE_BIN && !existsSync(DIST_CLI_PATH)) {
+    t.skip("run pnpm build or set ACPX_TEST_PACKAGE_BIN before packaged-bin smoke tests");
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const baseArgs = ["--agent", MOCK_AGENT_COMMAND, "--approve-all", "--cwd", cwd, "--ttl", "30"];
+
+    const created = await runPackageBin(
+      [...baseArgs, "--format", "json", "sessions", "new"],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    assert.equal(created.signal, null);
+    const createdPayload = JSON.parse(created.stdout.trim()) as {
+      acpxRecordId?: unknown;
+    };
+    assert.equal(typeof createdPayload.acpxRecordId, "string");
+    const sessionId = createdPayload.acpxRecordId as string;
+
+    try {
+      const [first, concurrent] = await Promise.all([
+        runPackageBin(
+          [...baseArgs, "--format", "quiet", "prompt", "echo packaged-owner-first"],
+          homeDir,
+        ),
+        runPackageBin(
+          [...baseArgs, "--format", "quiet", "prompt", "echo packaged-owner-concurrent"],
+          homeDir,
+        ),
+      ]);
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(first.signal, null);
+      assert.equal(first.stdout.trim(), "packaged-owner-first");
+      assert.equal(concurrent.code, 0, concurrent.stderr);
+      assert.equal(concurrent.signal, null);
+      assert.equal(concurrent.stdout.trim(), "packaged-owner-concurrent");
+
+      const firstLease = JSON.parse(
+        await fs.readFile(queuePaths(homeDir, sessionId).lockPath, "utf8"),
+      ) as {
+        pid?: unknown;
+      };
+      assert.equal(typeof firstLease.pid, "number");
+
+      const status = await runPackageBin([...baseArgs, "--format", "json", "status"], homeDir);
+      assert.equal(status.code, 0, status.stderr);
+      const statusPayload = JSON.parse(status.stdout.trim()) as {
+        status?: unknown;
+      };
+      assert.equal(statusPayload.status, "alive");
+
+      const warm = await runPackageBin(
+        [...baseArgs, "--format", "quiet", "prompt", "echo packaged-owner-warm"],
+        homeDir,
+      );
+      assert.equal(warm.code, 0, warm.stderr);
+      assert.equal(warm.signal, null);
+      assert.equal(warm.stdout.trim(), "packaged-owner-warm");
+
+      const secondLease = JSON.parse(
+        await fs.readFile(queuePaths(homeDir, sessionId).lockPath, "utf8"),
+      ) as {
+        pid?: unknown;
+      };
+      assert.equal(secondLease.pid, firstLease.pid);
+    } finally {
+      const closed = await runPackageBin(
+        [...baseArgs, "--format", "json", "sessions", "close"],
+        homeDir,
+      );
+      assert.equal(closed.code, 0, closed.stderr);
+    }
   });
 });

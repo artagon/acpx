@@ -73,7 +73,10 @@ function jobBlocks(workflow: string, keepComments = false): Map<string, string> 
 
 test("release-binaries separates the signing identity from repository code", () => {
   const jobs = jobBlocks(readWorkflow("release-binaries.yml"));
-  assert.deepEqual([...jobs.keys()], ["gate", "build", "attest", "publish", "formula", "formula-pr"]);
+  assert.deepEqual(
+    [...jobs.keys()],
+    ["gate", "build", "attest", "publish", "formula", "formula-pr"],
+  );
 
   // `build` runs pnpm install, the bundler, and the freshly built binary. OIDC
   // there would let any of that code mint provenance for bytes the workflow
@@ -154,6 +157,17 @@ test("the packaged artifact is proven to be a SEA, not a bare Node copy", () => 
   // --version with Node's version. Checking exit status alone shipped one.
   assert.match(build, /the SEA blob was not injected/);
   assert.match(build, /reported.*!=.*expected|\[ "\$reported" != "\$expected" \]/s);
+});
+
+test("each release artifact runs the packaged persistent-session smoke tests", () => {
+  const build = jobBlocks(readWorkflow("release-binaries.yml")).get("build") ?? "";
+  const compileTests = build.indexOf("pnpm run build:test");
+  const packagedTests = build.indexOf(
+    'ACPX_TEST_PACKAGE_BIN="$workdir/acpx" node --test dist-test/test/packaged-bin.test.js',
+  );
+
+  assert.ok(compileTests >= 0, "the release build must compile packaged-bin tests");
+  assert.ok(packagedTests > compileTests, "the built SEA must run the packaged-bin test suite");
 });
 
 test("the SBOM describes the artifact this job actually built", () => {
