@@ -26,6 +26,7 @@ import {
 import type { ClientOperation, NonInteractivePermissionPolicy, PermissionMode } from "../types.js";
 import {
   beginProcessTreeTracking,
+  captureProcessTreePids,
   createManagedProcessTree,
   rememberProcessTreePids,
   signalProcessTree,
@@ -35,6 +36,7 @@ import {
 
 const DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_KILL_GRACE_MS = 1_500;
+const TERMINAL_OUTPUT_DRAIN_GRACE_MS = 50;
 
 type ManagedTerminal = {
   process: ChildProcessByStdio<null, Readable, Readable>;
@@ -236,14 +238,24 @@ export class TerminalManager {
 
       proc.stdout.on("data", appendOutput);
       proc.stderr.on("data", appendOutput);
+      const outputDrained = Promise.all([
+        waitForReadableCompletion(proc.stdout),
+        waitForReadableCompletion(proc.stderr),
+      ]).then(() => {});
       proc.once("exit", (exitCode, signal) => {
         terminal.exitCode = exitCode;
         terminal.signal = signal;
         rememberProcessTreePids(terminal.processTree);
-        terminal.resolveExit({
-          exitCode: exitCode ?? null,
-          signal: signal ?? null,
-        });
+        void (async () => {
+          await Promise.all([
+            captureProcessTreePids(terminal.processTree, false),
+            waitForTerminalOutputDrain(outputDrained),
+          ]);
+          terminal.resolveExit({
+            exitCode: exitCode ?? null,
+            signal: signal ?? null,
+          });
+        })();
       });
 
       const terminalId = randomUUID();
@@ -468,6 +480,31 @@ export class TerminalManager {
       this.killGraceMs,
     );
   }
+}
+
+function waitForReadableCompletion(stream: Readable): Promise<void> {
+  if (stream.readableEnded || stream.closed) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const finish = (): void => {
+      stream.off("end", finish);
+      stream.off("close", finish);
+      resolve();
+    };
+    stream.once("end", finish);
+    stream.once("close", finish);
+  });
+}
+
+async function waitForTerminalOutputDrain(outputDrained: Promise<void>): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, TERMINAL_OUTPUT_DRAIN_GRACE_MS);
+    void outputDrained.then(() => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
 }
 
 async function spawnTerminalProcess(
