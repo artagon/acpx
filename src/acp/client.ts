@@ -108,6 +108,7 @@ import {
   type SessionModelState,
 } from "./model-support.js";
 import {
+  beginProcessTreeTracking,
   captureProcessTreePids,
   createManagedProcessTree,
   rememberProcessTreePids,
@@ -751,6 +752,7 @@ export class AcpClient {
     } catch (error) {
       throw new AgentSpawnError(this.options.agentCommand, error);
     }
+    beginProcessTreeTracking(processTree);
     return requireAgentStdio(spawnedChild);
   }
 
@@ -1412,8 +1414,9 @@ export class AcpClient {
   ): Promise<void> {
     const processTree = this.agentProcessTree ?? createManagedProcessTree(child.pid, true);
     const stdinCloseGraceMs = resolveAgentCloseAfterStdinEndMs(this.options.agentCommand);
-    await captureProcessTreePids(processTree, isChildProcessRunning(child));
+    const processTreeSnapshot = captureProcessTreePids(processTree, isChildProcessRunning(child));
     this.endAgentStdin(child);
+    await processTreeSnapshot;
     let exited = await waitForProcessTreeExit(
       processTree,
       () => isChildProcessRunning(child),

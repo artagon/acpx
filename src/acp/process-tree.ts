@@ -5,6 +5,7 @@ const PROCESS_TREE_POLL_MS = 25;
 export type ManagedProcessTree = {
   rootPid: number | undefined;
   killProcessGroup: boolean;
+  platform: NodeJS.Platform;
   descendantPids: Set<number>;
   snapshotPromise?: Promise<void>;
 };
@@ -12,16 +13,24 @@ export type ManagedProcessTree = {
 export function createManagedProcessTree(
   rootPid: number | undefined,
   killProcessGroup: boolean,
+  platform: NodeJS.Platform = process.platform,
 ): ManagedProcessTree {
   return {
     rootPid,
     killProcessGroup,
+    platform,
     descendantPids: new Set(),
   };
 }
 
 export function rememberProcessTreePids(tree: ManagedProcessTree): void {
-  tree.snapshotPromise = captureProcessTreePids(tree, false);
+  queueProcessTreeSnapshot(tree);
+}
+
+export function beginProcessTreeTracking(tree: ManagedProcessTree): void {
+  if (tree.platform === "win32") {
+    queueProcessTreeSnapshot(tree);
+  }
 }
 
 export async function captureProcessTreePids(
@@ -29,23 +38,44 @@ export async function captureProcessTreePids(
   rootRunning: boolean,
 ): Promise<void> {
   const rootPid = tree.rootPid;
-  // POSIX ownership is the process group created at spawn. Descendants that
-  // deliberately create another session are outside that ownership boundary.
-  if (!tree.killProcessGroup || !rootPid || process.platform !== "win32") {
+  if (!tree.killProcessGroup || !rootPid) {
     return;
   }
-  await waitForPriorSnapshot(tree, rootRunning);
 
-  recordProcessTreePids(tree, await listDescendantPids(rootPid));
+  if (!rootRunning) {
+    await waitForPriorSnapshot(tree);
+    return;
+  }
+
+  await recordCurrentProcessTreePids(tree);
 }
 
-async function waitForPriorSnapshot(tree: ManagedProcessTree, rootRunning: boolean): Promise<void> {
-  if (rootRunning) {
-    return;
-  }
+async function waitForPriorSnapshot(tree: ManagedProcessTree): Promise<void> {
   await tree.snapshotPromise?.catch(() => {
     // Process tree snapshots are best-effort because the root may already be gone.
   });
+}
+
+function queueProcessTreeSnapshot(tree: ManagedProcessTree): void {
+  const priorSnapshot = tree.snapshotPromise;
+  tree.snapshotPromise = (async () => {
+    await priorSnapshot?.catch(() => {
+      // A later snapshot can still succeed after an earlier best-effort failure.
+    });
+    await recordCurrentProcessTreePids(tree);
+  })();
+}
+
+async function recordCurrentProcessTreePids(tree: ManagedProcessTree): Promise<void> {
+  const rootPid = tree.rootPid;
+  if (!tree.killProcessGroup || !rootPid) {
+    return;
+  }
+  const pids =
+    tree.platform === "win32"
+      ? await listDescendantPids(rootPid, tree.platform)
+      : await listProcessGroupPids(rootPid);
+  recordProcessTreePids(tree, pids);
 }
 
 function recordProcessTreePids(tree: ManagedProcessTree, pids: number[]): void {
@@ -71,11 +101,42 @@ export async function signalProcessTree(
   }
 
   await captureProcessTreePids(tree, rootRunning);
-  if (process.platform === "win32") {
-    await signalWindowsProcessTree(tree, rootRunning, signal);
-    return;
+  for (const target of resolveProcessTreeSignalTargets(tree, rootRunning)) {
+    if (target.tree) {
+      await killWindowsProcessTree(target.pid, signal);
+    } else {
+      sendSignal(target.pid, signal);
+    }
   }
-  signalPosixProcessTree(tree, signal);
+}
+
+export type ProcessTreeSignalTarget = {
+  pid: number;
+  tree: boolean;
+};
+
+export function resolveProcessTreeSignalTargets(
+  tree: ManagedProcessTree,
+  rootRunning: boolean,
+): ProcessTreeSignalTarget[] {
+  const rootPid = tree.rootPid;
+  if (!rootPid) {
+    return [];
+  }
+  if (!tree.killProcessGroup) {
+    return [{ pid: rootPid, tree: false }];
+  }
+  if (tree.platform === "win32") {
+    return rootRunning
+      ? [{ pid: rootPid, tree: true }]
+      : Array.from(tree.descendantPids, (pid) => ({ pid, tree: true }));
+  }
+  if (rootRunning) {
+    return [{ pid: -rootPid, tree: false }];
+  }
+  // Once the root exits, its numeric PID/PGID can be recycled. Signal only
+  // members captured while the owned group still existed.
+  return Array.from(tree.descendantPids, (pid) => ({ pid, tree: false }));
 }
 
 export async function waitForProcessTreeExit(
@@ -84,54 +145,38 @@ export async function waitForProcessTreeExit(
   timeoutMs: number,
 ): Promise<boolean> {
   const deadline = Date.now() + Math.max(0, timeoutMs);
-  while (rootRunning() || hasLiveManagedProcessTree(tree)) {
+  let rootIsRunning = rootRunning();
+  while (rootIsRunning || hasLiveManagedProcessTree(tree, rootIsRunning)) {
     if (Date.now() >= deadline) {
       return false;
     }
     await waitMs(Math.min(PROCESS_TREE_POLL_MS, Math.max(0, deadline - Date.now())));
+    rootIsRunning = rootRunning();
   }
   return true;
 }
 
-async function signalWindowsProcessTree(
-  tree: ManagedProcessTree,
-  rootRunning: boolean,
-  signal: NodeJS.Signals,
-): Promise<void> {
-  const rootPid = tree.rootPid;
-  if (rootRunning && rootPid) {
-    await killWindowsProcessTree(rootPid, signal);
-    return;
-  }
-  for (const descendantPid of tree.descendantPids) {
-    await killWindowsProcessTree(descendantPid, signal);
-  }
-}
-
-function signalPosixProcessTree(tree: ManagedProcessTree, signal: NodeJS.Signals): void {
-  const rootPid = tree.rootPid;
-  if (rootPid && hasLiveProcessGroup(rootPid)) {
-    sendSignal(-rootPid, signal);
-  }
-}
-
-function hasLiveManagedProcessTree(tree: ManagedProcessTree): boolean {
+function hasLiveManagedProcessTree(tree: ManagedProcessTree, rootRunning: boolean): boolean {
   const rootPid = tree.rootPid;
   if (
+    rootRunning &&
     tree.killProcessGroup &&
     rootPid &&
-    process.platform !== "win32" &&
+    tree.platform !== "win32" &&
     hasLiveProcessGroup(rootPid)
   ) {
     return true;
   }
-  return process.platform === "win32" && hasLivePid(tree.descendantPids);
+  return hasLivePid(tree.descendantPids);
 }
 
-async function listDescendantPids(rootPid: number): Promise<number[]> {
+async function listDescendantPids(
+  rootPid: number,
+  platform: NodeJS.Platform = process.platform,
+): Promise<number[]> {
   let output: string;
   try {
-    output = await runProcessListCommand();
+    output = await runProcessListCommand(platform);
   } catch {
     return [];
   }
@@ -179,11 +224,29 @@ function parseProcessListLine(line: string): { pid: number; parentPid: number } 
   return { pid, parentPid };
 }
 
-async function runProcessListCommand(): Promise<string> {
-  if (process.platform === "win32") {
+async function runProcessListCommand(platform: NodeJS.Platform): Promise<string> {
+  if (platform === "win32") {
     return await runWindowsProcessListCommand();
   }
   return await runPsCommand(["-eo", "pid=,ppid="]);
+}
+
+async function listProcessGroupPids(processGroupId: number): Promise<number[]> {
+  let output: string;
+  try {
+    output = await runPsCommand(["-eo", "pid=,pgid="]);
+  } catch {
+    return [];
+  }
+
+  const pids: number[] = [];
+  for (const line of output.split("\n")) {
+    const parsed = parseProcessListLine(line);
+    if (parsed?.parentPid === processGroupId) {
+      pids.push(parsed.pid);
+    }
+  }
+  return pids;
 }
 
 async function runPsCommand(args: string[]): Promise<string> {

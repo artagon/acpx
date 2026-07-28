@@ -45,7 +45,9 @@ Repo: https://github.com/openclaw/acpx
 
 - CLI/status: report a normal cold-start session as `agent starting` while preserving `needs reconnect` for an unreachable live owner. Thanks @guettli.
 
-- Runtime/agents: terminate the owned adapter process group/tree during normal and failed startup cleanup so package-exec wrappers cannot leave descendants running after ACPX exits.
+- Runtime/agents: terminate owned adapter process groups on POSIX and best-effort tracked process trees on Windows during normal and failed startup cleanup so package-exec wrappers do not leave captured descendants running after ACPX exits.
+
+- Runtime/queue: treat a cold-start owner lease that has not bound its socket yet as a startup miss without a second health probe, allowing the caller to recover instead of reporting `QUEUE_NOT_ACCEPTING_REQUESTS`.
 
 ## 2026.7.23 (v0.12.1)
 

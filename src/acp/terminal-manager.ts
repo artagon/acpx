@@ -25,6 +25,7 @@ import {
 } from "../spawn-command-options.js";
 import type { ClientOperation, NonInteractivePermissionPolicy, PermissionMode } from "../types.js";
 import {
+  beginProcessTreeTracking,
   createManagedProcessTree,
   rememberProcessTreePids,
   signalProcessTree,
@@ -218,6 +219,7 @@ export class TerminalManager {
         exitPromise,
         resolveExit,
       };
+      beginProcessTreeTracking(terminal.processTree);
 
       const appendOutput = (chunk: Buffer | string): void => {
         const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);

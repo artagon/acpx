@@ -12,6 +12,7 @@ import {
   trySubmitToRunningOwner,
 } from "../src/cli/queue/ipc.js";
 import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
+import { getPerfMetricsSnapshot, resetPerfMetrics } from "../src/perf-metrics.js";
 import type { OutputFormatter } from "../src/types.js";
 import {
   cleanupOwnerArtifacts,
@@ -800,6 +801,38 @@ test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", asy
       await assert.rejects(fs.access(lockPath));
     } finally {
       await closeServer(server);
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("startup probe treats lease-before-bind as a miss without a health reconnect", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "startup-lease-before-bind";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+    });
+
+    resetPerfMetrics();
+    try {
+      const outcome = await trySubmitToRunningOwner({
+        sessionId,
+        message: "hello",
+        permissionMode: "approve-reads",
+        outputFormatter: NOOP_OUTPUT_FORMATTER,
+        waitForCompletion: true,
+        startupProbe: true,
+      });
+      assert.equal(outcome, undefined);
+      assert.equal(getPerfMetricsSnapshot().timings["queue.connect"]?.count, 1);
+    } finally {
+      resetPerfMetrics();
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);
     }

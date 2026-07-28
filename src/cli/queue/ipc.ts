@@ -711,11 +711,15 @@ function assertQueueOwnerMcpConfigMatches(
   );
 }
 
-function unavailableOwnerCountsAsMissing(
-  health: QueueOwnerHealth,
+async function unavailableOwnerCountsAsMissing(
+  sessionId: string,
   startupProbe: boolean | undefined,
-): boolean {
-  return !health.hasLease || startupProbe === true;
+): Promise<boolean> {
+  if (startupProbe) {
+    return true;
+  }
+  const health = await probeQueueOwnerHealth(sessionId);
+  return !health.hasLease;
 }
 
 export async function trySubmitToRunningOwner(
@@ -754,8 +758,7 @@ export async function trySubmitToRunningOwner(
     return submitted;
   }
 
-  const health = await probeQueueOwnerHealth(options.sessionId);
-  if (unavailableOwnerCountsAsMissing(health, options.startupProbe)) {
+  if (await unavailableOwnerCountsAsMissing(options.sessionId, options.startupProbe)) {
     return undefined;
   }
 
