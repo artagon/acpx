@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isSea } from "node:sea";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AuthPolicy,
@@ -131,7 +132,11 @@ export function sanitizeQueueOwnerExecArgv(
 export function buildQueueOwnerArgOverride(
   entryPath: string,
   execArgv: readonly string[] = process.execArgv,
+  runningInSea: boolean = isSea(),
 ): string | null {
+  if (runningInSea) {
+    return null;
+  }
   const sanitized = sanitizeQueueOwnerExecArgv(execArgv);
   if (sanitized.length === 0) {
     return null;
@@ -139,7 +144,10 @@ export function buildQueueOwnerArgOverride(
   return JSON.stringify([...sanitized, entryPath, "__queue-owner"]);
 }
 
-export function resolveQueueOwnerSpawnArgs(argv: readonly string[] = process.argv): string[] {
+export function resolveQueueOwnerSpawnArgs(
+  argv: readonly string[] = process.argv,
+  runningInSea: boolean = isSea(),
+): string[] {
   const override = process.env.ACPX_QUEUE_OWNER_ARGS;
   if (override) {
     const parsed = JSON.parse(override) as unknown;
@@ -147,6 +155,10 @@ export function resolveQueueOwnerSpawnArgs(argv: readonly string[] = process.arg
       return [...parsed];
     }
     throw new Error("acpx self-spawn failed: invalid ACPX_QUEUE_OWNER_ARGS");
+  }
+
+  if (runningInSea) {
+    return ["__queue-owner"];
   }
 
   const entry = argv[1];

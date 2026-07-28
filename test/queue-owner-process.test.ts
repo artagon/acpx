@@ -39,7 +39,7 @@ async function waitForCondition(
 }
 
 describe("resolveQueueOwnerSpawnArgs", () => {
-  it("prefers ACPX_QUEUE_OWNER_ARGS when provided", () => {
+  it("prefers ACPX_QUEUE_OWNER_ARGS when provided, including in a SEA", () => {
     const previous = process.env.ACPX_QUEUE_OWNER_ARGS;
     process.env.ACPX_QUEUE_OWNER_ARGS = JSON.stringify([
       "--import",
@@ -48,7 +48,7 @@ describe("resolveQueueOwnerSpawnArgs", () => {
       "__queue-owner",
     ]);
     try {
-      const args = resolveQueueOwnerSpawnArgs(["node", "ignored.js"]);
+      const args = resolveQueueOwnerSpawnArgs(["acpx", "acpx"], true);
       assert.deepEqual(args, ["--import", "tsx", "src/cli.ts", "__queue-owner"]);
     } finally {
       if (previous === undefined) {
@@ -57,6 +57,14 @@ describe("resolveQueueOwnerSpawnArgs", () => {
         process.env.ACPX_QUEUE_OWNER_ARGS = previous;
       }
     }
+  });
+
+  it("runs the embedded entrypoint directly in a SEA", () => {
+    assert.deepEqual(resolveQueueOwnerSpawnArgs(["acpx", "acpx"], true), ["__queue-owner"]);
+  });
+
+  it("does not require a JavaScript entry path in a SEA", () => {
+    assert.deepEqual(resolveQueueOwnerSpawnArgs(["acpx"], true), ["__queue-owner"]);
   });
 
   it("returns <real cli path> and __queue-owner", async () => {
@@ -111,6 +119,13 @@ describe("sanitizeQueueOwnerExecArgv", () => {
 });
 
 describe("buildQueueOwnerArgOverride", () => {
+  it("does not create a JavaScript entry override in a SEA", () => {
+    assert.equal(
+      buildQueueOwnerArgOverride("/snapshot/acpx/cli.js", ["--import", "tsx"], true),
+      null,
+    );
+  });
+
   it("returns null when no loader args remain after sanitization", () => {
     assert.equal(
       buildQueueOwnerArgOverride("/tmp/cli.js", [
@@ -274,6 +289,7 @@ describe("spawnQueueOwnerProcess startup capture lifecycle", () => {
     `;
     const ownerArgs = JSON.stringify(["--input-type=module", "-e", ownerCode]);
     const probe = `
+      import { writeSync } from "node:fs";
       import { spawnQueueOwnerProcess } from ${JSON.stringify(moduleUrl)};
       process.env.ACPX_QUEUE_OWNER_ARGS = ${JSON.stringify(ownerArgs)};
       const handle = spawnQueueOwnerProcess({
@@ -281,7 +297,7 @@ describe("spawnQueueOwnerProcess startup capture lifecycle", () => {
         permissionMode: "approve-reads",
       });
       handle.stopStartupCapture();
-      console.log(handle.pid);
+      writeSync(1, String(handle.pid));
     `;
 
     const result = spawnSync(process.execPath, ["--input-type=module", "--eval", probe], {
@@ -295,7 +311,10 @@ describe("spawnQueueOwnerProcess startup capture lifecycle", () => {
         0,
         `submitter did not exit independently: ${result.stderr || String(result.signal)}`,
       );
-      assert.ok(Number.isInteger(ownerPid) && ownerPid > 0, "expected detached owner pid");
+      assert.ok(
+        Number.isInteger(ownerPid) && ownerPid > 0,
+        `expected detached owner pid; stdout=${JSON.stringify(result.stdout)} stderr=${JSON.stringify(result.stderr)}`,
+      );
       assert.doesNotThrow(() => process.kill(ownerPid, 0), "owner should still be running");
     } finally {
       if (Number.isInteger(ownerPid) && ownerPid > 0) {
