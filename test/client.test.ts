@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -1276,6 +1278,76 @@ test("AcpClient start fails fast when the agent exits during initialize", async 
   assert(Date.now() - startedAt < 2_000);
 });
 
+test("AcpClient startup failure kills descendants left by an exited npx wrapper", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-startup-tree-"));
+  const packageDir = path.join(tempDir, "adapter-package");
+  const processInfoPath = path.join(tempDir, "process-info.json");
+  let descendantPid: number | undefined;
+
+  try {
+    await fs.mkdir(packageDir, { recursive: true });
+    await fs.writeFile(
+      path.join(packageDir, "package.json"),
+      `${JSON.stringify({
+        name: "acpx-startup-tree-fixture",
+        version: "1.0.0",
+        bin: { "acpx-startup-tree-fixture": "adapter.cjs" },
+      })}\n`,
+    );
+    const adapterPath = path.join(packageDir, "adapter.cjs");
+    await fs.writeFile(
+      adapterPath,
+      [
+        "#!/usr/bin/env node",
+        'const { spawn } = require("node:child_process");',
+        'const fs = require("node:fs");',
+        'const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000);"], { stdio: "ignore" });',
+        `fs.writeFileSync(${JSON.stringify(processInfoPath)}, JSON.stringify({ adapterPid: process.pid, descendantPid: child.pid }));`,
+        "setTimeout(() => process.exit(17), 100);",
+        "",
+      ].join("\n"),
+    );
+    await fs.chmod(adapterPath, 0o755);
+
+    const client = makeClient({
+      agentCommand: `npx --yes --offline --package ${JSON.stringify(packageDir)} -- acpx-startup-tree-fixture`,
+      cwd: tempDir,
+      sessionOptions: {
+        env: {
+          HOME: tempDir,
+          npm_config_cache: path.join(tempDir, "npm-cache"),
+        },
+      },
+    });
+
+    await assert.rejects(() => client.start(), AgentStartupError);
+    const processInfo = JSON.parse(await fs.readFile(processInfoPath, "utf8")) as {
+      adapterPid: number;
+      descendantPid: number;
+    };
+    descendantPid = processInfo.descendantPid;
+    assert.notEqual(
+      processInfo.adapterPid,
+      descendantPid,
+      "fixture must create a separate stubborn descendant",
+    );
+    assert.equal(
+      isPidAlive(descendantPid),
+      false,
+      "startup cleanup must not leave the adapter descendant alive",
+    );
+  } finally {
+    if (descendantPid) {
+      await terminateTestPid(descendantPid);
+    }
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("AcpClient close resets in-memory state and shuts down terminal manager", async () => {
   const client = makeClient();
   const internals = asInternals(client);
@@ -1352,6 +1424,26 @@ function makeClient(
     permissionMode: "approve-reads",
     ...overrides,
   });
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function terminateTestPid(pid: number): Promise<void> {
+  if (!isPidAlive(pid)) {
+    return;
+  }
+  process.kill(pid, "SIGKILL");
+  const deadline = Date.now() + 2_000;
+  while (isPidAlive(pid) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 function asInternals(client: AcpClient): ClientInternals {

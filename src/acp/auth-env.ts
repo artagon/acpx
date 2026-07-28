@@ -174,12 +174,14 @@ export function buildAgentSpawnOptions(
   sessionEnv?: Record<string, string>,
 ): {
   cwd: string;
+  detached: true;
   env: NodeJS.ProcessEnv;
   stdio: ["pipe", "pipe", "pipe"];
   windowsHide: true;
 } {
   return {
     cwd,
+    detached: true,
     env: buildAgentEnvironment(authCredentials, sessionEnv),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
