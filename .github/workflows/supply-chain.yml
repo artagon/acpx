@@ -138,9 +138,6 @@ jobs:
       - name: Action pins match their version comments
         run: |
           set -euo pipefail
-          # A pin that names a tag object rather than a commit fails to resolve;
-          # a pin that names an unrelated commit resolves to unintended code.
-          # Both have happened here.
           fail=0
           while IFS= read -r line; do
             ref="${line#*uses: }"
@@ -148,9 +145,25 @@ jobs:
             sha="${rest%% *}"; tag="${rest##*# }"
             [ "$sha" = "$rest" ] && continue
             repo="$(cut -d/ -f1,2 <<<"$action")"
-            actual="$(gh api "repos/${repo}/commits/${sha}" --jq .sha 2>/dev/null || true)"
-            if [ -z "$actual" ]; then
-              echo "::error::${repo}@${sha} (${tag}) is not a commit in that repository."
+
+            tag_ref="$(gh api "repos/${repo}/git/ref/tags/${tag}" --jq '.object | [.type, .sha] | @tsv' 2>/dev/null || true)"
+            if [ -z "$tag_ref" ]; then
+              echo "::error::${repo} has no tag ${tag}."
+              fail=1
+              continue
+            fi
+
+            read -r tag_type tag_sha <<<"$tag_ref"
+            for _ in 1 2 3 4 5; do
+              [ "$tag_type" != "tag" ] && break
+              tag_ref="$(gh api "repos/${repo}/git/tags/${tag_sha}" --jq '.object | [.type, .sha] | @tsv' 2>/dev/null || true)"
+              [ -z "$tag_ref" ] && break
+              read -r tag_type tag_sha <<<"$tag_ref"
+            done
+
+            resolved_sha="$tag_sha"
+            if [ "$tag_type" != "commit" ] || [ "$resolved_sha" != "$sha" ]; then
+              echo "::error::${repo}@${sha} does not match ${tag} (resolved ${tag_type}:${resolved_sha})."
               fail=1
             fi
           done < <(grep -rhoE 'uses: [^@]+@[0-9a-f]{40} # \S+' .github/workflows/)

@@ -137,6 +137,19 @@ test("the npm SBOM catalogs the pruned production closure", () => {
   assert.doesNotMatch(release, /cp package\.json pnpm-lock\.yaml pnpm-workspace\.yaml/);
 });
 
+test("the npm SBOM generator is immutable and removes nondeterministic metadata", () => {
+  const release = readWorkflow("release.yml");
+
+  assert.doesNotMatch(release, /anchore\/sbom-action/);
+  assert.match(release, /SYFT_VERSION: 1\.44\.0/);
+  assert.match(release, /SYFT_LINUX_AMD64_SHA256: [0-9a-f]{64}/);
+  assert.match(release, /releases\/download\/v\$\{SYFT_VERSION\}/);
+  assert.match(release, /sha256sum --check/);
+  assert.match(release, /"\$\{RUNNER_TEMP\}\/syft\/syft"/);
+  assert.match(release, /delete bom\.serialNumber/);
+  assert.match(release, /delete bom\.metadata\.timestamp/);
+});
+
 test("binary releases fail closed unless repository immutability is enabled", () => {
   const gate = jobBlocks(readWorkflow("release-binaries.yml")).get("gate") ?? "";
 
@@ -148,6 +161,14 @@ test("binary releases fail closed unless repository immutability is enabled", ()
   );
   assert.match(gate, /if \[ -z "\$GH_TOKEN" \]/);
   assert.match(gate, /if \[ "\$enabled" != "true" \]/);
+});
+
+test("action pin comments are verified against the referenced tags", () => {
+  const policy = jobBlocks(readWorkflow("supply-chain.yml")).get("policy") ?? "";
+
+  assert.match(policy, /git\/ref\/tags\/\$\{tag\}/);
+  assert.match(policy, /git\/tags\/\$\{tag_sha\}/);
+  assert.match(policy, /\[ "\$resolved_sha" != "\$sha" \]/);
 });
 
 test("every release stage stays bound to the gate-validated commit", () => {

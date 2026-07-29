@@ -8,40 +8,10 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
-- Startup: module init drops from 68.1ms to 16.6ms (-76%) by moving
-  `@agentclientprotocol/sdk` and its transitive zod out of the eager import
-  graph. acpx uses three runtime values from the SDK; every other import was
-  already `import type`. Five import edges had to move together — cutting any
-  subset is worth ~0, because the bundler re-merges `src/acp/client.ts` into an
-  eager chunk. Commands that never load the session module (`--version`,
-  `--help`, `config`, `sessions list --local`, `sessions history/show/export`)
-  get the full win; ACP commands pay the SDK later instead, inside
-  `sessions.list.load_session_module` (~60-78ms).
-- Teardown: `AcpClientOptions.fastTeardown` shortens the shutdown grace ladder
-  from 1500/1000ms to 150/250ms for read-only single-shot operations, currently
-  `sessions list`. Adapters that ignore stdin-end previously cost the full
-  SIGTERM grace on every invocation — copilot teardown drops from 1614ms to
-  264ms. Escalation to SIGKILL is unchanged, so the child is still reaped.
-- Capability cache: `copilot --help` was re-run on every launch to check for
-  `--acp` support (~386ms). That answer is a property of the binary, so it is
-  now cached under `~/.acpx/cache/` keyed by a fingerprint of realpath, size and
-  mtime; the probe drops to ~6ms. Only definite answers are cached, and every
-  failure path degrades to a cache miss.
-- Observability: nine opt-in perf spans across `sessions list` and `AcpClient`
-  (`sessions.list.{total,permission_policy,load_session_module,client_start,rpc,close}`,
-  `acp.start.{resolve_launch,launch_support,spawn,initialize}`,
-  `acp.initialize.{rpc,authenticate}`), enabled via `ACPX_PERF_METRICS_FILE`.
-  They attribute `sessions list` to a single ACP `initialize` round-trip rather
-  than to process creation — spawn is ~4ms and authenticate ~0.4ms.
 - Packaging: `pnpm run sea` builds a self-contained single executable (Node SEA
   plus V8 startup snapshot) that needs no system Node and starts in 50.2ms
   versus 77.1ms for the npm install. See `docs/packaging.md` and
-  `packaging/homebrew/acpx.rb`.
-- CI: `pnpm run lint:eager-graph` fails the build if any third-party package
-  other than commander enters the eager startup chunk closure. The regression it
-  guards is silent — one value import from the `session/session.js` barrel
-  re-welds the SDK into startup with nothing visibly breaking — so it is a
-  static assertion rather than a benchmark.
+  `Formula/acpx.rb`.
 
 ### Breaking
 
