@@ -154,11 +154,16 @@ test("every release stage stays bound to the gate-validated commit", () => {
   assert.match(formula, /ref: \$\{\{ needs\.gate\.outputs\.sha \}\}/);
   assert.doesNotMatch(build, /ref: \$\{\{ inputs\.tag/);
 
-  // The final writer dereferences the remote tag immediately before publishing
-  // the draft, when repository release immutability freezes it.
+  // The final writer dereferences the remote tag both before draft work and
+  // again after upload, immediately before immutable publication freezes it.
   assert.match(publish, /git\/ref\/tags\/\$\{TAG\}/);
   assert.match(publish, /git\/tags\/\$\{object_sha\}/);
   assert.match(publish, /object_sha.*VALIDATED_SHA/);
+  assert.equal(publish.match(/^\s+assert_tag_matches$/gm)?.length, 2);
+  const upload = publish.indexOf("gh release upload");
+  const finalTagCheck = publish.lastIndexOf("assert_tag_matches");
+  const publishLive = publish.indexOf("gh release edit");
+  assert.ok(upload < finalTagCheck && finalTagCheck < publishLive);
 });
 
 test("every artifact gets both provenance and an SBOM attestation", () => {

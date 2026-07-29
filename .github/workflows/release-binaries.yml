@@ -401,22 +401,28 @@ jobs:
           VALIDATED_SHA: ${{ needs.gate.outputs.sha }}
         run: |
           set -euo pipefail
-          # The tag is still mutable until publication. Dereference annotated
-          # tags through the Git data API and fail if it moved after the gate.
-          read -r object_type object_sha < <(
-            gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" \
-              --jq '.object | [.type, .sha] | @tsv'
-          )
-          while [ "$object_type" = "tag" ]; do
+          assert_tag_matches() {
+            local object_type object_sha
+
+            # The tag is mutable until publication. Dereference annotated tags
+            # through the Git data API and fail if it moved after the gate.
             read -r object_type object_sha < <(
-              gh api "repos/${GH_REPO}/git/tags/${object_sha}" \
+              gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" \
                 --jq '.object | [.type, .sha] | @tsv'
             )
-          done
-          if [ "$object_type" != "commit" ] || [ "$object_sha" != "$VALIDATED_SHA" ]; then
-            echo "::error::$TAG moved after validation; expected $VALIDATED_SHA, resolved ${object_type}:${object_sha}."
-            exit 1
-          fi
+            while [ "$object_type" = "tag" ]; do
+              read -r object_type object_sha < <(
+                gh api "repos/${GH_REPO}/git/tags/${object_sha}" \
+                  --jq '.object | [.type, .sha] | @tsv'
+              )
+            done
+            if [ "$object_type" != "commit" ] || [ "$object_sha" != "$VALIDATED_SHA" ]; then
+              echo "::error::$TAG moved after validation; expected $VALIDATED_SHA, resolved ${object_type}:${object_sha}."
+              exit 1
+            fi
+          }
+
+          assert_tag_matches
 
           # Immutable releases freeze assets at publication, so everything is
           # attached to a draft first and the draft is flipped live last. The
@@ -445,6 +451,9 @@ jobs:
           done
 
           gh release upload "$TAG" assets/*.tar.gz assets/*.cdx.json assets/SHA256SUMS
+          # Upload can take long enough for a concurrent tag update. Check again
+          # at the last possible point before immutable publication freezes it.
+          assert_tag_matches
           gh release edit "$TAG" --draft=false
           echo "Published $TAG; assets and tag are now immutable."
 
