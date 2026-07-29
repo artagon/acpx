@@ -425,7 +425,7 @@ async function submitToQueueOwner(
   return await runQueueOwnerRequest<SessionSendOutcome>({
     owner,
     request,
-    connectAttempts: options.startupProbe ? 1 : undefined,
+    connectAttempts: options.startupProbe && queueOwnerIsWithinStartupGrace(owner) ? 1 : undefined,
     onAccepted: ({ resolve }) => {
       options.onQueueAccepted?.();
       options.outputFormatter.setContext({

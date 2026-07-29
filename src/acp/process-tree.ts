@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 
 const PROCESS_TREE_POLL_MS = 25;
 const PROCESS_LIST_COMMAND_TIMEOUT_MS = 1_000;
+const WINDOWS_PROCESS_LIST_COMMAND_TIMEOUT_MS = 5_000;
 const PROCESS_TREE_TRACKING_INITIAL_POLL_MS = 25;
 const PROCESS_TREE_TRACKING_MAX_POLL_MS = 1_000;
 const PROCESS_TREE_TRACKING_MAX_DURATION_MS = 10_000;
@@ -519,23 +520,33 @@ async function listOwnedPosixProcesses(tree: ManagedProcessTree): Promise<Proces
   if (!processList) {
     return [];
   }
+  const root = processList.find((entry) => entry.pid === rootPid);
+  if (!posixRootIdentityMatches(tree, root)) {
+    return [];
+  }
   const ownedByPid = new Map(
     processList
       .filter((entry) => entry.processGroupId === rootPid)
       .map((entry) => [entry.pid, entry]),
   );
-  const root = processList.find((entry) => entry.pid === rootPid);
-  if (
-    root &&
-    (!tree.rootIdentity || tree.rootIdentity === root.identity) &&
-    root.processGroupId === rootPid
-  ) {
+  if (root) {
     tree.rootIdentity = root.identity;
     for (const descendant of walkValidatedDescendants(root, indexProcessesByParent(processList))) {
       ownedByPid.set(descendant.pid, descendant);
     }
   }
   return [...ownedByPid.values()];
+}
+
+function posixRootIdentityMatches(
+  tree: ManagedProcessTree,
+  root: ProcessListEntry | undefined,
+): boolean {
+  return (
+    !root ||
+    (root.processGroupId === tree.rootPid &&
+      (tree.rootIdentity === undefined || tree.rootIdentity === root.identity))
+  );
 }
 
 async function refreshExitedProcessTreePids(tree: ManagedProcessTree): Promise<boolean> {
@@ -592,9 +603,8 @@ function discoverCurrentPosixGroupMembers(
   const currentGroup = processList.filter((entry) => entry.processGroupId === rootPid);
   if (currentGroup.some((entry) => entry.pid === rootPid)) {
     // A live process whose PID equals the old group leader means the numeric
-    // PID/PGID was recycled after the owned group became empty.
-    tree.descendantPids.clear();
-    tree.descendantIdentities.clear();
+    // PID/PGID was recycled. Do not adopt ambiguous group members, but retain
+    // descendants whose identities were validated by retainCurrentProcessTreePids.
     return;
   }
   recordProcessTreePids(tree, currentGroup);
@@ -617,6 +627,8 @@ async function runWindowsProcessListCommand(): Promise<string> {
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-Command", command],
     "powershell process list",
+    undefined,
+    WINDOWS_PROCESS_LIST_COMMAND_TIMEOUT_MS,
   );
 }
 
@@ -625,6 +637,7 @@ async function runCapturedCommand(
   args: string[],
   description: string,
   env?: NodeJS.ProcessEnv,
+  timeoutMs = PROCESS_LIST_COMMAND_TIMEOUT_MS,
 ): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     const child = spawn(command, args, {
@@ -658,9 +671,9 @@ async function runCapturedCommand(
       }
       child.unref();
       finish({
-        error: new Error(`${description} did not exit within ${PROCESS_LIST_COMMAND_TIMEOUT_MS}ms`),
+        error: new Error(`${description} did not exit within ${timeoutMs}ms`),
       });
-    }, PROCESS_LIST_COMMAND_TIMEOUT_MS);
+    }, timeoutMs);
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");

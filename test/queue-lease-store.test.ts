@@ -9,6 +9,7 @@ import {
   claimQueueOwnerLock,
   ensureOwnerIsUsable,
   isProcessAlive,
+  type QueueOwnerLease,
   readQueueOwnerRecord,
   readQueueOwnerStatus,
   refreshQueueOwnerLease,
@@ -310,7 +311,7 @@ test("lock claims serialize cross-process refresh and release mutations", async 
 
     await refreshQueueOwnerLease(lease, { queueDepth: 7 });
     assert.equal(await claim.isHeld(), true);
-    await releaseQueueOwnerLease({ ...lease });
+    await assert.rejects(releaseQueueOwnerLease(lease), /lease release is busy.*retry cleanup/);
     assert.equal(await claim.isHeld(), true);
     const blockedRecord = await readQueueOwnerRecord(sessionId);
     assert(blockedRecord);
@@ -368,6 +369,46 @@ test("lock claims recover after a claimant crashes", async () => {
   });
 });
 
+test("owner shutdown defers lease removal to a live external cleanup claimant", async () => {
+  await withTempHome(async () => {
+    const sessionId = "external-cleaner-owner-shutdown";
+    const modulePath = fileURLToPath(new URL("../src/cli/queue/lease-store.js", import.meta.url));
+    const script = `
+      const { releaseQueueOwnerLease, tryAcquireQueueOwnerLease } = await import(${JSON.stringify(modulePath)});
+      const lease = await tryAcquireQueueOwnerLease(${JSON.stringify(sessionId)});
+      if (!lease) process.exit(2);
+      process.stdout.write(JSON.stringify(lease) + "\\n");
+      process.on("SIGTERM", () => {
+        void releaseQueueOwnerLease(lease).then(
+          () => process.exit(0),
+          () => process.exit(1),
+        );
+      });
+      setInterval(() => {}, 60_000);
+    `;
+    const owner = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", script],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+
+    try {
+      const lease = JSON.parse((await waitForChildOutput(owner)).toString()) as QueueOwnerLease;
+      const claim = await claimQueueOwnerLock(lease.lockPath, lease.ownerGeneration);
+      assert(claim);
+      owner.kill("SIGTERM");
+      const [code] = (await once(owner, "exit")) as [number | null, NodeJS.Signals | null];
+      assert.equal(code, 0);
+      await claim.release();
+      await fs.rm(lease.lockPath, { force: true });
+    } finally {
+      if (owner.exitCode == null && owner.signalCode == null) {
+        owner.kill("SIGKILL");
+      }
+    }
+  });
+});
+
 test("explicit cleanup waits for an active lease claim", async () => {
   await withTempHome(async () => {
     const sessionId = "cleanup-claim-contention";
@@ -384,6 +425,46 @@ test("explicit cleanup waits for an active lease claim", async () => {
     await claim.release();
     await cleanup;
 
+    assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+  });
+});
+
+test("lease release waits for an active same-generation claim", async () => {
+  await withTempHome(async () => {
+    const sessionId = "release-claim-contention";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+    const claim = await claimQueueOwnerLock(lease.lockPath, lease.ownerGeneration);
+    assert(claim);
+
+    const release = releaseQueueOwnerLease(lease);
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    assert(await readQueueOwnerRecord(sessionId));
+    await claim.release();
+    await release;
+
+    assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+  });
+});
+
+test("explicit cleanup succeeds when a contended lease is concurrently removed", async () => {
+  await withTempHome(async () => {
+    const sessionId = "cleanup-concurrent-removal";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+    const claim = await claimQueueOwnerLock(lease.lockPath, lease.ownerGeneration);
+    assert(claim);
+
+    const cleanup = terminateQueueOwnerForSession(sessionId);
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    await fs.rm(lease.lockPath);
+    await claim.release();
+
+    await cleanup;
     assert.equal(await readQueueOwnerRecord(sessionId), undefined);
   });
 });
@@ -532,6 +613,61 @@ test("restoring a displaced lock claim never overwrites a concurrent claim", asy
       );
     } finally {
       fs.rename = originalRename;
+      await fs.rm(claimPath, { force: true });
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
+test("a claim released while temporarily displaced is not restored as an orphan", async () => {
+  await withTempHome(async () => {
+    const sessionId = "displaced-claim-release-race";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+    const lockStat = await fs.lstat(lease.lockPath);
+    const claimPath = `${lease.lockPath}.claim-${lockStat.dev}-${lockStat.ino}`;
+    await fs.writeFile(
+      claimPath,
+      `${JSON.stringify({ claimId: "stale-claim", pid: 999_999_999 })}\n`,
+      "utf8",
+    );
+
+    const originalLink = fs.link;
+    const originalRename = fs.rename;
+    let concurrentClaim: Awaited<ReturnType<typeof claimQueueOwnerLock>>;
+    let raceInjected = false;
+    fs.rename = async (oldPath, newPath): Promise<void> => {
+      if (
+        !raceInjected &&
+        oldPath === claimPath &&
+        String(newPath).startsWith(`${claimPath}.reap-`)
+      ) {
+        raceInjected = true;
+        await fs.unlink(claimPath);
+        concurrentClaim = await claimQueueOwnerLock(lease.lockPath, lease.ownerGeneration);
+        assert(concurrentClaim);
+      }
+      await originalRename(oldPath, newPath);
+    };
+    fs.link = async (existingPath, newPath): Promise<void> => {
+      if (
+        raceInjected &&
+        concurrentClaim &&
+        String(existingPath).startsWith(`${claimPath}.reap-`) &&
+        newPath === claimPath
+      ) {
+        await concurrentClaim.release();
+      }
+      await originalLink(existingPath, newPath);
+    };
+
+    try {
+      assert.equal(await claimQueueOwnerLock(lease.lockPath, lease.ownerGeneration), undefined);
+      assert.equal(raceInjected, true);
+      await assert.rejects(fs.access(claimPath));
+    } finally {
+      fs.rename = originalRename;
+      fs.link = originalLink;
       await fs.rm(claimPath, { force: true });
       await releaseQueueOwnerLease(lease);
     }

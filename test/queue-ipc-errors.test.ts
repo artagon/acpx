@@ -897,12 +897,70 @@ test("startup probe fails closed for an older live owner without a socket", asyn
           return true;
         },
       );
-      assert.equal(getPerfMetricsSnapshot().timings["queue.connect"]?.count, 1);
+      assert((getPerfMetricsSnapshot().timings["queue.connect"]?.count ?? 0) > 1);
       await fs.access(lockPath);
       assert.equal(keeper.exitCode, null);
       assert.equal(keeper.signalCode, null);
     } finally {
       resetPerfMetrics();
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("startup probe retries a transient connection failure for an established owner", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "startup-established-owner-transient-connect";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      createdAt: "2000-01-01T00:00:00.000Z",
+      heartbeatAt: new Date().toISOString(),
+    });
+
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "submit_prompt");
+      socket.write(
+        `${JSON.stringify({
+          type: "accepted",
+          requestId: request.requestId,
+        })}\n`,
+      );
+      socket.end();
+    });
+    const delayedListen = new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        void listenServer(server, socketPath).then(resolve, reject);
+      }, 75);
+    });
+
+    resetPerfMetrics();
+    try {
+      const [outcome] = await Promise.all([
+        trySubmitToRunningOwner({
+          sessionId,
+          message: "hello",
+          permissionMode: "approve-reads",
+          outputFormatter: NOOP_OUTPUT_FORMATTER,
+          waitForCompletion: false,
+          startupProbe: true,
+        }),
+        delayedListen,
+      ]);
+      assert(outcome);
+      assert.equal("queued" in outcome, true);
+      assert((getPerfMetricsSnapshot().timings["queue.connect"]?.count ?? 0) > 1);
+    } finally {
+      resetPerfMetrics();
+      await delayedListen.catch(() => {
+        // The submit failure remains the primary assertion signal.
+      });
+      await closeServer(server);
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);
     }

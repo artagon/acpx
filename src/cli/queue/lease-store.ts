@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { readProcessIdentity } from "../../acp/process-tree.js";
 import { isProcessAlive } from "../../process-liveness.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir, queueSocketPath } from "./paths.js";
@@ -351,15 +352,49 @@ export async function claimQueueOwnerLock(
       return current?.claimId === claimRecord.claimId;
     },
     release: async (): Promise<void> => {
-      if ((await readQueueOwnerLockClaimRecord(claimPath))?.claimId === claimRecord.claimId) {
-        await unlinkIfPresent(claimPath);
-      }
+      await releaseQueueOwnerLockClaim(claimPath, claimRecord.claimId);
     },
   };
   if (!(await validateQueueOwnerLockClaim(lockPath, observedStat, expectedGeneration, claim))) {
     return undefined;
   }
   return claim;
+}
+
+async function releaseQueueOwnerLockClaim(claimPath: string, claimId: string): Promise<void> {
+  if (await releaseQueueOwnerLockClaimAtPath(claimPath, claimId)) {
+    return;
+  }
+
+  const directory = path.dirname(claimPath);
+  const displacedPrefix = `${path.basename(claimPath)}.reap-`;
+  for (const entry of await readDirectoryIfPresent(directory)) {
+    if (entry.startsWith(displacedPrefix)) {
+      await releaseQueueOwnerLockClaimAtPath(path.join(directory, entry), claimId);
+    }
+  }
+
+  await releaseQueueOwnerLockClaimAtPath(claimPath, claimId);
+}
+
+async function releaseQueueOwnerLockClaimAtPath(
+  candidatePath: string,
+  claimId: string,
+): Promise<boolean> {
+  if ((await readQueueOwnerLockClaimRecord(candidatePath))?.claimId !== claimId) {
+    return false;
+  }
+  await unlinkIfPresent(candidatePath);
+  return true;
+}
+
+async function readDirectoryIfPresent(directory: string): Promise<string[]> {
+  return await fs.readdir(directory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  });
 }
 
 async function currentQueueOwnerLockClaimRecord(): Promise<QueueOwnerLockClaimRecord> {
@@ -835,9 +870,18 @@ export async function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<vo
     state.released = true;
     state.releasePromise = (async () => {
       await state.pendingRefresh;
-      const claim = await claimQueueOwnerLock(lease.lockPath, lease.ownerGeneration);
+      const claim = await claimQueueOwnerLockForCleanup(lease.lockPath, lease.ownerGeneration);
       if (!claim) {
-        return;
+        const currentOwner = await readQueueOwnerRecordAtPath(lease.lockPath);
+        if (!currentOwner || currentOwner.ownerGeneration !== lease.ownerGeneration) {
+          return;
+        }
+        if (await queueOwnerLockHasLiveExternalClaimant(lease.lockPath)) {
+          return;
+        }
+        throw new Error(
+          `Queue owner lease release is busy for session ${lease.sessionId}; retry cleanup`,
+        );
       }
       try {
         if (!(await claim.isHeld())) {
@@ -855,7 +899,34 @@ export async function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<vo
       }
     })();
   }
-  await state.releasePromise;
+  const releasePromise = state.releasePromise;
+  try {
+    await releasePromise;
+  } catch (error) {
+    if (state.releasePromise === releasePromise) {
+      state.releasePromise = undefined;
+      state.released = false;
+    }
+    throw error;
+  }
+}
+
+async function queueOwnerLockHasLiveExternalClaimant(lockPath: string): Promise<boolean> {
+  const lockStat = await lstatIfPresent(lockPath);
+  if (!lockStat) {
+    return false;
+  }
+  const claimPath = queueOwnerLockClaimPath(lockPath, lockStat);
+  const claimStat = await lstatIfPresent(claimPath);
+  if (!claimStat) {
+    return false;
+  }
+  const claimRecord = await readQueueOwnerLockClaimRecord(claimPath);
+  return Boolean(
+    claimRecord &&
+    claimRecord.pid !== process.pid &&
+    !(await queueOwnerLockClaimIsStale(claimPath, claimStat)),
+  );
 }
 
 function queueOwnerLeaseState(lease: QueueOwnerLease): QueueOwnerLeaseState {
@@ -877,6 +948,9 @@ export async function terminateQueueOwnerForSession(sessionId: string): Promise<
   }
 
   if (!(await cleanupStaleQueueOwner(sessionId, owner))) {
+    if (!(await readQueueOwnerRecord(sessionId))) {
+      return;
+    }
     throw new Error(`Queue owner cleanup is busy for session ${sessionId}; retry the operation`);
   }
 }

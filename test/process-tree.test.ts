@@ -294,6 +294,36 @@ test(
 );
 
 test(
+  "Windows snapshots tolerate process-list startup beyond one second",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-slow-powershell-"));
+    const powershellPath = path.join(fixtureDir, "powershell.exe");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(
+      powershellPath,
+      [
+        "#!/bin/sh",
+        "sleep 1.2",
+        'printf "500 1 1000\\n"',
+        `printf "${process.pid} 500 1100\\n"`,
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(500, true, "win32");
+      await captureProcessTreePids(tree, true);
+      assert.equal(tree.descendantPids.has(process.pid), true);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "signaling a running POSIX group bounds its pre-signal descendant snapshot",
   { skip: process.platform === "win32" },
   async () => {
@@ -331,6 +361,73 @@ test(
 
     assert.equal(tree.descendantPids.has(process.pid), false);
     assert.equal(tree.descendantIdentities.has(process.pid), false);
+  },
+);
+
+test(
+  "exited POSIX trees preserve identity-validated descendants after group leader PID reuse",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-posix-reused-leader-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const originalPath = process.env.PATH;
+    const descendantIdentity = "Wed Jul 29 12:00:01 2026";
+    await fs.writeFile(
+      psPath,
+      [
+        "#!/bin/sh",
+        'printf "500 1 500 Wed Jul 29 12:01:00 2026\\n"',
+        `printf "${process.pid} 1 500 ${descendantIdentity}\\n"`,
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(500, true, "darwin");
+      tree.descendantPids.add(process.pid);
+      tree.descendantIdentities.set(process.pid, descendantIdentity);
+
+      await signalProcessTree(tree, false, "SIGCONT");
+
+      assert.equal(tree.descendantPids.has(process.pid), true);
+      assert.equal(tree.descendantIdentities.get(process.pid), descendantIdentity);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "running POSIX snapshots reject a recycled group with a mismatched root identity",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-posix-recycled-group-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(
+      psPath,
+      [
+        "#!/bin/sh",
+        'printf "500 1 500 Wed Jul 29 12:01:00 2026\\n"',
+        `printf "${process.pid} 500 500 Wed Jul 29 12:01:01 2026\\n"`,
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(500, true, "darwin");
+      tree.rootIdentity = "Wed Jul 29 12:00:00 2026";
+
+      await captureProcessTreePids(tree, true);
+
+      assert.equal(tree.descendantPids.has(process.pid), false);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
   },
 );
 
