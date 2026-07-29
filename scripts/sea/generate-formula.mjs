@@ -92,11 +92,11 @@ if (shaByTarget.size === 0) {
 
 const releaseBase = `https://github.com/openclaw/acpx/releases/download/v${version}`;
 
-/** One platform slot: a binary url/sha256 pair, or the node fallback. */
+/** One platform slot with a published binary asset. */
 function slotLines(target, indent) {
   const sha = shaByTarget.get(target);
   if (sha === undefined) {
-    return [`${indent}depends_on "node"`];
+    return [];
   }
   return [
     `${indent}url "${releaseBase}/acpx-${version}-${target}.tar.gz"`,
@@ -104,22 +104,19 @@ function slotLines(target, indent) {
   ];
 }
 
-/** on_macos / on_linux block, collapsing when both arches take the same path. */
+/** on_macos / on_linux block containing only arches with binary assets. */
 function osBlock(os, armTarget, intelTarget) {
-  const bothMissing = !shaByTarget.has(armTarget) && !shaByTarget.has(intelTarget);
-  if (bothMissing) {
-    return [`  on_${os} do`, `    depends_on "node"`, "  end"];
+  const arches = [];
+  if (shaByTarget.has(armTarget)) {
+    arches.push("    on_arm do", ...slotLines(armTarget, "      "), "    end");
   }
-  return [
-    `  on_${os} do`,
-    "    on_arm do",
-    ...slotLines(armTarget, "      "),
-    "    end",
-    "    on_intel do",
-    ...slotLines(intelTarget, "      "),
-    "    end",
-    "  end",
-  ];
+  if (shaByTarget.has(intelTarget)) {
+    arches.push("    on_intel do", ...slotLines(intelTarget, "      "), "    end");
+  }
+  if (arches.length === 0) {
+    return [];
+  }
+  return [`  on_${os} do`, ...arches, "  end"];
 }
 
 const formula = [
@@ -134,14 +131,15 @@ const formula = [
   "  #",
   "  # Platforms with a published asset get a self-contained Node",
   "  # single-executable: the bundle and a V8 startup snapshot injected into an",
-  "  # official Node binary, with no runtime dependency on a system Node and",
-  "  # ~50ms startup versus ~77ms for the npm package. The snapshot is",
+  "  # official Node binary, with ~50ms startup versus ~77ms for the npm",
+  "  # package. The snapshot is",
   "  # architecture-specific, so each asset is built on a native runner by",
   "  # release-binaries.yml; Homebrew's own node has SEA support compiled out",
   "  # and cannot build them from source.",
   "  #",
-  "  # Every other platform installs the npm package below with Homebrew's",
-  "  # node — same code, ordinary module resolution instead of a snapshot.",
+  "  # Every other platform installs the npm package below. Node remains a",
+  "  # dependency on binary platforms because ACP adapters run as separate",
+  "  # Node processes; the acpx executable itself does not use that runtime.",
   "  #",
   "  # Binary assets carry build-provenance and SBOM attestations, and releases",
   "  # are immutable, so each sha256 pins bytes that cannot be replaced",
@@ -150,6 +148,7 @@ const formula = [
   `  version "${version}"`,
   `  sha256 "${npmSha}"`,
   '  license "MIT"',
+  '  depends_on "node"',
   "",
   ...osBlock("macos", "darwin-arm64", "darwin-x64"),
   "",

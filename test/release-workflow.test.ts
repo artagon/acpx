@@ -129,6 +129,32 @@ test("binary releases fail closed unless repository immutability is enabled", ()
   assert.match(gate, /if \[ "\$enabled" != "true" \]/);
 });
 
+test("every release stage stays bound to the gate-validated commit", () => {
+  const jobs = jobBlocks(readWorkflow("release-binaries.yml"));
+  const gate = jobs.get("gate") ?? "";
+  const build = jobs.get("build") ?? "";
+  const publish = jobs.get("publish") ?? "";
+  const formula = jobs.get("formula") ?? "";
+
+  // workflow_dispatch provenance identifies github.sha, so the selected
+  // dispatch ref must resolve to the same commit as the requested tag.
+  assert.match(gate, /TRIGGER_SHA: \$\{\{ github\.sha \}\}/);
+  assert.match(gate, /triggerSha !== sha/);
+  assert.match(gate, /sha=\$\{sha\}/);
+
+  // Matrix jobs and formula rendering consume the immutable SHA output, never
+  // independently resolve the still-mutable tag.
+  assert.match(build, /ref: \$\{\{ needs\.gate\.outputs\.sha \}\}/);
+  assert.match(formula, /ref: \$\{\{ needs\.gate\.outputs\.sha \}\}/);
+  assert.doesNotMatch(build, /ref: \$\{\{ inputs\.tag/);
+
+  // The final writer dereferences the remote tag immediately before publishing
+  // the draft, when repository release immutability freezes it.
+  assert.match(publish, /git\/ref\/tags\/\$\{TAG\}/);
+  assert.match(publish, /git\/tags\/\$\{object_sha\}/);
+  assert.match(publish, /object_sha.*VALIDATED_SHA/);
+});
+
 test("every artifact gets both provenance and an SBOM attestation", () => {
   const attest = jobBlocks(readWorkflow("release-binaries.yml")).get("attest") ?? "";
 

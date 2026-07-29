@@ -45,7 +45,11 @@ Core capabilities:
 npm i -g acpx
 ```
 
-For normal session reuse, prefer a global install over `npx`.
+The npm package includes the Codex and Claude ACP adapters and launches those
+installed copies directly. The Homebrew formula installs a faster standalone
+`acpx` executable plus Node.js; adapter processes are resolved through `npx` on
+first use. For normal session reuse, prefer either install over invoking `acpx`
+itself through `npx`.
 
 ## Command model
 

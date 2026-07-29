@@ -86,14 +86,15 @@ test("generator emits upstream URLs and explicit release-layout checks", (t) => 
   assert.match(formula, /Unknown acpx release layout/);
 });
 
-test("generator uses the Node fallback only for missing platform assets", (t) => {
+test("generator keeps Node for adapter subprocesses and omits missing binary slots", (t) => {
   const result = runGenerator(t, `${tarballLine("darwin-arm64")}\n`);
 
   assert.equal(result.status, 0, result.stderr);
   const formula = readFileSync(result.formulaPath, "utf8");
+  assert.match(formula, /^\s+depends_on "node"$/m);
   assert.match(formula, /on_arm do\n\s+url .*darwin-arm64/);
-  assert.match(formula, /on_intel do\n\s+depends_on "node"/);
-  assert.match(formula, /on_linux do\n\s+depends_on "node"/);
+  assert.doesNotMatch(formula, /on_intel do/);
+  assert.doesNotMatch(formula, /on_linux do/);
 });
 
 test("generator rejects duplicate target checksums", (t) => {

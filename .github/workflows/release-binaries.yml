@@ -55,6 +55,10 @@ jobs:
   gate:
     name: Validate tag
     runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.validate.outputs.sha }}
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,8 +84,10 @@ jobs:
           echo "Release immutability is enabled."
 
       - name: Validate tag shape, version match, and ancestry
+        id: validate
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          TRIGGER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           # Mirrors release.yml's gate. Without it a tag pointing at an
@@ -92,9 +98,10 @@ jobs:
 
           node - <<'NODE'
           const { execFileSync } = require("node:child_process");
-          const { readFileSync } = require("node:fs");
+          const { appendFileSync } = require("node:fs");
 
           const tag = process.env.RELEASE_TAG ?? "";
+          const triggerSha = process.env.TRIGGER_SHA ?? "";
           if (!/^v\d+\.\d+\.\d+$/.test(tag)) {
             console.error(`Release tags must match vX.Y.Z; received ${tag || "<missing>"}.`);
             process.exit(1);
@@ -118,14 +125,29 @@ jobs:
             console.error(`Tagged commit ${sha} is not contained in origin/main.`);
             process.exit(1);
           }
-          console.log(`${tag} validated.`);
+          // Build provenance identifies github.sha. Require the dispatch ref to
+          // be this tag (or its exact commit), rather than claiming a branch
+          // head while packaging different source from the tag input.
+          if (triggerSha !== sha) {
+            console.error(
+              `Dispatch ref resolved to ${triggerSha}, but ${tag} resolves to ${sha}. ` +
+              `Run the workflow at the ${tag} ref.`,
+            );
+            process.exit(1);
+          }
+
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `tag=${tag}\nsha=${sha}\nversion=${pkg.version}\n`,
+          );
+          console.log(`${tag} validated at ${sha}.`);
           NODE
 
       - name: Refuse to overwrite a published release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ steps.validate.outputs.tag }}
         run: |
           set -euo pipefail
           # Fail here rather than after four platform builds. Immutable releases
@@ -163,7 +185,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          # Never re-resolve the tag after the gate: it is mutable until the
+          # draft release is published and repository immutability freezes it.
+          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
@@ -207,7 +231,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
+          version="${{ needs.gate.outputs.version }}"
           # Validate before use: node -p prints the raw string, so an embedded
           # newline would write extra key=value pairs into $GITHUB_OUTPUT and
           # forge step outputs consumed as action inputs below.
@@ -341,7 +365,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: attest
+    needs: [gate, attest]
     runs-on: ubuntu-24.04
     # No id-token here: this job never signs anything. It writes the release.
     permissions:
@@ -366,9 +390,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          VALIDATED_SHA: ${{ needs.gate.outputs.sha }}
         run: |
           set -euo pipefail
+          # The tag is still mutable until publication. Dereference annotated
+          # tags through the Git data API and fail if it moved after the gate.
+          read -r object_type object_sha < <(
+            gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" \
+              --jq '.object | [.type, .sha] | @tsv'
+          )
+          while [ "$object_type" = "tag" ]; do
+            read -r object_type object_sha < <(
+              gh api "repos/${GH_REPO}/git/tags/${object_sha}" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+          done
+          if [ "$object_type" != "commit" ] || [ "$object_sha" != "$VALIDATED_SHA" ]; then
+            echo "::error::$TAG moved after validation; expected $VALIDATED_SHA, resolved ${object_type}:${object_sha}."
+            exit 1
+          fi
+
           # Immutable releases freeze assets at publication, so everything is
           # attached to a draft first and the draft is flipped live last. The
           # older create-then-upload order cannot work here: the release would
@@ -405,7 +447,7 @@ jobs:
   # at all — it commits bytes it downloaded from the render job.
   formula:
     name: Render Homebrew formula
-    needs: publish
+    needs: [gate, publish]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -415,7 +457,7 @@ jobs:
           # The validated tag, not main: the gate proved this ref is on main
           # and matches the released version, and it cannot move afterwards —
           # a branch checkout would run whatever landed on main since.
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -427,7 +469,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.gate.outputs.tag }}
         run: |
           set -euo pipefail
           # From the published release, not the build artifacts: the release is
@@ -439,7 +481,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.gate.outputs.tag }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
@@ -466,7 +508,7 @@ jobs:
 
       - name: Regenerate the formula
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.gate.outputs.tag }}
           NPM_SHA256: ${{ steps.npm.outputs.sha256 }}
         run: |
           set -euo pipefail
@@ -487,7 +529,7 @@ jobs:
 
   formula-pr:
     name: Propose formula update
-    needs: formula
+    needs: [gate, formula]
     runs-on: ubuntu-24.04
     # Writes a branch and opens a PR; requires "Allow GitHub Actions to create
     # and approve pull requests" in the repository's Actions settings.
@@ -515,7 +557,7 @@ jobs:
       - name: Open a pull request
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.gate.outputs.tag }}
         run: |
           set -euo pipefail
           if git diff --quiet -- Formula/acpx.rb; then

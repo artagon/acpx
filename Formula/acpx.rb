@@ -9,14 +9,15 @@ class Acpx < Formula
   #
   # Platforms with a published asset get a self-contained Node
   # single-executable: the bundle and a V8 startup snapshot injected into an
-  # official Node binary, with no runtime dependency on a system Node and
-  # ~50ms startup versus ~77ms for the npm package. The snapshot is
+  # official Node binary, with ~50ms startup versus ~77ms for the npm
+  # package. The snapshot is
   # architecture-specific, so each asset is built on a native runner by
   # release-binaries.yml; Homebrew's own node has SEA support compiled out
   # and cannot build them from source.
   #
-  # Every other platform installs the npm package below with Homebrew's
-  # node — same code, ordinary module resolution instead of a snapshot.
+  # Every other platform installs the npm package below. Node remains a
+  # dependency on binary platforms because ACP adapters run as separate
+  # Node processes; the acpx executable itself does not use that runtime.
   #
   # Binary assets carry build-provenance and SBOM attestations, and releases
   # are immutable, so each sha256 pins bytes that cannot be replaced
@@ -25,14 +26,7 @@ class Acpx < Formula
   version "0.12.1"
   sha256 "c759e05bfc628a99da32e04e384272a49ff34ada454ce87550d2a6ac234e58de"
   license "MIT"
-
-  on_macos do
-    depends_on "node"
-  end
-
-  on_linux do
-    depends_on "node"
-  end
+  depends_on "node"
 
   def install
     npm_layout = (buildpath/"package.json").file?

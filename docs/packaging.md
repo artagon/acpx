@@ -6,7 +6,7 @@ pick per audience rather than treating one as a replacement for the other.
 |                         | npm (`npm i -g acpx`)  | single executable (Homebrew)               |
 | ----------------------- | ---------------------- | ------------------------------------------ |
 | `--version` startup     | 77.1 ± 5.7 ms          | **50.2 ± 3.7 ms**                          |
-| Requires a system Node  | yes (>= 22.13)         | no                                         |
+| Requires a system Node  | yes (>= 22.13)         | for adapter subprocesses, not `acpx`       |
 | Artifact size           | ~640 KB `dist/`        | ~122 MB binary (~39 MB compressed)         |
 | First run after install | normal                 | one-off code-signature validation on macOS |
 | Updates                 | `npm i -g acpx@latest` | new release + `brew upgrade`               |
@@ -74,7 +74,10 @@ brew install openclaw/acpx/acpx
 The checked-in bootstrap formula installs the latest published npm package.
 After the first binary release completes, the formula update workflow replaces
 that source with platform-specific executable assets while retaining an npm
-fallback for unsupported platforms.
+fallback for unsupported platforms. The formula always depends on Node because
+Codex and Claude adapters execute as separate JavaScript processes. The binary
+still avoids Node module initialization for the `acpx` process itself, which is
+the source of the measured startup improvement.
 
 ## Publishing a Homebrew release
 
@@ -82,7 +85,10 @@ The `Release binaries` workflow owns the release path:
 
 1. A maintainer enables GitHub release immutability for the repository.
 2. A normal tag release publishes and attests the npm tarball.
-3. A maintainer dispatches `release-binaries.yml` with that tag.
+3. A maintainer dispatches `release-binaries.yml` with that tag and selects the
+   same tag as the workflow ref. The gate rejects a branch ref so GitHub's
+   provenance identity, the validated source, and every matrix checkout name
+   one commit.
 4. Four native jobs build and test the platform executables without write or
    OIDC permissions.
 5. Separate jobs attest each tarball and its CycloneDX SBOM, then publish all
