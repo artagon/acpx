@@ -1,7 +1,12 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
 
 const PROCESS_TREE_POLL_MS = 25;
 const PROCESS_LIST_COMMAND_TIMEOUT_MS = 1_000;
+const WINDOWS_TRACKING_INITIAL_POLL_MS = 25;
+const WINDOWS_TRACKING_MAX_POLL_MS = 1_000;
+const WINDOWS_TRACKING_MAX_DURATION_MS = 10_000;
+const WINDOWS_EPOCH_OFFSET_TICKS = 621_355_968_000_000_000n;
 
 export type ManagedProcessTree = {
   rootPid: number | undefined;
@@ -10,19 +15,30 @@ export type ManagedProcessTree = {
   descendantPids: Set<number>;
   descendantIdentities: Map<number, string>;
   rootIdentity?: string;
+  rootIdentityFloor?: string;
   snapshotPromise?: Promise<void>;
 };
 
 export type ProcessListEntry = {
   pid: number;
   parentPid: number;
+  processGroupId?: number;
   identity: string;
 };
+
+export async function readProcessIdentity(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+): Promise<string | undefined> {
+  const processList = await readProcessList(platform);
+  return processList?.find((entry) => entry.pid === pid)?.identity;
+}
 
 export function createManagedProcessTree(
   rootPid: number | undefined,
   killProcessGroup: boolean,
   platform: NodeJS.Platform = process.platform,
+  rootCreatedAfterMs?: number,
 ): ManagedProcessTree {
   return {
     rootPid,
@@ -30,6 +46,10 @@ export function createManagedProcessTree(
     platform,
     descendantPids: new Set(),
     descendantIdentities: new Map(),
+    rootIdentityFloor:
+      platform === "win32" && rootCreatedAfterMs !== undefined
+        ? windowsTicksFromUnixMs(rootCreatedAfterMs)
+        : undefined,
   };
 }
 
@@ -37,9 +57,12 @@ export function rememberProcessTreePids(tree: ManagedProcessTree): void {
   queueProcessTreeSnapshot(tree);
 }
 
-export function beginProcessTreeTracking(tree: ManagedProcessTree): void {
+export function beginProcessTreeTracking(
+  tree: ManagedProcessTree,
+  rootRunning: () => boolean,
+): void {
   if (tree.platform === "win32") {
-    queueProcessTreeSnapshot(tree);
+    queueWindowsProcessTreeTracking(tree, rootRunning);
   }
 }
 
@@ -76,6 +99,31 @@ function queueProcessTreeSnapshot(tree: ManagedProcessTree): void {
   })();
 }
 
+function queueWindowsProcessTreeTracking(
+  tree: ManagedProcessTree,
+  rootRunning: () => boolean,
+): void {
+  const priorSnapshot = tree.snapshotPromise;
+  tree.snapshotPromise = (async () => {
+    await priorSnapshot?.catch(() => {
+      // Tracking can continue after an earlier best-effort snapshot failure.
+    });
+    const deadline = Date.now() + WINDOWS_TRACKING_MAX_DURATION_MS;
+    let pollMs = WINDOWS_TRACKING_INITIAL_POLL_MS;
+    while (rootRunning() && Date.now() < deadline) {
+      const descendantCount = tree.descendantPids.size;
+      await recordCurrentProcessTreePids(tree);
+      if (rootRunning() && Date.now() < deadline) {
+        await waitMs(pollMs);
+        pollMs =
+          tree.descendantPids.size > descendantCount
+            ? WINDOWS_TRACKING_INITIAL_POLL_MS
+            : Math.min(pollMs * 2, WINDOWS_TRACKING_MAX_POLL_MS);
+      }
+    }
+  })();
+}
+
 async function recordCurrentProcessTreePids(tree: ManagedProcessTree): Promise<void> {
   const rootPid = tree.rootPid;
   if (!tree.killProcessGroup || !rootPid) {
@@ -84,7 +132,7 @@ async function recordCurrentProcessTreePids(tree: ManagedProcessTree): Promise<v
   const processes =
     tree.platform === "win32"
       ? await listDescendantProcesses(tree)
-      : await listProcessGroupEntries(rootPid, tree.platform);
+      : await listOwnedPosixProcesses(tree);
   recordProcessTreePids(tree, processes);
 }
 
@@ -113,11 +161,9 @@ export async function signalProcessTree(
 
   if (!rootRunning) {
     await captureProcessTreePids(tree, false);
-    const refreshed = await refreshExitedProcessTreePids(tree);
-    if (!refreshed) {
-      tree.descendantPids.clear();
-      tree.descendantIdentities.clear();
-    }
+    await refreshExitedProcessTreePids(tree);
+  } else {
+    await recordCurrentProcessTreePids(tree);
   }
   for (const target of resolveProcessTreeSignalTargets(tree, rootRunning)) {
     if (target.tree) {
@@ -260,7 +306,12 @@ async function listDescendantProcesses(tree: ManagedProcessTree): Promise<Proces
     return [];
   }
 
-  const snapshot = collectWindowsDescendantProcesses(rootPid, tree.rootIdentity, processList);
+  const snapshot = collectWindowsDescendantProcesses(
+    rootPid,
+    tree.rootIdentity,
+    processList,
+    tree.rootIdentityFloor,
+  );
   if (!snapshot) {
     return [];
   }
@@ -272,9 +323,16 @@ export function collectWindowsDescendantProcesses(
   rootPid: number,
   expectedRootIdentity: string | undefined,
   processList: ProcessListEntry[],
+  rootIdentityFloor?: string,
 ): { rootIdentity: string; descendants: ProcessListEntry[] } | undefined {
   const root = processList.find((entry) => entry.pid === rootPid);
-  if (!root || (expectedRootIdentity && expectedRootIdentity !== root.identity)) {
+  if (!root) {
+    return undefined;
+  }
+  if (
+    (expectedRootIdentity && expectedRootIdentity !== root.identity) ||
+    (rootIdentityFloor && !isCreatedAtOrAfter(root.identity, rootIdentityFloor))
+  ) {
     return undefined;
   }
 
@@ -283,6 +341,10 @@ export function collectWindowsDescendantProcesses(
     rootIdentity: root.identity,
     descendants: walkValidatedDescendants(root, childrenByParent),
   };
+}
+
+function windowsTicksFromUnixMs(unixMs: number): string {
+  return (BigInt(Math.floor(unixMs)) * 10_000n + WINDOWS_EPOCH_OFFSET_TICKS).toString();
 }
 
 function indexProcessesByParent(processList: ProcessListEntry[]): Map<number, ProcessListEntry[]> {
@@ -323,11 +385,13 @@ function isCreatedAtOrAfter(childIdentity: string, parentIdentity: string): bool
   try {
     return BigInt(childIdentity) >= BigInt(parentIdentity);
   } catch {
-    return false;
+    const childTime = Date.parse(childIdentity);
+    const parentTime = Date.parse(parentIdentity);
+    return Number.isFinite(childTime) && Number.isFinite(parentTime) && childTime >= parentTime;
   }
 }
 
-function parseProcessListLine(line: string): ProcessListEntry | undefined {
+function parseWindowsProcessListLine(line: string): ProcessListEntry | undefined {
   const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
   if (!match) {
     return undefined;
@@ -345,31 +409,127 @@ function parseProcessListLine(line: string): ProcessListEntry | undefined {
   return { pid, parentPid, identity };
 }
 
+function parsePosixProcessListLine(line: string): ProcessListEntry | undefined {
+  const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+  if (!match) {
+    return undefined;
+  }
+  const pid = Number(match[1]);
+  const parentPid = Number(match[2]);
+  const processGroupId = Number(match[3]);
+  const identity = match[4].trim();
+  if (
+    !isPositiveInteger(pid) ||
+    !isPositiveInteger(parentPid) ||
+    !isPositiveInteger(processGroupId) ||
+    !identity
+  ) {
+    return undefined;
+  }
+  return { pid, parentPid, processGroupId, identity };
+}
+
 async function readProcessList(platform: NodeJS.Platform): Promise<ProcessListEntry[] | undefined> {
+  if (platform === "linux") {
+    return await readLinuxProcProcessList();
+  }
   let output: string;
   try {
     output =
       platform === "win32"
         ? await runWindowsProcessListCommand()
-        : await runPsCommand(["-eo", "pid=,pgid=,lstart="]);
+        : await runPsCommand(["-eo", "pid=,ppid=,pgid=,lstart="]);
   } catch {
     return undefined;
   }
+  const parseLine = platform === "win32" ? parseWindowsProcessListLine : parsePosixProcessListLine;
   return output
     .split("\n")
-    .map((line) => parseProcessListLine(line))
+    .map((line) => parseLine(line))
     .filter((entry): entry is ProcessListEntry => entry !== undefined);
 }
 
-async function listProcessGroupEntries(
-  processGroupId: number,
-  platform: NodeJS.Platform,
-): Promise<ProcessListEntry[]> {
-  const processList = await readProcessList(platform);
+async function readLinuxProcProcessList(): Promise<ProcessListEntry[] | undefined> {
+  let entries;
+  try {
+    entries = await fs.readdir("/proc", { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  const processList = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+      .map(async (entry) => {
+        try {
+          const stat = await fs.readFile(`/proc/${entry.name}/stat`, "utf8");
+          return parseLinuxProcStat(stat);
+        } catch {
+          return undefined;
+        }
+      }),
+  );
+  return processList.filter((entry): entry is ProcessListEntry => entry !== undefined);
+}
+
+function parseLinuxProcStat(stat: string): ProcessListEntry | undefined {
+  const commandEnd = stat.lastIndexOf(")");
+  const commandStart = stat.indexOf("(");
+  if (commandStart <= 0 || commandEnd <= commandStart) {
+    return undefined;
+  }
+  const pid = Number(stat.slice(0, commandStart).trim());
+  const fields = stat
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/);
+  const parentPid = Number(fields[1]);
+  const processGroupId = Number(fields[2]);
+  const startTime = fields[19];
+  if (
+    !isPositiveInteger(pid) ||
+    !isPositiveInteger(parentPid) ||
+    !isPositiveInteger(processGroupId) ||
+    !isNumericIdentity(startTime)
+  ) {
+    return undefined;
+  }
+  return { pid, parentPid, processGroupId, identity: startTime };
+}
+
+function isPositiveInteger(value: number): boolean {
+  return Number.isInteger(value) && value > 0;
+}
+
+function isNumericIdentity(value: string | undefined): value is string {
+  return value !== undefined && /^\d+$/.test(value);
+}
+
+async function listOwnedPosixProcesses(tree: ManagedProcessTree): Promise<ProcessListEntry[]> {
+  const rootPid = tree.rootPid;
+  if (!rootPid) {
+    return [];
+  }
+  const processList = await readProcessList(tree.platform);
   if (!processList) {
     return [];
   }
-  return processList.filter((entry) => entry.parentPid === processGroupId);
+  const ownedByPid = new Map(
+    processList
+      .filter((entry) => entry.processGroupId === rootPid)
+      .map((entry) => [entry.pid, entry]),
+  );
+  const root = processList.find((entry) => entry.pid === rootPid);
+  if (
+    root &&
+    (!tree.rootIdentity || tree.rootIdentity === root.identity) &&
+    root.processGroupId === rootPid
+  ) {
+    tree.rootIdentity = root.identity;
+    for (const descendant of walkValidatedDescendants(root, indexProcessesByParent(processList))) {
+      ownedByPid.set(descendant.pid, descendant);
+    }
+  }
+  return [...ownedByPid.values()];
 }
 
 async function refreshExitedProcessTreePids(tree: ManagedProcessTree): Promise<boolean> {
@@ -396,8 +556,7 @@ function retainCurrentProcessTreePids(
   for (const pid of tree.descendantPids) {
     const current = currentByPid.get(pid);
     const capturedIdentity = tree.descendantIdentities.get(pid);
-    const remainsInOwnedGroup = tree.platform === "win32" || current?.parentPid === tree.rootPid;
-    if (!current || current.identity !== capturedIdentity || !remainsInOwnedGroup) {
+    if (!current || current.identity !== capturedIdentity) {
       tree.descendantPids.delete(pid);
       tree.descendantIdentities.delete(pid);
     }
@@ -409,7 +568,7 @@ function discoverCurrentPosixGroupMembers(
   rootPid: number,
   processList: ProcessListEntry[],
 ): void {
-  const currentGroup = processList.filter((entry) => entry.parentPid === rootPid);
+  const currentGroup = processList.filter((entry) => entry.processGroupId === rootPid);
   if (currentGroup.some((entry) => entry.pid === rootPid)) {
     // A live process whose PID equals the old group leader means the numeric
     // PID/PGID was recycled after the owned group became empty.
@@ -421,7 +580,11 @@ function discoverCurrentPosixGroupMembers(
 }
 
 async function runPsCommand(args: string[]): Promise<string> {
-  return await runCapturedCommand("ps", args, "ps");
+  return await runCapturedCommand("ps", args, "ps", {
+    ...process.env,
+    LANG: "C",
+    LC_ALL: "C",
+  });
 }
 
 async function runWindowsProcessListCommand(): Promise<string> {
@@ -440,9 +603,11 @@ async function runCapturedCommand(
   command: string,
   args: string[],
   description: string,
+  env?: NodeJS.ProcessEnv,
 ): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     const child = spawn(command, args, {
+      env,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });

@@ -18,6 +18,7 @@ import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   ensureOwnerIsUsable,
+  isProcessAlive,
   type QueueOwnerRecord,
   readQueueOwnerRecord,
   terminateQueueOwnerForSession,
@@ -727,7 +728,7 @@ async function unavailableOwnerCountsAsMissing(
     return (
       !latestOwner ||
       latestOwner.ownerGeneration !== owner.ownerGeneration ||
-      queueOwnerIsWithinStartupGrace(latestOwner)
+      (queueOwnerIsWithinStartupGrace(latestOwner) && isProcessAlive(latestOwner.pid))
     );
   }
   const health = await probeQueueOwnerHealth(sessionId);

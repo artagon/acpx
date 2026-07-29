@@ -16,17 +16,25 @@ Repo: https://github.com/openclaw/acpx
   best-effort tracked process trees on Windows during normal and failed startup
   cleanup so package-exec wrappers do not leave captured descendants running
   after ACPX exits; exit-triggered snapshots are observed before cleanup
-  completes, owned POSIX group members created during shutdown are discovered
-  and re-signaled during forced cleanup, external process-list discovery is
-  bounded, and Windows parent edges plus remembered descendants are
-  identity-checked before later signaling.
+  completes, POSIX descendants are captured before signaling so later session
+  or group changes cannot escape forced cleanup, owned POSIX group members
+  created during shutdown are discovered and re-signaled, external process-list
+  discovery is bounded, Linux process identities come from procfs, other POSIX
+  snapshots use a fixed locale, Windows wrappers are sampled with bounded
+  exponential backoff through multi-stage launches, transient discovery
+  failures preserve and still signal captured targets, and Windows parent edges
+  plus remembered descendants are identity-checked before later signaling.
 
 - Runtime/queue: publish queue-owner leases atomically, preserve fresh malformed
-  locks during collisions, serialize generation-checked refresh and release,
-  and treat only a fresh lease-before-bind owner as a fast startup miss,
-  preventing premature `QUEUE_NOT_ACCEPTING_REQUESTS` errors without masking
-  older unreachable owners, letting released owners overwrite successors, or
-  leaving stale dangling-symlink locks unrecoverable.
+  locks during collisions, serialize cross-process refresh, release, and stale
+  cleanup through inode-qualified, crash-recoverable claims, retry explicit
+  cleanup across heartbeat contention while making unresolved explicit cleanup
+  fail visibly, reacquire atomically with fresh timestamps after retiring a
+  stale collision, and treat only a fresh, live lease-before-bind owner as a
+  fast startup miss, preventing premature
+  `QUEUE_NOT_ACCEPTING_REQUESTS` errors without masking older unreachable
+  owners, letting released owners overwrite successors, or leaving stale
+  dangling-symlink locks unrecoverable.
 
 ## 2026.7.27 (v0.13.0)
 

@@ -738,21 +738,27 @@ export class AcpClient {
       process.platform,
       plan.spawnOptions.env,
     );
+    const rootCreatedAfterMs = Date.now();
     const spawnedChild = spawn(spawnCommand.command, spawnCommand.args, {
       ...plan.spawnOptions,
       windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
     }) as ChildProcessByStdio<Writable, Readable, Readable>;
-    const processTree = createManagedProcessTree(spawnedChild.pid, true);
+    const processTree = createManagedProcessTree(
+      spawnedChild.pid,
+      true,
+      process.platform,
+      rootCreatedAfterMs,
+    );
     this.agentProcessTree = processTree;
     spawnedChild.once("exit", () => {
       rememberProcessTreePids(processTree);
     });
+    beginProcessTreeTracking(processTree, () => isChildProcessRunning(spawnedChild));
     try {
       await waitForSpawn(spawnedChild);
     } catch (error) {
       throw new AgentSpawnError(this.options.agentCommand, error);
     }
-    beginProcessTreeTracking(processTree);
     return requireAgentStdio(spawnedChild);
   }
 

@@ -839,6 +839,31 @@ test("startup probe treats lease-before-bind as a miss without a health reconnec
   });
 });
 
+test("startup probe retires a fresh dead owner instead of treating it as lease-before-bind", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "startup-dead-before-bind";
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: 999_999,
+      sessionId,
+      socketPath,
+    });
+
+    const outcome = await trySubmitToRunningOwner({
+      sessionId,
+      message: "hello",
+      permissionMode: "approve-reads",
+      outputFormatter: NOOP_OUTPUT_FORMATTER,
+      waitForCompletion: true,
+      startupProbe: true,
+    });
+
+    assert.equal(outcome, undefined);
+    await assert.rejects(fs.access(lockPath));
+  });
+});
+
 test("startup probe fails closed for an older live owner without a socket", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "startup-owner-not-accepting";

@@ -203,6 +203,7 @@ export class TerminalManager {
         0,
         Math.round(params.outputByteLimit ?? DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES),
       );
+      const rootCreatedAfterMs = Date.now();
       const { proc, spawnCommand } = await spawnTerminalProcess(params, this.cwd);
 
       let resolveExit: (response: WaitForTerminalExitResponse) => void = () => {};
@@ -212,7 +213,12 @@ export class TerminalManager {
 
       const terminal: ManagedTerminal = {
         process: proc,
-        processTree: createManagedProcessTree(proc.pid, spawnCommand.killProcessGroup),
+        processTree: createManagedProcessTree(
+          proc.pid,
+          spawnCommand.killProcessGroup,
+          process.platform,
+          rootCreatedAfterMs,
+        ),
         output: Buffer.alloc(0),
         truncated: false,
         outputByteLimit,
@@ -221,7 +227,10 @@ export class TerminalManager {
         exitPromise,
         resolveExit,
       };
-      beginProcessTreeTracking(terminal.processTree);
+      beginProcessTreeTracking(
+        terminal.processTree,
+        () => proc.exitCode === null && proc.signalCode === null,
+      );
 
       const appendOutput = (chunk: Buffer | string): void => {
         const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
