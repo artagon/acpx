@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { isSea } from "node:sea";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -46,6 +47,7 @@ type BuiltInLaunchResolverOptions = {
   resolvePackageRoot?: (packageName: string) => string;
   execPath?: string;
   resolveNpmCliPath?: (execPath: string) => string;
+  runningInSea?: boolean;
 };
 
 export const AGENT_REGISTRY: Record<string, string> = {
@@ -342,6 +344,9 @@ export function resolveBuiltInAgentLaunch(
   agentCommand: string,
   options: BuiltInLaunchResolverOptions = {},
 ): BuiltInAgentLaunch | undefined {
+  if (options.runningInSea ?? isSea()) {
+    return undefined;
+  }
   return (
     resolveInstalledBuiltInAgentLaunch(agentCommand, options) ??
     resolvePackageExecBuiltInAgentLaunch(agentCommand, options)

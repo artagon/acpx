@@ -257,3 +257,18 @@ test("resolveBuiltInAgentLaunch accepts the legacy Claude npm exec default", () 
     npmCliPath,
   });
 });
+
+test("resolveBuiltInAgentLaunch leaves npm-backed commands untouched inside a SEA", () => {
+  const npmCliPath = path.join(os.tmpdir(), "acpx-test-sea-npm-cli.js");
+  const launch = resolveBuiltInAgentLaunch(AGENT_REGISTRY.codex, {
+    execPath: "/tmp/acpx",
+    existsSync: (candidate) => candidate === npmCliPath,
+    resolvePackageRoot: () => {
+      throw new Error("adapter not installed");
+    },
+    resolveNpmCliPath: () => npmCliPath,
+    runningInSea: true,
+  });
+
+  assert.equal(launch, undefined);
+});
