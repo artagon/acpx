@@ -30,7 +30,11 @@ function parseArgs(argv) {
     if (!/^--[a-z0-9-]+$/.test(key) || value === undefined) {
       throw new Error(`Malformed arguments near ${key ?? "<end>"}.`);
     }
-    args[key.slice(2)] = value;
+    const name = key.slice(2);
+    if (Object.hasOwn(args, name)) {
+      throw new Error(`Duplicate argument --${name}.`);
+    }
+    args[name] = value;
   }
   return args;
 }
@@ -86,7 +90,7 @@ if (shaByTarget.size === 0) {
   throw new Error(`${sumsPath} lists no acpx tarballs; refusing to emit a binary-free formula.`);
 }
 
-const releaseBase = `https://github.com/artagon/acpx/releases/download/v${version}`;
+const releaseBase = `https://github.com/openclaw/acpx/releases/download/v${version}`;
 
 /** One platform slot: a binary url/sha256 pair, or the node fallback. */
 function slotLines(target, indent) {
@@ -124,7 +128,7 @@ const formula = [
   "# this file for every release and opens a PR with the result.",
   "class Acpx < Formula",
   '  desc "Headless CLI client for the Agent Client Protocol (ACP)"',
-  '  homepage "https://github.com/artagon/acpx"',
+  '  homepage "https://github.com/openclaw/acpx"',
   "",
   "  # Two install paths, resolved per platform:",
   "  #",
@@ -152,11 +156,18 @@ const formula = [
   ...osBlock("linux", "linux-arm64", "linux-x64"),
   "",
   "  def install",
-  '    if (buildpath/"acpx").exist?',
+  '    npm_layout = (buildpath/"package.json").file?',
+  '    binary_layout = (buildpath/"acpx").file? && (buildpath/"acpx").executable?',
+  "",
+  '    odie "Ambiguous acpx release layout" if npm_layout && binary_layout',
+  "",
+  "    if binary_layout",
   '      bin.install "acpx"',
-  "    else",
+  "    elsif npm_layout",
   '      system "npm", "install", *std_npm_args',
   '      bin.install_symlink Dir["#{libexec}/bin/*"]',
+  "    else",
+  '      odie "Unknown acpx release layout"',
   "    end",
   "  end",
   "",

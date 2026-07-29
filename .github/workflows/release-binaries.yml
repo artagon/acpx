@@ -14,9 +14,9 @@ name: Release binaries
 # read-only permissions, and `formula-pr` holds the contents-write credential
 # while executing no repository code.
 #
-# Release shape: this repository has immutable releases enabled, so assets and
-# the Git tag are frozen the moment a release is published. Assets are therefore
-# attached to a draft and the draft is published last.
+# Release shape: the gate below requires immutable releases before any build
+# starts. Once enabled, assets and the Git tag are frozen when the release is
+# published, so assets are attached to a draft and the draft is published last.
 
 # Manual-only, deliberately: two of the four matrix legs need macOS runners,
 # which are billed at a premium on GitHub-hosted infrastructure, so binaries
@@ -44,7 +44,7 @@ permissions:
   contents: read
 
 env:
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
   # Pinned exactly. The shipped binary *is* this Node build with a blob injected,
   # so a floating version silently changes the release's largest attack surface
   # (V8, OpenSSL, zlib) and makes builds non-reproducible. The SBOM records this
@@ -60,6 +60,24 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Require immutable releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          enabled="$(
+            gh api \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GH_REPO}/immutable-releases" \
+              --jq .enabled 2>/dev/null || true
+          )"
+          if [ "$enabled" != "true" ]; then
+            echo "::error::Enable release immutability in repository Settings > General > Releases before publishing executable assets."
+            exit 1
+          fi
+          echo "Release immutability is enabled."
 
       - name: Validate tag shape, version match, and ancestry
         env:

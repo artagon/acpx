@@ -121,6 +121,14 @@ test("the formula pins only verified bytes", () => {
   assert.match(formula, /gh attestation verify/);
 });
 
+test("binary releases fail closed unless repository immutability is enabled", () => {
+  const gate = jobBlocks(readWorkflow("release-binaries.yml")).get("gate") ?? "";
+
+  assert.match(gate, /repos\/\$\{GH_REPO\}\/immutable-releases/);
+  assert.match(gate, /X-GitHub-Api-Version: 2026-03-10/);
+  assert.match(gate, /if \[ "\$enabled" != "true" \]/);
+});
+
 test("every artifact gets both provenance and an SBOM attestation", () => {
   const attest = jobBlocks(readWorkflow("release-binaries.yml")).get("attest") ?? "";
 
@@ -134,9 +142,9 @@ test("every artifact gets both provenance and an SBOM attestation", () => {
 test("assets are attached to a draft before the release is published", () => {
   const publish = jobBlocks(readWorkflow("release-binaries.yml")).get("publish") ?? "";
 
-  // The repository has immutable releases enabled: assets and the Git tag
-  // freeze at publication. Creating a published release and uploading into it
-  // afterwards — the previous order — cannot work.
+  // The gate requires immutable releases before any build starts, so assets
+  // and the Git tag freeze at publication. Creating a published release and
+  // uploading into it afterwards cannot work.
   const draftCreate = publish.indexOf("gh release create");
   const upload = publish.indexOf("gh release upload");
   const flipLive = publish.indexOf("--draft=false");

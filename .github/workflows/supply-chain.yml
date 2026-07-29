@@ -3,7 +3,7 @@ name: Supply chain
 # Repo-level supply-chain checks. Release-artifact provenance lives in
 # release-binaries.yml, next to the artifacts it describes.
 #
-# This repository is a public fork, so anyone can open a pull request. Every job
+# This is a public repository, so anyone can open a pull request. Every job
 # here is written on the assumption that PR content is hostile.
 
 on:
@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 env:
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
   NODE_VERSION: 24.11.0
 
 jobs:
@@ -203,8 +203,8 @@ jobs:
         # the build on one trains people to ignore this job.
         run: |
           set -uo pipefail
-          # Distinguish "found advisories" from "could not run". pnpm 10.33.2
-          # crashes on a gzipped audit response with
+          # Distinguish "found advisories" from "could not run". Some pnpm
+          # versions crash on a gzipped audit response with
           # `Unexpected token '\x1f' ... is not valid JSON`, which is a
           # transport bug, not a finding. Failing the build on it would make a
           # red audit job mean nothing, and a real advisory would be ignored

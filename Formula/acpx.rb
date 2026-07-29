@@ -3,7 +3,7 @@
 # this file for every release and opens a PR with the result.
 class Acpx < Formula
   desc "Headless CLI client for the Agent Client Protocol (ACP)"
-  homepage "https://github.com/artagon/acpx"
+  homepage "https://github.com/openclaw/acpx"
 
   # Two install paths, resolved per platform:
   #
@@ -21,19 +21,13 @@ class Acpx < Formula
   # Binary assets carry build-provenance and SBOM attestations, and releases
   # are immutable, so each sha256 pins bytes that cannot be replaced
   # upstream. See docs/verifying-releases.md.
-  url "https://registry.npmjs.org/acpx/-/acpx-0.12.0.tgz"
-  version "0.12.0"
-  sha256 "1dd271ad09a39071b8305bdcdf6acddaa31c8f35ecf063e782dc9b5da8e193d7"
+  url "https://registry.npmjs.org/acpx/-/acpx-0.12.1.tgz"
+  version "0.12.1"
+  sha256 "c759e05bfc628a99da32e04e384272a49ff34ada454ce87550d2a6ac234e58de"
   license "MIT"
 
   on_macos do
-    on_arm do
-      url "https://github.com/artagon/acpx/releases/download/v0.12.0/acpx-0.12.0-darwin-arm64.tar.gz"
-      sha256 "823fea276f249b73c9305f0b36299f0af8f8936966208e5b52ef73f6f97e2c58"
-    end
-    on_intel do
-      depends_on "node"
-    end
+    depends_on "node"
   end
 
   on_linux do
@@ -41,11 +35,18 @@ class Acpx < Formula
   end
 
   def install
-    if (buildpath/"acpx").exist?
+    npm_layout = (buildpath/"package.json").file?
+    binary_layout = (buildpath/"acpx").file? && (buildpath/"acpx").executable?
+
+    odie "Ambiguous acpx release layout" if npm_layout && binary_layout
+
+    if binary_layout
       bin.install "acpx"
-    else
+    elsif npm_layout
       system "npm", "install", *std_npm_args
       bin.install_symlink Dir["#{libexec}/bin/*"]
+    else
+      odie "Unknown acpx release layout"
     end
   end
 

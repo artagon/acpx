@@ -185,8 +185,8 @@ jobs:
       # Unlike the single executable, the npm package bundles nothing: `dist/`
       # ships alone and every dependency is installed on the user's machine at
       # install time. So the honest scan target is the production dependency
-      # closure, resolved from the same frozen lockfile — currently ~685
-      # packages, most of them pulled in by the bundled ACP adapters.
+      # closure, resolved from the same frozen lockfile. Most components are
+      # pulled in by the bundled ACP adapters.
       #
       # Built in a scratch directory rather than by pruning the existing
       # install, so a dev-only package cannot leak into the result.

@@ -67,18 +67,31 @@ The repository is its own tap — `Formula/acpx.rb` lives at the root, so no
 separate tap repo is needed:
 
 ```bash
-brew tap artagon/acpx https://github.com/artagon/acpx
-brew install artagon/acpx/acpx
+brew tap openclaw/acpx https://github.com/openclaw/acpx
+brew install openclaw/acpx/acpx
 ```
+
+The checked-in bootstrap formula installs the latest published npm package.
+After the first binary release completes, the formula update workflow replaces
+that source with platform-specific executable assets while retaining an npm
+fallback for unsupported platforms.
 
 ## Publishing a Homebrew release
 
-1. `pnpm run sea` on each target os/arch.
-2. `tar -czf acpx-<version>-<os>-<arch>.tar.gz -C <dir> acpx`
-3. Attach the tarballs to the GitHub release for that version.
-4. Update `version` and each `sha256` in `Formula/acpx.rb` from
-   `shasum -a 256` of the uploaded assets, and commit.
+The `Release binaries` workflow owns the release path:
 
-`Formula/acpx.rb` carries `REPLACE_ON_RELEASE` placeholders until the first
-release exists; `brew install` fails loudly on a checksum mismatch, so an
-un-updated formula cannot silently install the wrong artifact.
+1. A maintainer enables GitHub release immutability for the repository.
+2. A normal tag release publishes and attests the npm tarball.
+3. A maintainer dispatches `release-binaries.yml` with that tag.
+4. Four native jobs build and test the platform executables without write or
+   OIDC permissions.
+5. Separate jobs attest each tarball and its CycloneDX SBOM, then publish all
+   assets through a draft release.
+6. A read-only job verifies the npm tarball's provenance and renders the
+   formula from the published checksums.
+7. A credential-only job opens a formula PR without executing repository code.
+
+The separation is deliberate. Build dependencies and repository code never run
+in the jobs that hold release-write or binary-attestation credentials. Formula
+generation likewise runs without a write token; the writer only commits the
+rendered artifact.

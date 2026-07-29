@@ -112,9 +112,25 @@ instead of spawning raw terminal sessions. For example:
 
 ## Install
 
+Install the npm package when you already manage Node.js:
+
 ```bash
 npm install -g acpx@latest
 ```
+
+Or install with Homebrew on macOS or Linux:
+
+```bash
+brew tap openclaw/acpx https://github.com/openclaw/acpx
+brew install openclaw/acpx/acpx
+```
+
+Homebrew installs a self-contained executable when a release publishes one for
+the current platform. Other platforms use the same npm package through
+Homebrew's Node.js. The binary avoids a system Node dependency and starts
+faster, while npm is substantially smaller and follows the standard Node
+toolchain. See [Packaging](docs/packaging.md) for the measured tradeoffs and
+[Verifying releases](docs/verifying-releases.md) for SBOM and provenance checks.
 
 Or run without installing:
 
@@ -126,7 +142,10 @@ Session state lives in `~/.acpx/` either way. Global install is a little faster,
 
 ## Agent prerequisites
 
-`acpx` auto-downloads ACP adapters with `npx` on first use. You do not need to install adapter packages manually.
+The npm and Homebrew installs include the Codex and Claude ACP adapters so they
+do not need a registry lookup on first launch. Other package-backed adapters
+are resolved with `npx` when first used. You do not need to install adapter
+packages manually.
 
 The only prerequisite is the underlying coding agent you want to use:
 
