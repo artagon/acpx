@@ -122,6 +122,21 @@ test("the formula pins only verified bytes", () => {
   assert.match(formula, /gh attestation verify/);
 });
 
+test("the npm SBOM catalogs the pruned production closure", () => {
+  const release = readWorkflow("release.yml");
+
+  assert.match(release, /pnpm --filter acpx deploy[\s\S]*?--prod[\s\S]*?--ignore-scripts/);
+  assert.match(release, /prod-tree\/node_modules\/\.pnpm\/lock\.yaml/);
+  assert.match(release, /prod-tree\/pnpm-lock\.yaml/);
+  assert.match(release, /@agentclientprotocol\/claude-agent-acp/);
+  assert.match(release, /@agentclientprotocol\/codex-acp/);
+  assert.match(release, /@agentclientprotocol\/sdk/);
+  assert.match(release, /@stryker-mutator\/core/);
+  assert.match(release, /oxlint/);
+  assert.match(release, /vite/);
+  assert.doesNotMatch(release, /cp package\.json pnpm-lock\.yaml pnpm-workspace\.yaml/);
+});
+
 test("binary releases fail closed unless repository immutability is enabled", () => {
   const gate = jobBlocks(readWorkflow("release-binaries.yml")).get("gate") ?? "";
 
