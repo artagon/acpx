@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { queuePaths } from "./queue-test-helpers.js";
 
 const DIST_CLI_PATH = path.join(process.cwd(), "dist", "cli.js");
+const DIST_SEA_SBOM_PATH = path.join(process.cwd(), "dist-sea", "sbom.json");
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
 
@@ -77,11 +80,13 @@ async function runPackageBin(
   args: string[],
   homeDir: string,
   timeoutMs = 15_000,
+  envOverrides: NodeJS.ProcessEnv = {},
 ): Promise<CliRunResult> {
   return await new Promise<CliRunResult>((resolve, reject) => {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: homeDir,
+      ...envOverrides,
     };
     delete env.NODE_V8_COVERAGE;
 
@@ -120,6 +125,68 @@ async function runPackageBin(
   });
 }
 
+async function waitForJsonFile(
+  filePath: string,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      return JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${filePath}`);
+    }
+    await delay(25);
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function waitForCondition(
+  description: string,
+  condition: () => boolean,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${description}`);
+    }
+    await delay(25);
+  }
+}
+
+async function waitForChildExit(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`timed out waiting for packaged acpx PID ${child.pid} to exit`));
+    }, timeoutMs);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+}
+
 test("packaged bin prints version through package executable mapping", async (t) => {
   if (!existsSync(DIST_CLI_PATH)) {
     t.skip("run pnpm build before packaged-bin smoke tests");
@@ -148,6 +215,58 @@ test("packaged bin prints version with top-level output flags", async (t) => {
     assert.equal(result.stderr.trim(), "");
     assert.equal(result.stdout.trim(), readPackageVersion());
   });
+});
+
+test("SEA build SBOM identifies the embedded esbuild runtime and platform binary", (t) => {
+  if (!process.env.ACPX_TEST_PACKAGE_BIN || !existsSync(DIST_SEA_SBOM_PATH)) {
+    t.skip("build the SEA and set ACPX_TEST_PACKAGE_BIN before checking its SBOM");
+    return;
+  }
+
+  const sbom = JSON.parse(readFileSync(DIST_SEA_SBOM_PATH, "utf8")) as {
+    components?: Array<{
+      group?: unknown;
+      name?: unknown;
+      version?: unknown;
+      "bom-ref"?: unknown;
+      hashes?: unknown;
+    }>;
+    dependencies?: Array<{
+      ref?: unknown;
+      dependsOn?: unknown;
+    }>;
+  };
+  const components = sbom.components ?? [];
+  const esbuild = components.find((component) => component.name === "esbuild");
+  assert.ok(esbuild);
+  assert.equal(typeof esbuild.version, "string");
+  assert.equal(typeof esbuild["bom-ref"], "string");
+
+  const platformPackageName = `${process.platform}-${process.arch}`;
+  const platformBinary = components.find(
+    (component) =>
+      component.group === "@esbuild" &&
+      component.name === platformPackageName &&
+      component.version === esbuild.version,
+  );
+  assert.ok(platformBinary);
+  assert.equal(typeof platformBinary["bom-ref"], "string");
+  assert.ok(Array.isArray(platformBinary.hashes));
+  assert.deepEqual(platformBinary.hashes, [
+    {
+      alg: "SHA-256",
+      content: createHash("sha256")
+        .update(readFileSync(path.join(process.cwd(), "dist-sea", "runtime", "esbuild")))
+        .digest("hex"),
+    },
+  ]);
+
+  const esbuildDependency = (sbom.dependencies ?? []).find(
+    (dependency) => dependency.ref === esbuild["bom-ref"],
+  );
+  assert.ok(esbuildDependency);
+  assert.ok(Array.isArray(esbuildDependency.dependsOn));
+  assert.ok(esbuildDependency.dependsOn.includes(platformBinary["bom-ref"]));
 });
 
 test("packaged bin runs a mock-agent exec command through package executable mapping", async (t) => {
@@ -179,6 +298,255 @@ test("packaged bin runs a mock-agent exec command through package executable map
   });
 });
 
+test("packaged bin runs a TypeScript flow with leading global flags", async (t) => {
+  if (!process.env.ACPX_TEST_PACKAGE_BIN && !existsSync(DIST_CLI_PATH)) {
+    t.skip("run pnpm build or set ACPX_TEST_PACKAGE_BIN before packaged-bin smoke tests");
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const flowPath = path.join(homeDir, "standalone.flow.ts");
+    await fs.writeFile(
+      flowPath,
+      [
+        'import { compute, defineFlow } from "acpx/flows";',
+        'enum Message { Ok = "packaged-flow-ok" }',
+        "const message: Message = Message.Ok;",
+        "export default defineFlow({",
+        '  name: "packaged-flow",',
+        '  startAt: "finish",',
+        "  nodes: {",
+        "    finish: compute({ run: () => ({ message }) }),",
+        "  },",
+        "  edges: [],",
+        "});",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const result = await runPackageBin(["--format", "json", "flow", "run", flowPath], homeDir);
+
+    assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+    assert.equal(result.signal, null);
+    assert.match(result.stdout, /packaged-flow-ok/);
+  });
+});
+
+test("packaged bin runs a CommonJS flow that requires acpx/flows", async (t) => {
+  if (!process.env.ACPX_TEST_PACKAGE_BIN && !existsSync(DIST_CLI_PATH)) {
+    t.skip("run pnpm build or set ACPX_TEST_PACKAGE_BIN before packaged-bin smoke tests");
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const flowPath = path.join(homeDir, "standalone.flow.cjs");
+    await fs.writeFile(
+      flowPath,
+      [
+        'const { compute, defineFlow } = require("acpx/flows");',
+        "module.exports = defineFlow({",
+        '  name: "packaged-commonjs-flow",',
+        '  startAt: "finish",',
+        "  nodes: {",
+        '    finish: compute({ run: () => ({ message: "packaged-commonjs-flow-ok" }) }),',
+        "  },",
+        "  edges: [],",
+        "});",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const result = await runPackageBin(["--format", "json", "flow", "run", flowPath], homeDir);
+
+    assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+    assert.equal(result.signal, null);
+    assert.match(result.stdout, /packaged-commonjs-flow-ok/);
+  });
+});
+
+test("SEA flow delegation fails clearly when system Node is unavailable", async (t) => {
+  if (!process.env.ACPX_TEST_PACKAGE_BIN) {
+    t.skip("set ACPX_TEST_PACKAGE_BIN to a SEA before running this smoke test");
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const flowPath = path.join(homeDir, "standalone.flow.mjs");
+    await fs.writeFile(
+      flowPath,
+      [
+        'import { compute, defineFlow } from "acpx/flows";',
+        "export default defineFlow({",
+        '  name: "packaged-flow-no-node",',
+        '  startAt: "finish",',
+        "  nodes: { finish: compute({ run: () => ({ ok: true }) }) },",
+        "  edges: [],",
+        "});",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const result = await runPackageBin(["flow", "run", flowPath], homeDir, 15_000, {
+      PATH: homeDir,
+    });
+
+    assert.equal(result.code, 1, result.stderr);
+    assert.equal(result.signal, null);
+    assert.match(result.stderr, /Unable to start SEA flow runtime/);
+    assert.match(result.stderr, /ENOENT/);
+  });
+});
+
+test("SEA flow delegation forwards termination signals and removes its temp runtime", async (t) => {
+  if (!process.env.ACPX_TEST_PACKAGE_BIN) {
+    t.skip("set ACPX_TEST_PACKAGE_BIN to a SEA before running this smoke test");
+    return;
+  }
+  if (process.platform === "win32") {
+    t.skip("POSIX signal semantics are unavailable on Windows");
+    return;
+  }
+
+  for (const terminationSignal of ["SIGTERM", "SIGINT"] as const) {
+    await t.test(terminationSignal, async () => {
+      await withTempHome(async (homeDir) => {
+        const markerPath = path.join(homeDir, "delegated-flow.json");
+        const flowPath = path.join(homeDir, "blocking.flow.mjs");
+        await fs.writeFile(
+          flowPath,
+          [
+            'import fs from "node:fs/promises";',
+            'import path from "node:path";',
+            'import { compute, defineFlow } from "acpx/flows";',
+            `const markerPath = ${JSON.stringify(markerPath)};`,
+            "export default defineFlow({",
+            '  name: "packaged-signal-flow",',
+            '  startAt: "wait",',
+            "  nodes: {",
+            "    wait: compute({",
+            "      run: async () => {",
+            "        const runtimePath = process.env.ACPX_FLOW_RUNTIME_PATH;",
+            "        const esbuildBinaryPath = process.env.ESBUILD_BINARY_PATH;",
+            '        if (!runtimePath) throw new Error("missing SEA flow runtime path");',
+            '        if (!esbuildBinaryPath) throw new Error("missing esbuild binary path");',
+            "        const tempDir = path.dirname(runtimePath);",
+            '        const esbuildPackagePath = path.join(tempDir, "node_modules/esbuild/package.json");',
+            '        const esbuildMainPath = path.join(tempDir, "node_modules/esbuild/lib/main.js");',
+            "        const [tempStat, binaryStat, packageStat, mainStat] = await Promise.all([",
+            "          fs.stat(tempDir),",
+            "          fs.stat(esbuildBinaryPath),",
+            "          fs.stat(esbuildPackagePath),",
+            "          fs.stat(esbuildMainPath),",
+            "        ]);",
+            "        await fs.writeFile(",
+            "          markerPath,",
+            "          JSON.stringify({",
+            "            pid: process.pid,",
+            "            tempDir,",
+            "            tempMode: tempStat.mode & 0o777,",
+            "            esbuildBinaryPath,",
+            "            esbuildBinaryMode: binaryStat.mode & 0o777,",
+            "            esbuildPackagePath,",
+            "            esbuildPackageMode: packageStat.mode & 0o777,",
+            "            esbuildMainPath,",
+            "            esbuildMainMode: mainStat.mode & 0o777,",
+            "          }),",
+            "        );",
+            "        await new Promise(() => {});",
+            "      },",
+            "    }),",
+            "  },",
+            "  edges: [],",
+            "});",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+
+        const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir };
+        delete env.NODE_V8_COVERAGE;
+        const command = packageBinSpawnArgs(["flow", "run", flowPath]);
+        const child = spawn(command.command, command.args, {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+
+        let delegatedPid: number | undefined;
+        let delegatedTempDir: string | undefined;
+        let stderr = "";
+        child.stderr?.setEncoding("utf8");
+        child.stderr?.on("data", (chunk: string) => {
+          stderr += chunk;
+        });
+
+        try {
+          const marker = await waitForJsonFile(markerPath, 10_000);
+          assert.equal(typeof marker.pid, "number");
+          assert.equal(typeof marker.tempDir, "string");
+          const activeDelegatedPid = marker.pid as number;
+          const activeDelegatedTempDir = marker.tempDir as string;
+          delegatedPid = activeDelegatedPid;
+          delegatedTempDir = activeDelegatedTempDir;
+          assert.equal(isProcessAlive(activeDelegatedPid), true);
+          assert.equal(existsSync(activeDelegatedTempDir), true);
+          assert.equal(marker.tempMode, 0o700);
+          assert.equal(marker.esbuildBinaryPath, path.join(activeDelegatedTempDir, "esbuild"));
+          assert.equal(marker.esbuildBinaryMode, 0o700);
+          assert.equal(
+            marker.esbuildPackagePath,
+            path.join(activeDelegatedTempDir, "node_modules", "esbuild", "package.json"),
+          );
+          assert.equal(marker.esbuildPackageMode, 0o600);
+          assert.equal(
+            marker.esbuildMainPath,
+            path.join(activeDelegatedTempDir, "node_modules", "esbuild", "lib", "main.js"),
+          );
+          assert.equal(marker.esbuildMainMode, 0o600);
+
+          const exitPromise = waitForChildExit(child, 5_000);
+          assert.equal(child.kill(terminationSignal), true);
+          const parentExit = await exitPromise;
+          assert.equal(parentExit.code, null, stderr);
+          assert.equal(parentExit.signal, terminationSignal, stderr);
+
+          await waitForCondition(
+            `delegated flow PID ${activeDelegatedPid} to terminate`,
+            () => !isProcessAlive(activeDelegatedPid),
+            5_000,
+          );
+          await waitForCondition(
+            `delegated flow temp dir ${activeDelegatedTempDir} to be removed`,
+            () => !existsSync(activeDelegatedTempDir),
+            5_000,
+          );
+        } finally {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill("SIGKILL");
+          }
+          if (delegatedPid !== undefined && isProcessAlive(delegatedPid)) {
+            process.kill(delegatedPid, "SIGKILL");
+            await waitForCondition(
+              `test-owned delegated flow PID ${delegatedPid} cleanup`,
+              () => !isProcessAlive(delegatedPid as number),
+              5_000,
+            );
+          }
+          if (
+            delegatedTempDir !== undefined &&
+            path.dirname(delegatedTempDir) === os.tmpdir() &&
+            path.basename(delegatedTempDir).startsWith("acpx-sea-flow-")
+          ) {
+            await fs.rm(delegatedTempDir, { recursive: true, force: true });
+          }
+        }
+      });
+    });
+  }
+});
+
 test("packaged bin serializes concurrent cold prompts through one detached queue owner", async (t) => {
   if (!process.env.ACPX_TEST_PACKAGE_BIN && !existsSync(DIST_CLI_PATH)) {
     t.skip("run pnpm build or set ACPX_TEST_PACKAGE_BIN before packaged-bin smoke tests");
@@ -203,22 +571,26 @@ test("packaged bin serializes concurrent cold prompts through one detached queue
     const sessionId = createdPayload.acpxRecordId as string;
 
     try {
-      const [first, concurrent] = await Promise.all([
-        runPackageBin(
-          [...baseArgs, "--format", "quiet", "prompt", "echo packaged-owner-first"],
-          homeDir,
-        ),
-        runPackageBin(
-          [...baseArgs, "--format", "quiet", "prompt", "echo packaged-owner-concurrent"],
-          homeDir,
-        ),
-      ]);
-      assert.equal(first.code, 0, first.stderr);
-      assert.equal(first.signal, null);
-      assert.equal(first.stdout.trim(), "packaged-owner-first");
-      assert.equal(concurrent.code, 0, concurrent.stderr);
-      assert.equal(concurrent.signal, null);
-      assert.equal(concurrent.stdout.trim(), "packaged-owner-concurrent");
+      const coldPromptOutputs = Array.from(
+        { length: 4 },
+        (_, index) => `packaged-owner-cold-${index + 1}`,
+      );
+      const coldResults = await Promise.all(
+        coldPromptOutputs.map(async (output) => {
+          return await runPackageBin(
+            [...baseArgs, "--format", "quiet", "prompt", `echo ${output}`],
+            homeDir,
+          );
+        }),
+      );
+      for (const result of coldResults) {
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(result.signal, null);
+      }
+      assert.deepEqual(
+        coldResults.map((result) => result.stdout.trim()).toSorted(),
+        coldPromptOutputs.toSorted(),
+      );
 
       const firstLease = JSON.parse(
         await fs.readFile(queuePaths(homeDir, sessionId).lockPath, "utf8"),

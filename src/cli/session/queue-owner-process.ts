@@ -148,6 +148,10 @@ export function resolveQueueOwnerSpawnArgs(
   argv: readonly string[] = process.argv,
   runningInSea: boolean = isSea(),
 ): string[] {
+  if (runningInSea) {
+    return ["__queue-owner"];
+  }
+
   const override = process.env.ACPX_QUEUE_OWNER_ARGS;
   if (override) {
     const parsed = JSON.parse(override) as unknown;
@@ -155,10 +159,6 @@ export function resolveQueueOwnerSpawnArgs(
       return [...parsed];
     }
     throw new Error("acpx self-spawn failed: invalid ACPX_QUEUE_OWNER_ARGS");
-  }
-
-  if (runningInSea) {
-    return ["__queue-owner"];
   }
 
   const entry = argv[1];

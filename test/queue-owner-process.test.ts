@@ -39,7 +39,7 @@ async function waitForCondition(
 }
 
 describe("resolveQueueOwnerSpawnArgs", () => {
-  it("prefers ACPX_QUEUE_OWNER_ARGS when provided, including in a SEA", () => {
+  it("ignores ACPX_QUEUE_OWNER_ARGS in a SEA", () => {
     const previous = process.env.ACPX_QUEUE_OWNER_ARGS;
     process.env.ACPX_QUEUE_OWNER_ARGS = JSON.stringify([
       "--import",
@@ -49,7 +49,7 @@ describe("resolveQueueOwnerSpawnArgs", () => {
     ]);
     try {
       const args = resolveQueueOwnerSpawnArgs(["acpx", "acpx"], true);
-      assert.deepEqual(args, ["--import", "tsx", "src/cli.ts", "__queue-owner"]);
+      assert.deepEqual(args, ["__queue-owner"]);
     } finally {
       if (previous === undefined) {
         delete process.env.ACPX_QUEUE_OWNER_ARGS;

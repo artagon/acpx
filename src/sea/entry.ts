@@ -1,6 +1,8 @@
+import { getAsset } from "node:sea";
 import v8 from "node:v8";
 import { main } from "../cli-core.js";
 import { installBrokenPipeHandler } from "../cli/broken-pipe.js";
+import { delegateSeaFlowCommand } from "./flow-delegation.js";
 
 /**
  * Single-executable entry point, built as CommonJS so it can be snapshotted.
@@ -20,5 +22,15 @@ v8.startupSnapshot.setDeserializeMainFunction(() => {
   installBrokenPipeHandler(process.stdout, "exit");
   installBrokenPipeHandler(process.stderr, isQueueOwner ? "ignore" : "exit");
 
-  void main(process.argv);
+  void delegateSeaFlowCommand(process.argv, getAsset)
+    .then((delegated) => {
+      if (!delegated) {
+        void main(process.argv);
+      }
+    })
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[acpx] error: RUNTIME Unable to start SEA flow runtime: ${message}\n`);
+      process.exitCode = 1;
+    });
 });

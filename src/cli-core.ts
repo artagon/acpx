@@ -288,6 +288,20 @@ function classifyTopLevelFlagScan(token: string): TopLevelFlagStep {
   };
 }
 
+export function findTopLevelCommandToken(argv: readonly string[]): string | undefined {
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    const scan = classifyTopLevelFlagScan(token);
+    if (scan.stop) {
+      return token === "--" ? undefined : token;
+    }
+    if (scan.skipNext) {
+      index += 1;
+    }
+  }
+  return undefined;
+}
+
 function readFormatFlagValue(
   token: string,
   nextToken: string | undefined,
