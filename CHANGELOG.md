@@ -12,6 +12,16 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+- Runtime/agents: terminate owned adapter process groups on POSIX and
+  best-effort tracked process trees on Windows during normal and failed startup
+  cleanup so package-exec wrappers do not leave captured descendants running
+  after ACPX exits.
+
+- Runtime/queue: publish queue-owner leases atomically, preserve fresh malformed
+  locks during collisions, and treat only a fresh lease-before-bind owner as a
+  fast startup miss, preventing premature `QUEUE_NOT_ACCEPTING_REQUESTS` errors
+  without masking older unreachable owners.
+
 ## 2026.7.27 (v0.13.0)
 
 ### Highlights
@@ -44,10 +54,6 @@ Repo: https://github.com/openclaw/acpx
 - Runtime/sessions: use collision-resistant temporary paths for concurrent atomic session and index writes. Thanks @henkterharmsel.
 
 - CLI/status: report a normal cold-start session as `agent starting` while preserving `needs reconnect` for an unreachable live owner. Thanks @guettli.
-
-- Runtime/agents: terminate owned adapter process groups on POSIX and best-effort tracked process trees on Windows during normal and failed startup cleanup so package-exec wrappers do not leave captured descendants running after ACPX exits.
-
-- Runtime/queue: treat a cold-start owner lease that has not bound its socket yet as a startup miss without a second health probe, allowing the caller to recover instead of reporting `QUEUE_NOT_ACCEPTING_REQUESTS`.
 
 ## 2026.7.23 (v0.12.1)
 

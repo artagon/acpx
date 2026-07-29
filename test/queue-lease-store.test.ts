@@ -178,6 +178,82 @@ test("tryAcquireQueueOwnerLease clears stale dead owners and can acquire on retr
   });
 });
 
+test("tryAcquireQueueOwnerLease preserves a fresh malformed lock during collision", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "fresh-malformed-owner";
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    const malformedPayload = "{incomplete";
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    await fs.writeFile(lockPath, malformedPayload, "utf8");
+    if (process.platform !== "win32") {
+      await fs.mkdir(path.dirname(socketPath), { recursive: true });
+      await fs.writeFile(socketPath, "live-socket-placeholder", "utf8");
+    }
+
+    assert.equal(await tryAcquireQueueOwnerLease(sessionId), undefined);
+    assert.equal(await fs.readFile(lockPath, "utf8"), malformedPayload);
+    if (process.platform !== "win32") {
+      assert.equal(await fs.readFile(socketPath, "utf8"), "live-socket-placeholder");
+    }
+
+    await fs.rm(lockPath, { force: true });
+    if (process.platform !== "win32") {
+      await fs.rm(socketPath, { force: true });
+    }
+  });
+});
+
+test("tryAcquireQueueOwnerLease removes a malformed lock only after it is stale", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "stale-malformed-owner";
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    await fs.writeFile(lockPath, "{incomplete", "utf8");
+    await fs.utimes(lockPath, new Date(0), new Date(0));
+    if (process.platform !== "win32") {
+      await fs.mkdir(path.dirname(socketPath), { recursive: true });
+      await fs.writeFile(socketPath, "stale-socket-placeholder", "utf8");
+    }
+
+    assert.equal(await tryAcquireQueueOwnerLease(sessionId), undefined);
+    await assert.rejects(fs.access(lockPath));
+    if (process.platform !== "win32") {
+      await assert.rejects(fs.access(socketPath));
+    }
+
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+    await releaseQueueOwnerLease(lease);
+  });
+});
+
+test("refreshQueueOwnerLease never exposes a partial record to concurrent readers", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "atomic-refresh";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+
+    try {
+      const writers = Array.from({ length: 200 }, async (_, index) => {
+        await refreshQueueOwnerLease(lease, { queueDepth: index % 5 });
+      });
+      const observations = await Promise.all(
+        Array.from({ length: 200 }, async () => await readQueueOwnerRecord(sessionId)),
+      );
+      await Promise.all(writers);
+      assert.equal(
+        observations.every((record) => record !== undefined),
+        true,
+      );
+
+      const files = await fs.readdir(path.dirname(queueLockFilePath(sessionId, homeDir)));
+      assert.deepEqual(files, [path.basename(queueLockFilePath(sessionId, homeDir))]);
+    } finally {
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
 test("readQueueOwnerStatus returns live owner details for a healthy owner", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "healthy-owner";

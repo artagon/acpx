@@ -51,10 +51,16 @@ export {
 } from "./lease-store.js";
 export type { QueueOwnerLease } from "./lease-store.js";
 
+const QUEUE_OWNER_STARTUP_GRACE_MS = 10_000;
 const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
 ]);
+
+function queueOwnerIsWithinStartupGrace(owner: QueueOwnerRecord): boolean {
+  const createdAt = Date.parse(owner.createdAt);
+  return Number.isFinite(createdAt) && Date.now() - createdAt < QUEUE_OWNER_STARTUP_GRACE_MS;
+}
 
 async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
   sessionId: string;
@@ -713,10 +719,16 @@ function assertQueueOwnerMcpConfigMatches(
 
 async function unavailableOwnerCountsAsMissing(
   sessionId: string,
+  owner: QueueOwnerRecord,
   startupProbe: boolean | undefined,
 ): Promise<boolean> {
   if (startupProbe) {
-    return true;
+    const latestOwner = await readQueueOwnerRecord(sessionId);
+    return (
+      !latestOwner ||
+      latestOwner.ownerGeneration !== owner.ownerGeneration ||
+      queueOwnerIsWithinStartupGrace(latestOwner)
+    );
   }
   const health = await probeQueueOwnerHealth(sessionId);
   return !health.hasLease;
@@ -758,7 +770,7 @@ export async function trySubmitToRunningOwner(
     return submitted;
   }
 
-  if (await unavailableOwnerCountsAsMissing(options.sessionId, options.startupProbe)) {
+  if (await unavailableOwnerCountsAsMissing(options.sessionId, owner, options.startupProbe)) {
     return undefined;
   }
 
