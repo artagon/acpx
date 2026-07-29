@@ -884,6 +884,78 @@ test("trySubmitToRunningOwner recovers stale owners before MCP conflict checks",
   });
 });
 
+test("trySubmitToRunningOwner keeps polling while a fresh owner is still binding", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "submit-owner-still-starting";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+    });
+
+    try {
+      const outcome = await trySubmitToRunningOwner({
+        sessionId,
+        message: "hello",
+        permissionMode: "approve-reads",
+        outputFormatter: NOOP_OUTPUT_FORMATTER,
+        waitForCompletion: true,
+      });
+      assert.equal(outcome, undefined);
+      await fs.access(lockPath);
+      assert.equal(keeper.exitCode, null);
+      assert.equal(keeper.signalCode, null);
+    } finally {
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("trySubmitToRunningOwner fails closed for an older live owner without a socket", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "submit-owner-not-accepting";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      createdAt: "2000-01-01T00:00:00.000Z",
+      heartbeatAt: new Date().toISOString(),
+    });
+
+    try {
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_NOT_ACCEPTING_REQUESTS");
+          assert.equal(error.retryable, true);
+          return true;
+        },
+      );
+      await fs.access(lockPath);
+      assert.equal(keeper.exitCode, null);
+      assert.equal(keeper.signalCode, null);
+    } finally {
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
 test("trySubmitToRunningOwner marks quiet errors as outputAlreadyEmitted after formatter emits", async () => {
   // Regression test for double-emission in quiet mode.
   //
