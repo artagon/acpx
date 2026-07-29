@@ -83,7 +83,11 @@ the source of the measured startup improvement.
 
 The `Release binaries` workflow owns the release path:
 
-1. A maintainer enables GitHub release immutability for the repository.
+1. A maintainer enables GitHub release immutability for the repository and
+   configures the `RELEASE_SETTINGS_READER` Actions secret. Use a
+   fine-grained token scoped to this repository with only
+   **Administration: read**; the workflow's `GITHUB_TOKEN` cannot query that
+   setting.
 2. A normal tag release publishes and attests the npm tarball.
 3. A maintainer dispatches `release-binaries.yml` with that tag and selects the
    same tag as the workflow ref. The gate rejects a branch ref so GitHub's

@@ -48,6 +48,12 @@ before publishing executable assets. `release-binaries.yml` checks the
 repository setting and fails before building when it is disabled. GitHub only
 applies the setting to future releases.
 
+The status endpoint requires repository **Administration: read**, a permission
+that Actions cannot grant to `GITHUB_TOKEN`. Store a fine-grained token scoped
+to this repository, with only that permission, as the
+`RELEASE_SETTINGS_READER` Actions secret. The workflow fails closed when
+the secret is absent or cannot read the setting.
+
 Once enabled, published assets and their Git tag cannot be replaced. This is why
 the workflow attaches every asset to a **draft** and publishes the draft last.
 A botched binary release requires a new version rather than an in-place patch.

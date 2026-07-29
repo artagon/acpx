@@ -98,6 +98,7 @@ test("release-binaries separates the signing identity from repository code", () 
   // must render from the immutable tag rather than a movable branch.
   assert.doesNotMatch(jobs.get("formula") ?? "", /id-token/);
   assert.match(jobs.get("formula") ?? "", /permissions:\n\s+contents: read/);
+  assert.match(jobs.get("formula") ?? "", /attestations: read/);
   assert.match(jobs.get("formula") ?? "", /persist-credentials: false/);
   assert.doesNotMatch(jobs.get("formula") ?? "", /ref: main/);
   assert.doesNotMatch(jobs.get("formula") ?? "", /pnpm install|npm install|npm ci\b/);
@@ -126,6 +127,11 @@ test("binary releases fail closed unless repository immutability is enabled", ()
 
   assert.match(gate, /repos\/\$\{GH_REPO\}\/immutable-releases/);
   assert.match(gate, /X-GitHub-Api-Version: 2026-03-10/);
+  assert.match(
+    gate,
+    /Require immutable releases[\s\S]*?GH_TOKEN: \$\{\{ secrets\.RELEASE_SETTINGS_READER \}\}[\s\S]*?repos\/\$\{GH_REPO\}\/immutable-releases/,
+  );
+  assert.match(gate, /if \[ -z "\$GH_TOKEN" \]/);
   assert.match(gate, /if \[ "\$enabled" != "true" \]/);
 });
 

@@ -67,10 +67,17 @@ jobs:
 
       - name: Require immutable releases
         env:
-          GH_TOKEN: ${{ github.token }}
+          # GITHUB_TOKEN cannot receive repository Administration permission.
+          # Keep this fine-grained PAT scoped to this repository with only
+          # Administration: read.
+          GH_TOKEN: ${{ secrets.RELEASE_SETTINGS_READER }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Configure RELEASE_SETTINGS_READER with repository Administration: read."
+            exit 1
+          fi
           enabled="$(
             gh api \
               --header "X-GitHub-Api-Version: 2026-03-10" \
@@ -451,6 +458,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      attestations: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
