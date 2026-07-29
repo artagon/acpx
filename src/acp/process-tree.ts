@@ -112,7 +112,11 @@ export async function signalProcessTree(
 
   if (!rootRunning) {
     await captureProcessTreePids(tree, false);
-    await retainOwnedProcessTreePids(tree);
+    const refreshed = await refreshExitedProcessTreePids(tree);
+    if (!refreshed) {
+      tree.descendantPids.clear();
+      tree.descendantIdentities.clear();
+    }
   }
   for (const target of resolveProcessTreeSignalTargets(tree, rootRunning)) {
     if (target.tree) {
@@ -168,7 +172,9 @@ export async function waitForProcessTreeExit(
       rootIsRunning = rootRunning();
     }
     if (!rootIsRunning && !hasLiveManagedProcessTree(tree, rootIsRunning)) {
-      return true;
+      if (await exitedTreeRemainsEmptyAfterRefresh(tree)) {
+        return true;
+      }
     }
     if (Date.now() >= deadline) {
       return false;
@@ -193,6 +199,10 @@ async function waitForPriorSnapshotBeforeDeadline(
     ),
     waitMs(remainingMs).then(() => false),
   ]);
+}
+
+async function exitedTreeRemainsEmptyAfterRefresh(tree: ManagedProcessTree): Promise<boolean> {
+  return (await refreshExitedProcessTreePids(tree)) && !hasLiveManagedProcessTree(tree, false);
 }
 
 function hasLiveManagedProcessTree(tree: ManagedProcessTree, rootRunning: boolean): boolean {
@@ -283,14 +293,27 @@ async function listProcessGroupEntries(
   return processList.filter((entry) => entry.parentPid === processGroupId);
 }
 
-async function retainOwnedProcessTreePids(tree: ManagedProcessTree): Promise<void> {
+async function refreshExitedProcessTreePids(tree: ManagedProcessTree): Promise<boolean> {
+  const rootPid = tree.rootPid;
+  if (!tree.killProcessGroup || !rootPid) {
+    return true;
+  }
   const processList = await readProcessList(tree.platform);
   if (!processList) {
-    tree.descendantPids.clear();
-    tree.descendantIdentities.clear();
-    return;
+    return false;
   }
   const currentByPid = new Map(processList.map((entry) => [entry.pid, entry]));
+  retainCurrentProcessTreePids(tree, currentByPid);
+  if (tree.platform !== "win32") {
+    discoverCurrentPosixGroupMembers(tree, rootPid, processList);
+  }
+  return true;
+}
+
+function retainCurrentProcessTreePids(
+  tree: ManagedProcessTree,
+  currentByPid: Map<number, ProcessListEntry>,
+): void {
   for (const pid of tree.descendantPids) {
     const current = currentByPid.get(pid);
     const capturedIdentity = tree.descendantIdentities.get(pid);
@@ -300,6 +323,22 @@ async function retainOwnedProcessTreePids(tree: ManagedProcessTree): Promise<voi
       tree.descendantIdentities.delete(pid);
     }
   }
+}
+
+function discoverCurrentPosixGroupMembers(
+  tree: ManagedProcessTree,
+  rootPid: number,
+  processList: ProcessListEntry[],
+): void {
+  const currentGroup = processList.filter((entry) => entry.parentPid === rootPid);
+  if (currentGroup.some((entry) => entry.pid === rootPid)) {
+    // A live process whose PID equals the old group leader means the numeric
+    // PID/PGID was recycled after the owned group became empty.
+    tree.descendantPids.clear();
+    tree.descendantIdentities.clear();
+    return;
+  }
+  recordProcessTreePids(tree, currentGroup);
 }
 
 async function runPsCommand(args: string[]): Promise<string> {

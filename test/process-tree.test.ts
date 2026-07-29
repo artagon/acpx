@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -132,5 +133,44 @@ test(
 
     assert.equal(tree.descendantPids.has(process.pid), false);
     assert.equal(tree.descendantIdentities.has(process.pid), false);
+  },
+);
+
+test(
+  "exited POSIX trees discover descendants spawned after the exit snapshot",
+  { skip: process.platform === "win32" },
+  async () => {
+    const child = spawn(
+      "sh",
+      ["-c", "trap 'sleep 30 & exit 0' TERM; echo ready; while :; do sleep 1; done"],
+      {
+        detached: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    const rootPid = child.pid;
+    assert(rootPid);
+
+    try {
+      await once(child.stdout, "data");
+      const tree = createManagedProcessTree(rootPid, true, process.platform);
+      await captureProcessTreePids(tree, true);
+      await signalProcessTree(tree, true, "SIGTERM");
+      if (child.exitCode === null && child.signalCode === null) {
+        await once(child, "exit");
+      }
+
+      assert.equal(await waitForProcessTreeExit(tree, () => false, 100), false);
+
+      await signalProcessTree(tree, false, "SIGKILL");
+      assert.equal(await waitForProcessTreeExit(tree, () => false, 2_000), true);
+    } finally {
+      try {
+        process.kill(-rootPid, "SIGKILL");
+      } catch {
+        // The process group was already cleaned up.
+      }
+      child.stdout.destroy();
+    }
   },
 );
