@@ -480,6 +480,64 @@ test("identity-less lock claims age out after claimant PID reuse cannot be exclu
   });
 });
 
+test("restoring a displaced lock claim never overwrites a concurrent claim", async () => {
+  await withTempHome(async () => {
+    const sessionId = "displaced-claim-restore-race";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+    const lockStat = await fs.lstat(lease.lockPath);
+    const claimPath = `${lease.lockPath}.claim-${lockStat.dev}-${lockStat.ino}`;
+    const displacedClaim = {
+      claimId: "displaced-claim",
+      pid: process.pid,
+    };
+    const concurrentClaim = {
+      claimId: "concurrent-claim",
+      pid: process.pid,
+    };
+    await fs.writeFile(claimPath, `${JSON.stringify(displacedClaim)}\n`, "utf8");
+    const staleTime = new Date(Date.now() - 20_000);
+    await fs.utimes(claimPath, staleTime, staleTime);
+
+    const originalRename = fs.rename;
+    let raceInjected = false;
+    fs.rename = async (oldPath, newPath): Promise<void> => {
+      await originalRename(oldPath, newPath);
+      if (
+        !raceInjected &&
+        oldPath === claimPath &&
+        String(newPath).startsWith(`${claimPath}.reap-`)
+      ) {
+        raceInjected = true;
+        const refreshedTime = new Date();
+        await fs.utimes(newPath, refreshedTime, refreshedTime);
+        await fs.writeFile(claimPath, `${JSON.stringify(concurrentClaim)}\n`, {
+          encoding: "utf8",
+          flag: "wx",
+        });
+      }
+    };
+
+    try {
+      assert.equal(await claimQueueOwnerLock(lease.lockPath, lease.ownerGeneration), undefined);
+      assert.equal(raceInjected, true);
+      const survivingClaim = JSON.parse(await fs.readFile(claimPath, "utf8")) as {
+        claimId?: unknown;
+      };
+      assert.equal(survivingClaim.claimId, concurrentClaim.claimId);
+      const claimFiles = await fs.readdir(path.dirname(claimPath));
+      assert.equal(
+        claimFiles.some((fileName) => fileName.startsWith(`${path.basename(claimPath)}.reap-`)),
+        false,
+      );
+    } finally {
+      fs.rename = originalRename;
+      await fs.rm(claimPath, { force: true });
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
 test("released owners cannot overwrite or remove a successor lease", async () => {
   await withTempHome(async () => {
     const sessionId = "released-owner-refresh";

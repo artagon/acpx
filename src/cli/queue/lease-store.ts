@@ -438,13 +438,17 @@ async function restoreDisplacedQueueOwnerLockClaim(
   claimPath: string,
 ): Promise<void> {
   try {
-    await fs.rename(quarantinePath, claimPath);
+    await fs.link(quarantinePath, claimPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return;
+    }
+    if (code !== "EEXIST") {
       throw error;
     }
-    await unlinkIfPresent(quarantinePath);
   }
+  await unlinkIfPresent(quarantinePath);
 }
 
 async function queueOwnerLockClaimIsStale(claimPath: string, stat: Stats): Promise<boolean> {
