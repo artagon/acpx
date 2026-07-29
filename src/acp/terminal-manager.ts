@@ -470,14 +470,18 @@ export class TerminalManager {
       return;
     }
 
-    await this.waitForCleanupAfterSignal(terminal);
+    await this.waitForCleanupAfterSignal(terminal, "SIGKILL");
   }
 
-  private async waitForCleanupAfterSignal(terminal: ManagedTerminal): Promise<boolean> {
+  private async waitForCleanupAfterSignal(
+    terminal: ManagedTerminal,
+    finalSignal?: NodeJS.Signals,
+  ): Promise<boolean> {
     return await waitForProcessTreeExit(
       terminal.processTree,
       () => this.isRunning(terminal),
       this.killGraceMs,
+      finalSignal,
     );
   }
 }

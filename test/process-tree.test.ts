@@ -8,6 +8,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import {
   captureProcessTreePids,
+  collectWindowsDescendantProcesses,
   createManagedProcessTree,
   resolveProcessTreeSignalTargets,
   signalProcessTree,
@@ -15,6 +16,21 @@ import {
 } from "../src/acp/process-tree.js";
 
 const execFileAsync = promisify(execFile);
+
+test("Windows descendant tracking validates creation order and terminates cycles", () => {
+  const processList = [
+    { pid: 100, parentPid: 102, identity: "1000" },
+    { pid: 101, parentPid: 100, identity: "1100" },
+    { pid: 102, parentPid: 101, identity: "1200" },
+    { pid: 103, parentPid: 100, identity: "900" },
+  ];
+
+  assert.deepEqual(collectWindowsDescendantProcesses(100, "1000", processList), {
+    rootIdentity: "1000",
+    descendants: [processList[1], processList[2]],
+  });
+  assert.equal(collectWindowsDescendantProcesses(100, "different-root", processList), undefined);
+});
 
 test("running POSIX trees signal the owned process group", () => {
   const tree = createManagedProcessTree(4100, true, "darwin");
@@ -164,6 +180,39 @@ test(
 
       await signalProcessTree(tree, false, "SIGKILL");
       assert.equal(await waitForProcessTreeExit(tree, () => false, 2_000), true);
+    } finally {
+      try {
+        process.kill(-rootPid, "SIGKILL");
+      } catch {
+        // The process group was already cleaned up.
+      }
+      child.stdout.destroy();
+    }
+  },
+);
+
+test(
+  "final POSIX cleanup signals descendants discovered after the prior SIGKILL snapshot",
+  { skip: process.platform === "win32" },
+  async () => {
+    const child = spawn("sh", ["-c", "sleep 30 & echo $!"], {
+      detached: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const rootPid = child.pid;
+    assert(rootPid);
+
+    try {
+      const [output] = await once(child.stdout, "data");
+      const descendantPid = Number(String(output).trim());
+      assert(Number.isInteger(descendantPid));
+      if (child.exitCode === null && child.signalCode === null) {
+        await once(child, "exit");
+      }
+
+      const tree = createManagedProcessTree(rootPid, true, process.platform);
+      assert.equal(await waitForProcessTreeExit(tree, () => false, 2_000, "SIGKILL"), true);
+      assert.throws(() => process.kill(descendantPid, 0));
     } finally {
       try {
         process.kill(-rootPid, "SIGKILL");

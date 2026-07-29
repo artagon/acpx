@@ -1471,7 +1471,12 @@ export class AcpClient {
     } catch {
       // best effort
     }
-    return await waitForProcessTreeExit(processTree, () => isChildProcessRunning(child), waitMs);
+    return await waitForProcessTreeExit(
+      processTree,
+      () => isChildProcessRunning(child),
+      waitMs,
+      signal === "SIGKILL" ? signal : undefined,
+    );
   }
 
   private detachAgentHandles(agent: ChildProcess, unref: boolean): void {

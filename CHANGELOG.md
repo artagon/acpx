@@ -16,8 +16,9 @@ Repo: https://github.com/openclaw/acpx
   best-effort tracked process trees on Windows during normal and failed startup
   cleanup so package-exec wrappers do not leave captured descendants running
   after ACPX exits; exit-triggered snapshots are observed before cleanup
-  completes, owned POSIX group members created during shutdown are discovered,
-  external process-list discovery is bounded, and remembered descendants are
+  completes, owned POSIX group members created during shutdown are discovered
+  and re-signaled during forced cleanup, external process-list discovery is
+  bounded, and Windows parent edges plus remembered descendants are
   identity-checked before later signaling.
 
 - Runtime/queue: publish queue-owner leases atomically, preserve fresh malformed

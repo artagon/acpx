@@ -9,10 +9,11 @@ export type ManagedProcessTree = {
   platform: NodeJS.Platform;
   descendantPids: Set<number>;
   descendantIdentities: Map<number, string>;
+  rootIdentity?: string;
   snapshotPromise?: Promise<void>;
 };
 
-type ProcessListEntry = {
+export type ProcessListEntry = {
   pid: number;
   parentPid: number;
   identity: string;
@@ -82,7 +83,7 @@ async function recordCurrentProcessTreePids(tree: ManagedProcessTree): Promise<v
   }
   const processes =
     tree.platform === "win32"
-      ? await listDescendantProcesses(rootPid, tree.platform)
+      ? await listDescendantProcesses(tree)
       : await listProcessGroupEntries(rootPid, tree.platform);
   recordProcessTreePids(tree, processes);
 }
@@ -160,8 +161,10 @@ export async function waitForProcessTreeExit(
   tree: ManagedProcessTree,
   rootRunning: () => boolean,
   timeoutMs: number,
+  finalSignal?: NodeJS.Signals,
 ): Promise<boolean> {
   const deadline = Date.now() + Math.max(0, timeoutMs);
+  const signaledIdentities = new Set<string>();
   while (true) {
     let rootIsRunning = rootRunning();
     if (!rootIsRunning) {
@@ -172,7 +175,7 @@ export async function waitForProcessTreeExit(
       rootIsRunning = rootRunning();
     }
     if (!rootIsRunning && !hasLiveManagedProcessTree(tree, rootIsRunning)) {
-      if (await exitedTreeRemainsEmptyAfterRefresh(tree)) {
+      if (await exitedTreeRemainsEmptyAfterRefresh(tree, finalSignal, signaledIdentities)) {
         return true;
       }
     }
@@ -201,8 +204,36 @@ async function waitForPriorSnapshotBeforeDeadline(
   ]);
 }
 
-async function exitedTreeRemainsEmptyAfterRefresh(tree: ManagedProcessTree): Promise<boolean> {
-  return (await refreshExitedProcessTreePids(tree)) && !hasLiveManagedProcessTree(tree, false);
+async function exitedTreeRemainsEmptyAfterRefresh(
+  tree: ManagedProcessTree,
+  finalSignal: NodeJS.Signals | undefined,
+  signaledIdentities: Set<string>,
+): Promise<boolean> {
+  if (!(await refreshExitedProcessTreePids(tree))) {
+    return false;
+  }
+  if (!hasLiveManagedProcessTree(tree, false)) {
+    return true;
+  }
+  if (finalSignal) {
+    signalNewlyDiscoveredProcessPids(tree, finalSignal, signaledIdentities);
+  }
+  return false;
+}
+
+function signalNewlyDiscoveredProcessPids(
+  tree: ManagedProcessTree,
+  signal: NodeJS.Signals,
+  signaledIdentities: Set<string>,
+): void {
+  for (const pid of tree.descendantPids) {
+    const identity = tree.descendantIdentities.get(pid);
+    const signalKey = `${pid}:${identity ?? ""}`;
+    if (!signaledIdentities.has(signalKey)) {
+      sendSignal(pid, signal);
+      signaledIdentities.add(signalKey);
+    }
+  }
 }
 
 function hasLiveManagedProcessTree(tree: ManagedProcessTree, rootRunning: boolean): boolean {
@@ -219,15 +250,42 @@ function hasLiveManagedProcessTree(tree: ManagedProcessTree, rootRunning: boolea
   return hasLivePid(tree);
 }
 
-async function listDescendantProcesses(
-  rootPid: number,
-  platform: NodeJS.Platform = process.platform,
-): Promise<ProcessListEntry[]> {
-  const processList = await readProcessList(platform);
+async function listDescendantProcesses(tree: ManagedProcessTree): Promise<ProcessListEntry[]> {
+  const rootPid = tree.rootPid;
+  if (!rootPid) {
+    return [];
+  }
+  const processList = await readProcessList(tree.platform);
   if (!processList) {
     return [];
   }
 
+  const snapshot = collectWindowsDescendantProcesses(rootPid, tree.rootIdentity, processList);
+  if (!snapshot) {
+    return [];
+  }
+  tree.rootIdentity = snapshot.rootIdentity;
+  return snapshot.descendants;
+}
+
+export function collectWindowsDescendantProcesses(
+  rootPid: number,
+  expectedRootIdentity: string | undefined,
+  processList: ProcessListEntry[],
+): { rootIdentity: string; descendants: ProcessListEntry[] } | undefined {
+  const root = processList.find((entry) => entry.pid === rootPid);
+  if (!root || (expectedRootIdentity && expectedRootIdentity !== root.identity)) {
+    return undefined;
+  }
+
+  const childrenByParent = indexProcessesByParent(processList);
+  return {
+    rootIdentity: root.identity,
+    descendants: walkValidatedDescendants(root, childrenByParent),
+  };
+}
+
+function indexProcessesByParent(processList: ProcessListEntry[]): Map<number, ProcessListEntry[]> {
   const childrenByParent = new Map<number, ProcessListEntry[]>();
   for (const processEntry of processList) {
     const children = childrenByParent.get(processEntry.parentPid);
@@ -237,15 +295,36 @@ async function listDescendantProcesses(
       childrenByParent.set(processEntry.parentPid, [processEntry]);
     }
   }
+  return childrenByParent;
+}
 
+function walkValidatedDescendants(
+  root: ProcessListEntry,
+  childrenByParent: Map<number, ProcessListEntry[]>,
+): ProcessListEntry[] {
   const descendants: ProcessListEntry[] = [];
-  const queue = [...(childrenByParent.get(rootPid) ?? [])];
+  const visited = new Set([root.pid]);
+  const queue = [root];
   for (let index = 0; index < queue.length; index += 1) {
-    const processEntry = queue[index];
-    descendants.push(processEntry);
-    queue.push(...(childrenByParent.get(processEntry.pid) ?? []));
+    const parent = queue[index];
+    for (const child of childrenByParent.get(parent.pid) ?? []) {
+      if (visited.has(child.pid) || !isCreatedAtOrAfter(child.identity, parent.identity)) {
+        continue;
+      }
+      visited.add(child.pid);
+      descendants.push(child);
+      queue.push(child);
+    }
   }
   return descendants;
+}
+
+function isCreatedAtOrAfter(childIdentity: string, parentIdentity: string): boolean {
+  try {
+    return BigInt(childIdentity) >= BigInt(parentIdentity);
+  } catch {
+    return false;
+  }
 }
 
 function parseProcessListLine(line: string): ProcessListEntry | undefined {
