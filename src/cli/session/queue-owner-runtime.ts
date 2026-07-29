@@ -17,6 +17,7 @@ import {
 import type { SessionSendOutcome } from "../../types.js";
 import {
   QUEUE_CONNECT_RETRY_MS,
+  QUEUE_OWNER_STARTUP_GRACE_MS,
   SessionQueueOwner,
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
@@ -48,7 +49,8 @@ import {
 } from "./queue-owner-process.js";
 import { runQueuedTask } from "./runtime.js";
 
-const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS = 120;
+const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS =
+  Math.ceil(QUEUE_OWNER_STARTUP_GRACE_MS / QUEUE_CONNECT_RETRY_MS) + 1;
 const QUEUE_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const QUEUE_OWNER_ACTIVE_TURN_CANCEL_GRACE_MS = 750;
 
@@ -573,4 +575,9 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
 
 export type { QueueOwnerRuntimeOptions };
 export { DEFAULT_QUEUE_OWNER_TTL_MS };
-export const queueOwnerRuntimeTestInternals = { queueOwnerExitIsFatal };
+export const queueOwnerRuntimeTestInternals = {
+  queueOwnerExitIsFatal,
+  queueOwnerStartupGraceMs: QUEUE_OWNER_STARTUP_GRACE_MS,
+  queueOwnerStartupMaxAttempts: QUEUE_OWNER_STARTUP_MAX_ATTEMPTS,
+  queueConnectRetryMs: QUEUE_CONNECT_RETRY_MS,
+};

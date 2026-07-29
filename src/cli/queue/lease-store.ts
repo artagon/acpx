@@ -189,9 +189,9 @@ async function cleanupStaleQueueOwner(
   sessionId: string,
   owner: QueueOwnerRecord | undefined,
   expectedLockStat?: Stats,
+  revalidateStaleness = false,
 ): Promise<boolean> {
   const lockPath = queueLockFilePath(sessionId);
-  const socketPath = owner?.socketPath ?? queueSocketPath(sessionId);
   const claim = await claimQueueOwnerLockForCleanup(
     lockPath,
     owner?.ownerGeneration,
@@ -202,14 +202,40 @@ async function cleanupStaleQueueOwner(
   }
 
   try {
-    if (owner && isProcessAlive(owner.pid)) {
-      await terminateProcess(owner.pid);
+    const claimedOwner = await resolveQueueOwnerForCleanup(lockPath, owner, revalidateStaleness);
+    if (claimedOwner === false) {
+      return false;
     }
+    const socketPath = claimedOwner?.socketPath ?? queueSocketPath(sessionId);
+    await terminateClaimedQueueOwner(claimedOwner);
     await removeClaimedQueueOwnerFiles(claim, socketPath, lockPath);
     return true;
   } finally {
     await claim.release();
   }
+}
+
+async function terminateClaimedQueueOwner(owner: QueueOwnerRecord | undefined): Promise<void> {
+  if (owner && isProcessAlive(owner.pid)) {
+    await terminateProcess(owner.pid);
+  }
+}
+
+async function resolveQueueOwnerForCleanup(
+  lockPath: string,
+  owner: QueueOwnerRecord | undefined,
+  revalidateStaleness: boolean,
+): Promise<QueueOwnerRecord | false | undefined> {
+  if (!revalidateStaleness || !owner) {
+    return owner;
+  }
+  const currentOwner = await readQueueOwnerRecordAtPath(lockPath);
+  if (currentOwner?.ownerGeneration !== owner.ownerGeneration) {
+    return false;
+  }
+  return isProcessAlive(currentOwner.pid) && !isQueueOwnerHeartbeatStale(currentOwner)
+    ? false
+    : currentOwner;
 }
 
 async function claimQueueOwnerLockForCleanup(
@@ -285,7 +311,7 @@ async function retireStaleQueueOwner(
   sessionId: string,
   owner: QueueOwnerRecord | undefined,
 ): Promise<boolean> {
-  return await cleanupStaleQueueOwner(sessionId, owner);
+  return await cleanupStaleQueueOwner(sessionId, owner, undefined, true);
 }
 
 export type QueueOwnerLockClaim = {

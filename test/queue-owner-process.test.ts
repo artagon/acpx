@@ -38,6 +38,14 @@ async function waitForCondition(
   }
 }
 
+it("queue owner startup retries cover the full lease-before-bind grace period", () => {
+  const { queueOwnerStartupGraceMs, queueOwnerStartupMaxAttempts, queueConnectRetryMs } =
+    queueOwnerRuntimeTestInternals;
+  const retryWindowMs = (queueOwnerStartupMaxAttempts - 1) * queueConnectRetryMs;
+
+  assert(retryWindowMs >= queueOwnerStartupGraceMs);
+});
+
 describe("resolveQueueOwnerSpawnArgs", () => {
   it("prefers ACPX_QUEUE_OWNER_ARGS when provided", () => {
     const previous = process.env.ACPX_QUEUE_OWNER_ARGS;

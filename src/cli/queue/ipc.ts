@@ -52,7 +52,7 @@ export {
 } from "./lease-store.js";
 export type { QueueOwnerLease } from "./lease-store.js";
 
-const QUEUE_OWNER_STARTUP_GRACE_MS = 10_000;
+export const QUEUE_OWNER_STARTUP_GRACE_MS = 10_000;
 const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",

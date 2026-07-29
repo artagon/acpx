@@ -3,9 +3,9 @@ import fs from "node:fs/promises";
 
 const PROCESS_TREE_POLL_MS = 25;
 const PROCESS_LIST_COMMAND_TIMEOUT_MS = 1_000;
-const WINDOWS_TRACKING_INITIAL_POLL_MS = 25;
-const WINDOWS_TRACKING_MAX_POLL_MS = 1_000;
-const WINDOWS_TRACKING_MAX_DURATION_MS = 10_000;
+const PROCESS_TREE_TRACKING_INITIAL_POLL_MS = 25;
+const PROCESS_TREE_TRACKING_MAX_POLL_MS = 1_000;
+const PROCESS_TREE_TRACKING_MAX_DURATION_MS = 10_000;
 const WINDOWS_EPOCH_OFFSET_TICKS = 621_355_968_000_000_000n;
 
 export type ManagedProcessTree = {
@@ -61,9 +61,10 @@ export function beginProcessTreeTracking(
   tree: ManagedProcessTree,
   rootRunning: () => boolean,
 ): void {
-  if (tree.platform === "win32") {
-    queueWindowsProcessTreeTracking(tree, rootRunning);
+  if (!tree.killProcessGroup || !tree.rootPid) {
+    return;
   }
+  queueProcessTreeTracking(tree, rootRunning);
 }
 
 export async function captureProcessTreePids(
@@ -99,17 +100,14 @@ function queueProcessTreeSnapshot(tree: ManagedProcessTree): void {
   })();
 }
 
-function queueWindowsProcessTreeTracking(
-  tree: ManagedProcessTree,
-  rootRunning: () => boolean,
-): void {
+function queueProcessTreeTracking(tree: ManagedProcessTree, rootRunning: () => boolean): void {
   const priorSnapshot = tree.snapshotPromise;
   tree.snapshotPromise = (async () => {
     await priorSnapshot?.catch(() => {
       // Tracking can continue after an earlier best-effort snapshot failure.
     });
-    const deadline = Date.now() + WINDOWS_TRACKING_MAX_DURATION_MS;
-    let pollMs = WINDOWS_TRACKING_INITIAL_POLL_MS;
+    const deadline = Date.now() + PROCESS_TREE_TRACKING_MAX_DURATION_MS;
+    let pollMs = PROCESS_TREE_TRACKING_INITIAL_POLL_MS;
     while (rootRunning() && Date.now() < deadline) {
       const descendantCount = tree.descendantPids.size;
       await recordCurrentProcessTreePids(tree);
@@ -117,8 +115,8 @@ function queueWindowsProcessTreeTracking(
         await waitMs(pollMs);
         pollMs =
           tree.descendantPids.size > descendantCount
-            ? WINDOWS_TRACKING_INITIAL_POLL_MS
-            : Math.min(pollMs * 2, WINDOWS_TRACKING_MAX_POLL_MS);
+            ? PROCESS_TREE_TRACKING_INITIAL_POLL_MS
+            : Math.min(pollMs * 2, PROCESS_TREE_TRACKING_MAX_POLL_MS);
       }
     }
   })();
@@ -220,7 +218,7 @@ export async function waitForProcessTreeExit(
       }
       rootIsRunning = rootRunning();
     }
-    if (!rootIsRunning && !hasLiveManagedProcessTree(tree, rootIsRunning)) {
+    if (shouldRefreshExitedTree(tree, rootIsRunning, finalSignal)) {
       if (await exitedTreeRemainsEmptyAfterRefresh(tree, finalSignal, signaledIdentities)) {
         return true;
       }
@@ -230,6 +228,14 @@ export async function waitForProcessTreeExit(
     }
     await waitMs(Math.min(PROCESS_TREE_POLL_MS, Math.max(0, deadline - Date.now())));
   }
+}
+
+function shouldRefreshExitedTree(
+  tree: ManagedProcessTree,
+  rootIsRunning: boolean,
+  finalSignal: NodeJS.Signals | undefined,
+): boolean {
+  return !rootIsRunning && Boolean(finalSignal || !hasLiveManagedProcessTree(tree, false));
 }
 
 async function waitForPriorSnapshotBeforeDeadline(
@@ -262,12 +268,12 @@ async function exitedTreeRemainsEmptyAfterRefresh(
     return true;
   }
   if (finalSignal) {
-    signalNewlyDiscoveredProcessPids(tree, finalSignal, signaledIdentities);
+    signalUnsignaledProcessPids(tree, finalSignal, signaledIdentities);
   }
   return false;
 }
 
-function signalNewlyDiscoveredProcessPids(
+function signalUnsignaledProcessPids(
   tree: ManagedProcessTree,
   signal: NodeJS.Signals,
   signaledIdentities: Set<string>,
@@ -544,6 +550,7 @@ async function refreshExitedProcessTreePids(tree: ManagedProcessTree): Promise<b
   const currentByPid = new Map(processList.map((entry) => [entry.pid, entry]));
   retainCurrentProcessTreePids(tree, currentByPid);
   if (tree.platform !== "win32") {
+    discoverRememberedPosixDescendants(tree, currentByPid, processList);
     discoverCurrentPosixGroupMembers(tree, rootPid, processList);
   }
   return true;
@@ -560,6 +567,20 @@ function retainCurrentProcessTreePids(
       tree.descendantPids.delete(pid);
       tree.descendantIdentities.delete(pid);
     }
+  }
+}
+
+function discoverRememberedPosixDescendants(
+  tree: ManagedProcessTree,
+  currentByPid: Map<number, ProcessListEntry>,
+  processList: ProcessListEntry[],
+): void {
+  const childrenByParent = indexProcessesByParent(processList);
+  const rememberedRoots = [...tree.descendantPids]
+    .map((pid) => currentByPid.get(pid))
+    .filter((entry): entry is ProcessListEntry => entry !== undefined);
+  for (const rememberedRoot of rememberedRoots) {
+    recordProcessTreePids(tree, walkValidatedDescendants(rememberedRoot, childrenByParent));
   }
 }
 

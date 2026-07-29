@@ -93,6 +93,53 @@ test(
 );
 
 test(
+  "bounded POSIX tracking captures children before an unexpected root exit",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-posix-tracking-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const counterPath = path.join(fixtureDir, "counter");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(
+      psPath,
+      [
+        "#!/bin/sh",
+        `counter=${JSON.stringify(counterPath)}`,
+        'count=$(cat "$counter" 2>/dev/null || true)',
+        "count=${count:-0}",
+        "count=$((count + 1))",
+        'printf "%s" "$count" > "$counter"',
+        'printf "500 1 500 Wed Jul 29 12:00:00 2026\\n"',
+        'if [ "$count" -ge 2 ]; then',
+        `  printf "${process.pid} 500 999 Wed Jul 29 12:00:01 2026\\n"`,
+        "fi",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    let running = true;
+    try {
+      const tree = createManagedProcessTree(500, true, "darwin");
+      beginProcessTreeTracking(tree, () => running);
+      for (let attempt = 0; attempt < 100 && !tree.descendantPids.has(process.pid); attempt += 1) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 25);
+        });
+      }
+      running = false;
+      await tree.snapshotPromise;
+
+      assert.equal(tree.descendantPids.has(process.pid), true);
+    } finally {
+      running = false;
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "Linux process identities do not depend on unsupported BusyBox ps columns",
   { skip: process.platform !== "linux" },
   async () => {
@@ -288,6 +335,40 @@ test(
 );
 
 test(
+  "exited POSIX trees discover children of identity-validated escaped descendants",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-posix-escaped-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(
+      psPath,
+      [
+        "#!/bin/sh",
+        'printf "600 1 700 Wed Jul 29 12:00:00 2026\\n"',
+        `printf "${process.pid} 600 999 Wed Jul 29 12:00:01 2026\\n"`,
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(500, true, "darwin");
+      tree.descendantPids.add(600);
+      tree.descendantIdentities.set(600, "Wed Jul 29 12:00:00 2026");
+
+      await signalProcessTree(tree, false, "SIGCONT");
+
+      assert.equal(tree.descendantPids.has(process.pid), true);
+      assert.equal(tree.descendantIdentities.get(process.pid), "Wed Jul 29 12:00:01 2026");
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "exited POSIX trees discover descendants spawned after the exit snapshot",
   { skip: process.platform === "win32" },
   async () => {
@@ -355,6 +436,34 @@ test(
         // The process group was already cleaned up.
       }
       child.stdout.destroy();
+    }
+  },
+);
+
+test(
+  "final POSIX cleanup signals already-tracked live descendants after root exit",
+  { skip: process.platform === "win32" },
+  async () => {
+    const child = spawn("sleep", ["30"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    const childPid = child.pid;
+    assert(childPid);
+
+    try {
+      const childIdentity = await readProcessIdentity(childPid);
+      assert(childIdentity);
+      const tree = createManagedProcessTree(999_999, true, process.platform);
+      tree.descendantPids.add(childPid);
+      tree.descendantIdentities.set(childPid, childIdentity);
+
+      assert.equal(await waitForProcessTreeExit(tree, () => false, 2_000, "SIGKILL"), true);
+      assert.throws(() => process.kill(childPid, 0));
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
     }
   },
 );

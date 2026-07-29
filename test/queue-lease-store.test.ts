@@ -560,6 +560,53 @@ test("ensureOwnerIsUsable cleans up stale live owners", async () => {
   });
 });
 
+test("stale cleanup preserves an owner refreshed before its cleanup claim", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "stale-owner-refreshed-before-claim";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    let claim: Awaited<ReturnType<typeof claimQueueOwnerLock>> | undefined;
+
+    try {
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+        heartbeatAt: "2000-01-01T00:00:00.000Z",
+      });
+      const staleOwner = await readQueueOwnerRecord(sessionId);
+      assert(staleOwner);
+      claim = await claimQueueOwnerLock(lockPath, staleOwner.ownerGeneration);
+      assert(claim);
+
+      const cleanup = ensureOwnerIsUsable(sessionId, staleOwner);
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 50);
+      });
+
+      const refreshedPath = `${lockPath}.refreshed`;
+      await fs.writeFile(
+        refreshedPath,
+        `${JSON.stringify({ ...staleOwner, heartbeatAt: new Date().toISOString() })}\n`,
+        "utf8",
+      );
+      await fs.rename(refreshedPath, lockPath);
+
+      assert.equal(await cleanup, false);
+      assert.equal(isProcessAlive(keeper.pid), true);
+      assert.equal((await readQueueOwnerStatus(sessionId))?.alive, true);
+    } finally {
+      await claim?.release();
+      stopProcess(keeper);
+      await fs.rm(lockPath, { force: true });
+      if (process.platform !== "win32") {
+        await fs.rm(socketPath, { force: true });
+      }
+    }
+  });
+});
+
 test("tryAcquireQueueOwnerLease terminates stale live owners and acquires in the same attempt", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "stale-live-owner-acquire";

@@ -20,21 +20,23 @@ Repo: https://github.com/openclaw/acpx
   or group changes cannot escape forced cleanup, owned POSIX group members
   created during shutdown are discovered and re-signaled, external process-list
   discovery is bounded, Linux process identities come from procfs, other POSIX
-  snapshots use a fixed locale, Windows wrappers are sampled with bounded
-  exponential backoff through multi-stage launches, transient discovery
+  snapshots use a fixed locale, adapter wrappers are sampled with bounded
+  exponential backoff through multi-stage launches, escaped descendants are
+  extended from identity-validated parents after root exit, transient discovery
   failures preserve and still signal captured targets, and Windows parent edges
   plus remembered descendants are identity-checked before later signaling.
 
 - Runtime/queue: publish queue-owner leases atomically, preserve fresh malformed
   locks during collisions, serialize cross-process refresh, release, and stale
-  cleanup through inode-qualified, crash-recoverable claims, retry explicit
-  cleanup across heartbeat contention while making unresolved explicit cleanup
-  fail visibly, reacquire atomically with fresh timestamps after retiring a
-  stale collision, and treat only a fresh, live lease-before-bind owner as a
-  fast startup miss, preventing premature
-  `QUEUE_NOT_ACCEPTING_REQUESTS` errors without masking older unreachable
-  owners, letting released owners overwrite successors, or leaving stale
-  dangling-symlink locks unrecoverable.
+  cleanup through inode-qualified, crash-recoverable claims, revalidate stale
+  owners while holding cleanup claims, retry explicit cleanup across heartbeat
+  contention while making unresolved explicit cleanup fail visibly, reacquire
+  atomically with fresh timestamps after retiring a stale collision, and treat
+  only a fresh, live lease-before-bind owner as a fast startup miss while
+  retaining a retry window that covers the full startup grace period, preventing
+  premature `QUEUE_NOT_ACCEPTING_REQUESTS` errors without masking older
+  unreachable owners, letting released owners overwrite successors, or leaving
+  stale dangling-symlink locks unrecoverable.
 
 ## 2026.7.27 (v0.13.0)
 
