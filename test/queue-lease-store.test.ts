@@ -227,6 +227,27 @@ test("tryAcquireQueueOwnerLease removes a malformed lock only after it is stale"
   });
 });
 
+test(
+  "tryAcquireQueueOwnerLease ages out a stale dangling symlink lock",
+  { skip: process.platform === "win32" },
+  async () => {
+    await withTempHome(async (homeDir) => {
+      const sessionId = "stale-dangling-symlink-owner";
+      const { lockPath } = queuePaths(homeDir, sessionId);
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
+      await fs.symlink("missing-owner-record", lockPath);
+      await fs.lutimes(lockPath, new Date(0), new Date(0));
+
+      assert.equal(await tryAcquireQueueOwnerLease(sessionId), undefined);
+      await assert.rejects(fs.lstat(lockPath));
+
+      const lease = await tryAcquireQueueOwnerLease(sessionId);
+      assert(lease);
+      await releaseQueueOwnerLease(lease);
+    });
+  },
+);
+
 test("refreshQueueOwnerLease never exposes a partial record to concurrent readers", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "atomic-refresh";

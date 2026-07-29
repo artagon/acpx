@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   captureProcessTreePids,
   createManagedProcessTree,
   resolveProcessTreeSignalTargets,
+  signalProcessTree,
   waitForProcessTreeExit,
 } from "../src/acp/process-tree.js";
+
+const execFileAsync = promisify(execFile);
 
 test("running POSIX trees signal the owned process group", () => {
   const tree = createManagedProcessTree(4100, true, "darwin");
@@ -61,6 +66,12 @@ test("waitForProcessTreeExit waits for the exit-triggered process snapshot", asy
   assert.equal(await exitResult, false);
 });
 
+test("waitForProcessTreeExit keeps a live non-group root in the cleanup loop", async () => {
+  const tree = createManagedProcessTree(process.pid, false, process.platform);
+
+  assert.equal(await waitForProcessTreeExit(tree, () => true, 10), false);
+});
+
 test(
   "process-tree snapshots bound stalled process-list commands",
   { skip: process.platform === "win32" },
@@ -80,5 +91,46 @@ test(
       process.env.PATH = originalPath;
       await fs.rm(fixtureDir, { recursive: true, force: true });
     }
+  },
+);
+
+test(
+  "signaling a running POSIX group does not wait for another process-list snapshot",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-stalled-ps-signal-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(psPath, "#!/bin/sh\nwhile :; do :; done\n", { mode: 0o755 });
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(process.pid, true, process.platform);
+      const startedAt = Date.now();
+      await signalProcessTree(tree, true, "SIGCONT");
+      assert(Date.now() - startedAt < 500);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "exited POSIX trees discard remembered PIDs whose identity changed",
+  { skip: process.platform === "win32" },
+  async () => {
+    const { stdout } = await execFileAsync("ps", ["-o", "pgid=", "-p", String(process.pid)]);
+    const processGroupId = Number(stdout.trim());
+    assert(Number.isInteger(processGroupId));
+
+    const tree = createManagedProcessTree(processGroupId, true, process.platform);
+    tree.descendantPids.add(process.pid);
+    tree.descendantIdentities.set(process.pid, "not-this-process");
+
+    await signalProcessTree(tree, false, "SIGCONT");
+
+    assert.equal(tree.descendantPids.has(process.pid), false);
+    assert.equal(tree.descendantIdentities.has(process.pid), false);
   },
 );

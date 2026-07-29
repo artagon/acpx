@@ -16,13 +16,15 @@ Repo: https://github.com/openclaw/acpx
   best-effort tracked process trees on Windows during normal and failed startup
   cleanup so package-exec wrappers do not leave captured descendants running
   after ACPX exits; exit-triggered snapshots are observed before cleanup
-  completes, and external process-list discovery is bounded.
+  completes, external process-list discovery is bounded, and remembered
+  descendants are identity-checked before later signaling.
 
 - Runtime/queue: publish queue-owner leases atomically, preserve fresh malformed
   locks during collisions, serialize generation-checked refresh and release,
   and treat only a fresh lease-before-bind owner as a fast startup miss,
   preventing premature `QUEUE_NOT_ACCEPTING_REQUESTS` errors without masking
-  older unreachable owners or letting released owners overwrite successors.
+  older unreachable owners, letting released owners overwrite successors, or
+  leaving stale dangling-symlink locks unrecoverable.
 
 ## 2026.7.27 (v0.13.0)
 
