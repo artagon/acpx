@@ -126,10 +126,16 @@ brew install openclaw/acpx/acpx
 ```
 
 Homebrew installs a self-contained `acpx` executable when a release publishes
-one for the current platform. Other platforms use the same npm package.
+one for the current platform. Other platforms use the same npm archive through
+a checked-in shrinkwrap and `npm ci`, so the fallback installs the dependency
+bytes validated during release. A normal `npm install -g` still follows npm's
+standard dependency-resolution rules; npm does not enforce a dependency
+package's shrinkwrap.
 Homebrew also installs Node.js because ACP adapters are separate processes; the
-binary does not use Node for its own startup and remains faster, while npm is
-substantially smaller and follows the standard Node toolchain. See
+binary does not use Node for its own startup and remains faster. `flow`
+commands use that Node runtime because startup snapshots cannot dynamically
+load user flow modules. The npm package is substantially smaller and follows
+the standard Node toolchain. See
 [Packaging](docs/packaging.md) for the measured tradeoffs and
 [Verifying releases](docs/verifying-releases.md) for SBOM and provenance checks.
 
@@ -144,9 +150,10 @@ Session state lives in `~/.acpx/` either way. Global install is a little faster,
 ## Agent prerequisites
 
 The npm install includes the Codex and Claude ACP adapters so they do not need a
-registry lookup on first launch. Homebrew and other package-backed adapters
-resolve them with `npx` when first used. You do not need to install adapter
-packages manually.
+registry lookup on launch. The Homebrew executable invokes package-backed
+adapters through `npx` for each new adapter process; the npm cache avoids repeat
+downloads, and a persistent acpx session reuses the live adapter process across
+prompts. You do not need to install adapter packages manually.
 
 The only prerequisite is the underlying coding agent you want to use:
 

@@ -51,6 +51,19 @@ if (!/^\d+\.\d+\.\d+$/.test(version)) {
 if (!/^[0-9a-f]{64}$/.test(npmSha)) {
   throw new Error(`--npm-sha256 must be 64 hex characters; received "${npmSha}".`);
 }
+if (sumsPath === "") {
+  throw new Error("--sums is required and must name a checksum manifest.");
+}
+
+if (!fs.existsSync(sumsPath)) {
+  throw new Error(
+    `--sums file does not exist: "${sumsPath}". Download or generate SHA256SUMS before rendering the formula.`,
+  );
+}
+const sumsStat = fs.statSync(sumsPath);
+if (!sumsStat.isFile()) {
+  throw new Error(`--sums must name a regular file; received "${sumsPath}".`);
+}
 
 // The four slots Homebrew can address with on_macos/on_linux × on_arm/on_intel.
 // A manifest naming any other target fails the run: silently skipping it would
@@ -131,7 +144,7 @@ const formula = [
   "  #",
   "  # Platforms with a published asset get a self-contained Node",
   "  # single-executable: the bundle and a V8 startup snapshot injected into an",
-  "  # official Node binary, with ~50ms startup versus ~77ms for the npm",
+  "  # official Node binary, with ~68ms startup versus ~121ms for the npm",
   "  # package. The snapshot is",
   "  # architecture-specific, so each asset is built on a native runner by",
   "  # release-binaries.yml; Homebrew's own node has SEA support compiled out",
@@ -143,7 +156,9 @@ const formula = [
   "  #",
   "  # Binary assets carry build-provenance and SBOM attestations, and releases",
   "  # are immutable, so each sha256 pins bytes that cannot be replaced",
-  "  # upstream. See docs/verifying-releases.md.",
+  "  # upstream. The attested npm tarball ships a shrinkwrap whose integrity",
+  "  # entries bind the fallback's exact production dependency bytes.",
+  "  # See docs/verifying-releases.md.",
   `  url "https://registry.npmjs.org/acpx/-/acpx-${version}.tgz"`,
   `  version "${version}"`,
   `  sha256 "${npmSha}"`,
@@ -163,8 +178,11 @@ const formula = [
   "    if binary_layout",
   '      bin.install "acpx"',
   "    elsif npm_layout",
-  '      system "npm", "install", *std_npm_args',
-  '      bin.install_symlink Dir["#{libexec}/bin/*"]',
+  '      odie "npm fallback archive is missing npm-shrinkwrap.json" unless',
+  '        (buildpath/"npm-shrinkwrap.json").file?',
+  '      system "npm", "ci", "--omit=dev", *std_npm_args(prefix: false)',
+  '      libexec.install Dir["*"]',
+  '      bin.install_symlink libexec/"dist/cli.js" => "acpx"',
   "    else",
   '      odie "Unknown acpx release layout"',
   "    end",
@@ -173,8 +191,8 @@ const formula = [
   "  test do",
   '    assert_match version.to_s, shell_output("#{bin}/acpx --version")',
   "",
-  "    # On binary platforms this must answer without a system Node on PATH —",
-  "    # that is the property that justifies shipping a ~122MB executable.",
+  "    # The release build separately proves these fast-path commands answer",
+  "    # without system Node. Flow commands intentionally use the Node dependency.",
   '    assert_match "Usage", shell_output("#{bin}/acpx --help")',
   "  end",
   "end",

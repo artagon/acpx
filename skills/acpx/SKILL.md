@@ -47,9 +47,14 @@ npm i -g acpx
 
 The npm package includes the Codex and Claude ACP adapters and launches those
 installed copies directly. The Homebrew formula installs a faster standalone
-`acpx` executable plus Node.js; adapter processes are resolved through `npx` on
-first use. For normal session reuse, prefer either install over invoking `acpx`
-itself through `npx`.
+`acpx` executable plus Node.js; each new package-backed adapter process is
+resolved through `npx`, while a persistent acpx session reuses the live process.
+Homebrew `flow` commands also use the formula's Node runtime because startup
+snapshots cannot dynamically load user flow modules. For normal session reuse,
+prefer either install over invoking `acpx` itself through `npx`. Generated
+Homebrew npm fallbacks enforce the shrinkwrap shipped in the attested archive;
+ordinary global npm installs retain npm's normal dependency-resolution
+semantics.
 
 ## Command model
 

@@ -6,6 +6,7 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 
 const GENERATOR = path.join(process.cwd(), "scripts", "sea", "generate-formula.mjs");
+const CHECKED_FORMULA = path.join(process.cwd(), "Formula", "acpx.rb");
 const VERSION = "1.2.3";
 const NPM_SHA = "a".repeat(64);
 
@@ -16,6 +17,26 @@ type GeneratorResult = {
   formulaPath: string;
 };
 
+function invokeGenerator(
+  t: TestContext,
+  argsFor: (dir: string, formulaPath: string) => readonly string[],
+): GeneratorResult {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "acpx-formula-test-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const formulaPath = path.join(dir, "acpx.rb");
+  const result = spawnSync(process.execPath, [GENERATOR, ...argsFor(dir, formulaPath)], {
+    encoding: "utf8",
+  });
+
+  return {
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    formulaPath,
+  };
+}
+
 function runGenerator(
   t: TestContext,
   sums: string,
@@ -23,17 +44,10 @@ function runGenerator(
   version = VERSION,
   npmSha = NPM_SHA,
 ): GeneratorResult {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "acpx-formula-test-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-
-  const sumsPath = path.join(dir, "SHA256SUMS");
-  const formulaPath = path.join(dir, "acpx.rb");
-  writeFileSync(sumsPath, sums);
-
-  const result = spawnSync(
-    process.execPath,
-    [
-      GENERATOR,
+  return invokeGenerator(t, (dir, formulaPath) => {
+    const sumsPath = path.join(dir, "SHA256SUMS");
+    writeFileSync(sumsPath, sums);
+    return [
       "--version",
       version,
       "--npm-sha256",
@@ -43,16 +57,8 @@ function runGenerator(
       "--out",
       formulaPath,
       ...extraArgs,
-    ],
-    { encoding: "utf8" },
-  );
-
-  return {
-    status: result.status,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    formulaPath,
-  };
+    ];
+  });
 }
 
 function tarballLine(target: string, sha = "b".repeat(64), version = VERSION): string {
@@ -95,6 +101,81 @@ test("generator keeps Node for adapter subprocesses and omits missing binary slo
   assert.match(formula, /on_arm do\n\s+url .*darwin-arm64/);
   assert.doesNotMatch(formula, /on_intel do/);
   assert.doesNotMatch(formula, /on_linux do/);
+});
+
+test("generator requires --sums before reading the checksum manifest", (t) => {
+  const result = invokeGenerator(t, (_dir, formulaPath) => [
+    "--version",
+    VERSION,
+    "--npm-sha256",
+    NPM_SHA,
+    "--out",
+    formulaPath,
+  ]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--sums is required and must name a checksum manifest/);
+  assert.doesNotMatch(result.stderr, /ENOENT/);
+});
+
+test("generator rejects a missing --sums file with its path and remediation", (t) => {
+  const result = invokeGenerator(t, (dir, formulaPath) => {
+    const missingPath = path.join(dir, "missing-SHA256SUMS");
+    return [
+      "--version",
+      VERSION,
+      "--npm-sha256",
+      NPM_SHA,
+      "--sums",
+      missingPath,
+      "--out",
+      formulaPath,
+    ];
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--sums file does not exist:/);
+  assert.match(result.stderr, /missing-SHA256SUMS/);
+  assert.match(result.stderr, /Download or generate SHA256SUMS before rendering the formula/);
+  assert.doesNotMatch(result.stderr, /ENOENT/);
+});
+
+test("generator rejects a --sums path that is not a regular file", (t) => {
+  const result = invokeGenerator(t, (dir, formulaPath) => [
+    "--version",
+    VERSION,
+    "--npm-sha256",
+    NPM_SHA,
+    "--sums",
+    dir,
+    "--out",
+    formulaPath,
+  ]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--sums must name a regular file/);
+  assert.doesNotMatch(result.stderr, /EISDIR/);
+});
+
+test("generated npm fallbacks require the shipped shrinkwrap and enforce it with npm ci", (t) => {
+  const result = runGenerator(t, `${tarballLine("linux-x64")}\n`);
+
+  assert.equal(result.status, 0, result.stderr);
+  const formula = readFileSync(result.formulaPath, "utf8");
+  assert.match(formula, /npm-shrinkwrap\.json/);
+  assert.match(formula, /system "npm", "ci", "--omit=dev", \*std_npm_args\(prefix: false\)/);
+  assert.doesNotMatch(formula, /system "npm", "install"/);
+  assert.match(formula, /libexec\.install Dir\["\*"\]/);
+  assert.match(formula, /bin\.install_symlink libexec\/"dist\/cli\.js" => "acpx"/);
+});
+
+test("the checked v0.12.1 formula marks its dynamic npm fallback as legacy-only", () => {
+  const formula = readFileSync(CHECKED_FORMULA, "utf8");
+
+  assert.match(formula, /version "0\.12\.1"/);
+  assert.match(formula, /fallback remains\s+# legacy-only/s);
+  assert.match(formula, /system "npm", "install", \*std_npm_args/);
+  assert.doesNotMatch(formula, /exact production dependency bytes/);
 });
 
 test("generator rejects duplicate target checksums", (t) => {

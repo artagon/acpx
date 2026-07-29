@@ -1,0 +1,28 @@
+name: Release request
+
+# This workflow is intentionally unprivileged because a tag selects the
+# workflow revision that runs. Its only purpose is to emit a completed
+# tag-push run that the trusted default-branch release workflow validates.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+jobs:
+  request:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Request a trusted release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" != "tag" ] || ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release requests require a vX.Y.Z tag push."
+            exit 1
+          fi
+          echo "Requested trusted release validation for $RELEASE_TAG."

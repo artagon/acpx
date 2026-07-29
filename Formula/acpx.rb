@@ -9,7 +9,7 @@ class Acpx < Formula
   #
   # Platforms with a published asset get a self-contained Node
   # single-executable: the bundle and a V8 startup snapshot injected into an
-  # official Node binary, with ~50ms startup versus ~77ms for the npm
+  # official Node binary, with ~68ms startup versus ~121ms for the npm
   # package. The snapshot is
   # architecture-specific, so each asset is built on a native runner by
   # release-binaries.yml; Homebrew's own node has SEA support compiled out
@@ -37,6 +37,8 @@ class Acpx < Formula
     if binary_layout
       bin.install "acpx"
     elsif npm_layout
+      # v0.12.1 predates the publishable shrinkwrap. This fallback remains
+      # legacy-only; newly generated formulas fail closed and use npm ci.
       system "npm", "install", *std_npm_args
       bin.install_symlink Dir["#{libexec}/bin/*"]
     else
@@ -47,8 +49,8 @@ class Acpx < Formula
   test do
     assert_match version.to_s, shell_output("#{bin}/acpx --version")
 
-    # On binary platforms this must answer without a system Node on PATH —
-    # that is the property that justifies shipping a ~122MB executable.
+    # The release build separately proves these fast-path commands answer
+    # without system Node. Flow commands intentionally use the Node dependency.
     assert_match "Usage", shell_output("#{bin}/acpx --help")
   end
 end

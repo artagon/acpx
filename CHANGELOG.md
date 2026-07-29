@@ -9,13 +9,24 @@ Repo: https://github.com/openclaw/acpx
 ### Changes
 
 - Packaging: `pnpm run sea` builds a self-contained single executable (Node SEA
-  plus V8 startup snapshot) that needs no system Node and starts in 50.2ms
-  versus 77.1ms for the npm install. See `docs/packaging.md` and
-  `Formula/acpx.rb`.
+  plus V8 startup snapshot) that starts in 67.8ms versus 120.5ms for the npm
+  install (25-run macOS arm64 benchmark). Adapter subprocesses still use system
+  Node, and `flow` commands delegate to an embedded runtime through system Node
+  because snapshots cannot dynamically load user modules. See
+  `docs/packaging.md` and `Formula/acpx.rb`.
+
+- Packaging/Homebrew: ship a production npm shrinkwrap and make newly generated
+  fallback formulas enforce it with `npm ci`, with release gates that compare
+  npm and pnpm package identities and integrity hashes before publication.
 
 ### Breaking
 
 ### Fixes
+
+- Session queue owner: keep polling during the bounded cold-start window when a
+  live owner has acquired its lease but has not bound its IPC socket yet,
+  preventing concurrent SEA prompts from failing prematurely while preserving
+  fail-closed behavior for older unreachable owners.
 
 ## 2026.7.27 (v0.13.0)
 

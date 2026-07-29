@@ -52,6 +52,52 @@ jobs:
           console.log(`minimumReleaseAge = ${minutes} minutes.`);
           NODE
 
+      - name: Formula version never moves backward
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          main_formula="${RUNNER_TEMP}/main-acpx.rb"
+          gh api \
+            --header "Accept: application/vnd.github.raw+json" \
+            "repos/${GH_REPO}/contents/Formula/acpx.rb?ref=main" \
+            > "$main_formula"
+
+          if cmp -s Formula/acpx.rb "$main_formula"; then
+            echo "Formula matches live main."
+            exit 0
+          fi
+
+          CANDIDATE_FORMULA="Formula/acpx.rb" MAIN_FORMULA="$main_formula" node - <<'NODE'
+          const { readFileSync } = require("node:fs");
+
+          const versionOf = (file) => {
+            const source = readFileSync(file, "utf8");
+            const version = source.match(/^\s*version "(\d+\.\d+\.\d+)"$/m)?.[1];
+            if (!version) throw new Error(`No semantic formula version in ${file}.`);
+            return version;
+          };
+          const compareVersions = (left, right) => {
+            const a = left.split(".").map(Number);
+            const b = right.split(".").map(Number);
+            for (let index = 0; index < 3; index += 1) {
+              if (a[index] !== b[index]) return a[index] - b[index];
+            }
+            return 0;
+          };
+
+          const candidateVersion = versionOf(process.env.CANDIDATE_FORMULA);
+          const mainVersion = versionOf(process.env.MAIN_FORMULA);
+          if (compareVersions(candidateVersion, mainVersion) <= 0) {
+            console.error(
+              `Formula candidate version ${candidateVersion} must be strictly greater than live main ${mainVersion}.`,
+            );
+            process.exit(1);
+          }
+          console.log(`Formula advancement validated: ${mainVersion} -> ${candidateVersion}.`);
+          NODE
+
       - name: Build tools are lockfile-pinned
         run: |
           set -euo pipefail
