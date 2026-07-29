@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 
 const PROCESS_TREE_POLL_MS = 25;
+const PROCESS_LIST_COMMAND_TIMEOUT_MS = 1_000;
 
 export type ManagedProcessTree = {
   rootPid: number | undefined;
@@ -145,15 +146,41 @@ export async function waitForProcessTreeExit(
   timeoutMs: number,
 ): Promise<boolean> {
   const deadline = Date.now() + Math.max(0, timeoutMs);
-  let rootIsRunning = rootRunning();
-  while (rootIsRunning || hasLiveManagedProcessTree(tree, rootIsRunning)) {
+  while (true) {
+    let rootIsRunning = rootRunning();
+    if (!rootIsRunning) {
+      const snapshotCompleted = await waitForPriorSnapshotBeforeDeadline(tree, deadline);
+      if (!snapshotCompleted) {
+        return false;
+      }
+      rootIsRunning = rootRunning();
+    }
+    if (!rootIsRunning && !hasLiveManagedProcessTree(tree, rootIsRunning)) {
+      return true;
+    }
     if (Date.now() >= deadline) {
       return false;
     }
     await waitMs(Math.min(PROCESS_TREE_POLL_MS, Math.max(0, deadline - Date.now())));
-    rootIsRunning = rootRunning();
   }
-  return true;
+}
+
+async function waitForPriorSnapshotBeforeDeadline(
+  tree: ManagedProcessTree,
+  deadline: number,
+): Promise<boolean> {
+  const snapshot = tree.snapshotPromise;
+  if (!snapshot) {
+    return true;
+  }
+  const remainingMs = Math.max(0, deadline - Date.now());
+  return await Promise.race([
+    snapshot.then(
+      () => true,
+      () => true,
+    ),
+    waitMs(remainingMs).then(() => false),
+  ]);
 }
 
 function hasLiveManagedProcessTree(tree: ManagedProcessTree, rootRunning: boolean): boolean {
@@ -277,6 +304,33 @@ async function runCapturedCommand(
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+
+    const finish = (result: { output: string } | { error: Error }): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      if ("output" in result) {
+        resolve(result.output);
+      } else {
+        reject(result.error);
+      }
+    };
+    const timeout = setTimeout(() => {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // best-effort cleanup for a stalled process-list command
+      }
+      child.unref();
+      finish({
+        error: new Error(`${description} did not exit within ${PROCESS_LIST_COMMAND_TIMEOUT_MS}ms`),
+      });
+    }, PROCESS_LIST_COMMAND_TIMEOUT_MS);
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -286,17 +340,19 @@ async function runCapturedCommand(
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
-    child.once("error", reject);
+    child.once("error", (error) => {
+      finish({ error });
+    });
     child.once("close", (code, signal) => {
       if (code === 0) {
-        resolve(stdout);
+        finish({ output: stdout });
         return;
       }
-      reject(
-        new Error(
+      finish({
+        error: new Error(
           `${description} exited with code ${code ?? "null"} signal ${signal ?? "null"}: ${stderr}`,
         ),
-      );
+      });
     });
   });
 }

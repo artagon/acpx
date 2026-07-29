@@ -15,12 +15,14 @@ Repo: https://github.com/openclaw/acpx
 - Runtime/agents: terminate owned adapter process groups on POSIX and
   best-effort tracked process trees on Windows during normal and failed startup
   cleanup so package-exec wrappers do not leave captured descendants running
-  after ACPX exits.
+  after ACPX exits; exit-triggered snapshots are observed before cleanup
+  completes, and external process-list discovery is bounded.
 
 - Runtime/queue: publish queue-owner leases atomically, preserve fresh malformed
-  locks during collisions, and treat only a fresh lease-before-bind owner as a
-  fast startup miss, preventing premature `QUEUE_NOT_ACCEPTING_REQUESTS` errors
-  without masking older unreachable owners.
+  locks during collisions, serialize generation-checked refresh and release,
+  and treat only a fresh lease-before-bind owner as a fast startup miss,
+  preventing premature `QUEUE_NOT_ACCEPTING_REQUESTS` errors without masking
+  older unreachable owners or letting released owners overwrite successors.
 
 ## 2026.7.27 (v0.13.0)
 

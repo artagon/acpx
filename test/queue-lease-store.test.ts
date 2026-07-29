@@ -254,6 +254,29 @@ test("refreshQueueOwnerLease never exposes a partial record to concurrent reader
   });
 });
 
+test("released owners cannot overwrite or remove a successor lease", async () => {
+  await withTempHome(async () => {
+    const sessionId = "released-owner-refresh";
+    const releasedLease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(releasedLease);
+    await releaseQueueOwnerLease(releasedLease);
+
+    const successorLease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(successorLease);
+    try {
+      await refreshQueueOwnerLease(releasedLease, { queueDepth: 9 });
+      await releaseQueueOwnerLease(releasedLease);
+
+      const record = await readQueueOwnerRecord(sessionId);
+      assert(record);
+      assert.equal(record.ownerGeneration, successorLease.ownerGeneration);
+      assert.equal(record.queueDepth, 0);
+    } finally {
+      await releaseQueueOwnerLease(successorLease);
+    }
+  });
+});
+
 test("readQueueOwnerStatus returns live owner details for a healthy owner", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "healthy-owner";

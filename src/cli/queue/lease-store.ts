@@ -39,6 +39,14 @@ export type QueueOwnerLease = {
   mcpConfigFingerprint?: string;
 };
 
+type QueueOwnerLeaseState = {
+  pendingRefresh: Promise<void>;
+  released: boolean;
+  releasePromise?: Promise<void>;
+};
+
+const queueOwnerLeaseStates = new WeakMap<QueueOwnerLease, QueueOwnerLeaseState>();
+
 export type QueueOwnerStatus = {
   pid: number;
   socketPath: string;
@@ -353,7 +361,7 @@ export async function tryAcquireQueueOwnerLease(
     await removeSocketFile(socketPath).catch(() => {
       // best-effort stale socket cleanup after ownership is acquired
     });
-    return {
+    const lease = {
       sessionId,
       lockPath,
       socketPath,
@@ -361,6 +369,11 @@ export async function tryAcquireQueueOwnerLease(
       ownerGeneration,
       ...mcpConfigMetadata,
     };
+    queueOwnerLeaseStates.set(lease, {
+      pendingRefresh: Promise.resolve(),
+      released: false,
+    });
+    return lease;
   } catch (error) {
     return await handleLeaseCollision(sessionId, error);
   }
@@ -441,34 +454,78 @@ export async function refreshQueueOwnerLease(
   },
   nowIsoFactory: () => string = nowIso,
 ): Promise<void> {
-  const payload = JSON.stringify(
-    {
-      pid: process.pid,
-      sessionId: lease.sessionId,
-      socketPath: lease.socketPath,
-      createdAt: lease.createdAt,
-      heartbeatAt: nowIsoFactory(),
-      ownerGeneration: lease.ownerGeneration,
-      queueDepth: Math.max(0, Math.round(options.queueDepth)),
-      ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
-      ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
-    },
-    null,
-    2,
-  );
-  await writeQueueOwnerFileAtomically(lease.lockPath, `${payload}\n`, "replace");
+  const state = queueOwnerLeaseState(lease);
+  if (state.released) {
+    return;
+  }
+  const refresh = state.pendingRefresh.then(async () => {
+    if (state.released || !(await queueOwnerLeaseStillOwnsLock(lease))) {
+      return;
+    }
+    const payload = JSON.stringify(
+      {
+        pid: process.pid,
+        sessionId: lease.sessionId,
+        socketPath: lease.socketPath,
+        createdAt: lease.createdAt,
+        heartbeatAt: nowIsoFactory(),
+        ownerGeneration: lease.ownerGeneration,
+        queueDepth: Math.max(0, Math.round(options.queueDepth)),
+        ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
+        ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
+      },
+      null,
+      2,
+    );
+    await writeQueueOwnerFileAtomically(lease.lockPath, `${payload}\n`, "replace");
+  });
+  state.pendingRefresh = refresh.catch(() => {
+    // Keep the serialization chain usable after a best-effort refresh failure.
+  });
+  await refresh;
 }
 
 export async function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<void> {
-  await removeSocketFile(lease.socketPath).catch(() => {
-    // ignore best-effort cleanup failures
-  });
+  const state = queueOwnerLeaseState(lease);
+  if (!state.releasePromise) {
+    state.released = true;
+    state.releasePromise = (async () => {
+      await state.pendingRefresh;
+      if (!(await queueOwnerLeaseStillOwnsLock(lease))) {
+        return;
+      }
+      await removeSocketFile(lease.socketPath).catch(() => {
+        // ignore best-effort cleanup failures
+      });
 
-  await fs.unlink(lease.lockPath).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  });
+      if (!(await queueOwnerLeaseStillOwnsLock(lease))) {
+        return;
+      }
+      await fs.unlink(lease.lockPath).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      });
+    })();
+  }
+  await state.releasePromise;
+}
+
+function queueOwnerLeaseState(lease: QueueOwnerLease): QueueOwnerLeaseState {
+  let state = queueOwnerLeaseStates.get(lease);
+  if (!state) {
+    state = {
+      pendingRefresh: Promise.resolve(),
+      released: false,
+    };
+    queueOwnerLeaseStates.set(lease, state);
+  }
+  return state;
+}
+
+async function queueOwnerLeaseStillOwnsLock(lease: QueueOwnerLease): Promise<boolean> {
+  const owner = await readQueueOwnerRecord(lease.sessionId);
+  return owner?.ownerGeneration === lease.ownerGeneration;
 }
 
 export async function terminateQueueOwnerForSession(sessionId: string): Promise<void> {
