@@ -1348,6 +1348,40 @@ test("AcpClient startup failure kills descendants left by an exited npx wrapper"
   }
 });
 
+test("AcpClient close terminates an adapter while initialization is still pending", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX process-group cleanup assertion");
+    return;
+  }
+
+  const client = makeClient({
+    agentCommand: `${JSON.stringify(process.execPath)} --eval ${JSON.stringify(
+      'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);',
+    )}`,
+  });
+  const startResult = client.start().then(
+    () => ({ type: "resolved" as const }),
+    (error: unknown) => ({ type: "rejected" as const, error }),
+  );
+  let pid: number | undefined;
+
+  try {
+    pid = await waitForClientPid(client);
+    await client.close();
+
+    assert.equal(
+      await waitForPidExit(pid),
+      true,
+      "close must terminate the detached adapter before initialization finishes",
+    );
+    assert.equal((await startResult).type, "rejected");
+  } finally {
+    if (pid) {
+      await terminateTestPid(pid);
+    }
+  }
+});
+
 test("AcpClient close resets in-memory state and shuts down terminal manager", async () => {
   const client = makeClient();
   const internals = asInternals(client);
@@ -1452,6 +1486,18 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000): Promise<boolean> 
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
   }
   return !isPidAlive(pid);
+}
+
+async function waitForClientPid(client: AcpClient, timeoutMs = 2_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pid = client.getAgentPid();
+    if (pid) {
+      return pid;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Timed out waiting for adapter PID");
 }
 
 function asInternals(client: AcpClient): ClientInternals {

@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { readProcessIdentity } from "../src/acp/process-tree.js";
 import {
   claimQueueOwnerLock,
   ensureOwnerIsUsable,
@@ -47,6 +48,8 @@ test("tryAcquireQueueOwnerLease creates a lease that can be refreshed and releas
     const lease = await tryAcquireQueueOwnerLease("lease-create");
     assert(lease);
     assert.equal(lease.sessionId, "lease-create");
+    const expectedProcessIdentity = await readProcessIdentity(process.pid);
+    assert.equal(lease.processIdentity, expectedProcessIdentity);
 
     await refreshQueueOwnerLease(
       lease,
@@ -58,6 +61,7 @@ test("tryAcquireQueueOwnerLease creates a lease that can be refreshed and releas
 
     const record = await readQueueOwnerRecord("lease-create");
     assert(record);
+    assert.equal(record.processIdentity, expectedProcessIdentity);
     assert.equal(record.queueDepth, 2);
     assert.equal(record.heartbeatAt, "2026-03-26T00:00:00.000Z");
 
@@ -704,9 +708,11 @@ test("readQueueOwnerStatus returns live owner details for a healthy owner", asyn
     const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
 
     try {
+      const processIdentity = await readProcessIdentity(keeper.pid!);
       await writeQueueOwnerLock({
         lockPath,
         pid: keeper.pid,
+        processIdentity,
         sessionId,
         socketPath,
         queueDepth: 3,
@@ -728,16 +734,22 @@ test("readQueueOwnerStatus returns live owner details for a healthy owner", asyn
   });
 });
 
-test("ensureOwnerIsUsable cleans up stale live owners", async () => {
+test("ensureOwnerIsUsable cleans up stale live owners", async (t) => {
   await withTempHome(async (homeDir) => {
     const sessionId = "stale-live-owner";
     const keeper = await startKeeperProcess();
     const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
 
     try {
+      const processIdentity = await readProcessIdentity(keeper.pid!);
+      if (!processIdentity) {
+        t.skip("process identity unavailable in the managed environment");
+        return;
+      }
       await writeQueueOwnerLock({
         lockPath,
         pid: keeper.pid,
+        processIdentity,
         sessionId,
         socketPath,
         heartbeatAt: "2000-01-01T00:00:00.000Z",
@@ -762,9 +774,11 @@ test("stale cleanup preserves an owner refreshed before its cleanup claim", asyn
     let claim: Awaited<ReturnType<typeof claimQueueOwnerLock>> | undefined;
 
     try {
+      const processIdentity = await readProcessIdentity(keeper.pid!);
       await writeQueueOwnerLock({
         lockPath,
         pid: keeper.pid,
+        processIdentity,
         sessionId,
         socketPath,
         heartbeatAt: "2000-01-01T00:00:00.000Z",
@@ -801,16 +815,22 @@ test("stale cleanup preserves an owner refreshed before its cleanup claim", asyn
   });
 });
 
-test("tryAcquireQueueOwnerLease terminates stale live owners and acquires in the same attempt", async () => {
+test("tryAcquireQueueOwnerLease terminates stale live owners and acquires in the same attempt", async (t) => {
   await withTempHome(async (homeDir) => {
     const sessionId = "stale-live-owner-acquire";
     const keeper = await startKeeperProcess();
     const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
 
     try {
+      const processIdentity = await readProcessIdentity(keeper.pid!);
+      if (!processIdentity) {
+        t.skip("process identity unavailable in the managed environment");
+        return;
+      }
       await writeQueueOwnerLock({
         lockPath,
         pid: keeper.pid,
+        processIdentity,
         sessionId,
         socketPath,
         heartbeatAt: "2000-01-01T00:00:00.000Z",
@@ -839,9 +859,11 @@ test("terminateProcess and terminateQueueOwnerForSession handle live and missing
 
     try {
       assert.equal(isProcessAlive(keeper.pid), true);
+      const processIdentity = await readProcessIdentity(keeper.pid!);
       await writeQueueOwnerLock({
         lockPath,
         pid: keeper.pid,
+        processIdentity,
         sessionId,
         socketPath,
       });
@@ -850,6 +872,63 @@ test("terminateProcess and terminateQueueOwnerForSession handle live and missing
       assert.equal(await readQueueOwnerRecord(sessionId), undefined);
     } finally {
       stopProcess(keeper);
+    }
+  });
+});
+
+test("mismatched queue-owner identities are retired without signaling the reused pid", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "reused-owner-pid";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+
+    try {
+      const processIdentity = await readProcessIdentity(keeper.pid!);
+      if (!processIdentity) {
+        t.skip("process identity unavailable in the managed environment");
+        return;
+      }
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        processIdentity: `${processIdentity}-reused`,
+        sessionId,
+        socketPath,
+      });
+
+      const owner = await readQueueOwnerRecord(sessionId);
+      assert(owner);
+      assert.equal(await ensureOwnerIsUsable(sessionId, owner), false);
+      assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+      assert.equal(isProcessAlive(keeper.pid), true);
+    } finally {
+      stopProcess(keeper);
+      await fs.rm(lockPath, { force: true });
+    }
+  });
+});
+
+test("legacy queue-owner records are cleaned without signaling an unverifiable pid", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "legacy-owner-cleanup";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+
+    try {
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+        heartbeatAt: "2000-01-01T00:00:00.000Z",
+      });
+
+      await terminateQueueOwnerForSession(sessionId);
+      assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+      assert.equal(isProcessAlive(keeper.pid), true);
+    } finally {
+      stopProcess(keeper);
+      await fs.rm(lockPath, { force: true });
     }
   });
 });

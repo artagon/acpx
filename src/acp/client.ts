@@ -419,7 +419,14 @@ export class AcpClient {
   private options: AcpClientOptions;
   private connection?: ClientSideConnection;
   private agent?: ChildProcessByStdio<Writable, Readable, Readable>;
+  private startingAgent?: ChildProcessByStdio<Writable, Readable, Readable>;
   private agentProcessTree?: ManagedProcessTree;
+  private readonly agentTerminationPromises = new WeakMap<
+    ChildProcessByStdio<Writable, Readable, Readable>,
+    Promise<void>
+  >();
+  private closePromise?: Promise<void>;
+  private lifecycleGeneration = 0;
   private initResult?: InitializeResponse;
   private loadedSessionId?: string;
   private eventHandlers: Pick<
@@ -619,18 +626,18 @@ export class AcpClient {
   }
 
   async start(): Promise<void> {
-    if (this.connection && this.agent && isChildProcessRunning(this.agent)) {
+    if (!(await this.prepareForStart())) {
       return;
     }
-    if (this.connection || this.agent) {
-      await this.close();
-    }
 
+    const startupGeneration = ++this.lifecycleGeneration;
+    this.closing = false;
     const launch = await this.resolveAgentLaunchPlan();
     this.logAgentLaunch(launch);
     await this.ensureLaunchSupport(launch);
+    this.assertStartupIsCurrent(startupGeneration);
     const child = await this.spawnAgentProcess(launch);
-    this.closing = false;
+    this.assertStartupIsCurrent(startupGeneration);
     this.agentStartedAt = isoNow();
     this.lastAgentExit = undefined;
     this.lastKnownPid = child.pid ?? undefined;
@@ -667,7 +674,27 @@ export class AcpClient {
       startupFailure,
       startupStderr,
       launch,
+      startupGeneration,
     });
+  }
+
+  private async prepareForStart(): Promise<boolean> {
+    if (this.closePromise) {
+      await this.closePromise;
+    }
+    if (this.connection && this.agent && isChildProcessRunning(this.agent)) {
+      return false;
+    }
+    if (this.connection || this.agent || this.startingAgent) {
+      await this.close();
+    }
+    return true;
+  }
+
+  private assertStartupIsCurrent(startupGeneration: number): void {
+    if (this.closing || startupGeneration !== this.lifecycleGeneration) {
+      throw new Error("ACP client closed during startup");
+    }
   }
 
   private async resolveAgentLaunchPlan(): Promise<AgentLaunchPlan> {
@@ -743,6 +770,7 @@ export class AcpClient {
       ...plan.spawnOptions,
       windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
     }) as ChildProcessByStdio<Writable, Readable, Readable>;
+    this.startingAgent = spawnedChild;
     const processTree = createManagedProcessTree(
       spawnedChild.pid,
       true,
@@ -757,6 +785,9 @@ export class AcpClient {
     try {
       await waitForSpawn(spawnedChild);
     } catch (error) {
+      if (this.startingAgent === spawnedChild) {
+        this.startingAgent = undefined;
+      }
       throw new AgentSpawnError(this.options.agentCommand, error);
     }
     return requireAgentStdio(spawnedChild);
@@ -826,6 +857,7 @@ export class AcpClient {
     startupFailure: StartupFailureWatcher;
     startupStderr: string[];
     launch: AgentLaunchPlan;
+    startupGeneration: number;
   }): Promise<void> {
     try {
       const initResult = await Promise.race([
@@ -833,8 +865,12 @@ export class AcpClient {
         params.startupFailure.promise,
       ]);
       params.startupFailure.dispose();
+      this.assertStartupIsCurrent(params.startupGeneration);
       this.connection = params.connection;
       this.agent = params.child;
+      if (this.startingAgent === params.child) {
+        this.startingAgent = undefined;
+      }
       this.initResult = initResult;
       this.log(`initialized protocol version ${initResult.protocolVersion}`);
     } catch (error) {
@@ -878,9 +914,12 @@ export class AcpClient {
       params.startupStderr,
     );
     try {
-      await this.terminateAgentProcess(params.child);
+      await this.terminateAgentProcessOnce(params.child);
     } catch {
       // best effort
+    }
+    if (this.startingAgent === params.child) {
+      this.startingAgent = undefined;
     }
     if (params.launch.geminiAcp && error instanceof TimeoutError) {
       throw new GeminiAcpStartupTimeoutError(
@@ -1369,13 +1408,33 @@ export class AcpClient {
   }
 
   async close(): Promise<void> {
+    if (this.closePromise) {
+      return await this.closePromise;
+    }
+    const closePromise = this.closeInternal();
+    this.closePromise = closePromise;
+    try {
+      await closePromise;
+    } finally {
+      if (this.closePromise === closePromise) {
+        this.closePromise = undefined;
+      }
+    }
+  }
+
+  private async closeInternal(): Promise<void> {
     this.closing = true;
+    this.lifecycleGeneration += 1;
 
     await this.terminalManager.shutdown();
 
-    const agent = this.agent;
-    if (agent) {
-      await this.terminateAgentProcess(agent);
+    const agents = new Set(
+      [this.startingAgent, this.agent].filter(
+        (agent): agent is ChildProcessByStdio<Writable, Readable, Readable> => agent !== undefined,
+      ),
+    );
+    for (const agent of agents) {
+      await this.terminateAgentProcessOnce(agent);
     }
     if (this.pendingConnectionRequests.size > 0) {
       this.rejectPendingConnectionRequests(
@@ -1412,7 +1471,20 @@ export class AcpClient {
     this.initResult = undefined;
     this.connection = undefined;
     this.agent = undefined;
+    this.startingAgent = undefined;
     this.agentProcessTree = undefined;
+  }
+
+  private terminateAgentProcessOnce(
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+  ): Promise<void> {
+    const existing = this.agentTerminationPromises.get(child);
+    if (existing) {
+      return existing;
+    }
+    const termination = this.terminateAgentProcess(child);
+    this.agentTerminationPromises.set(child, termination);
+    return termination;
   }
 
   private async terminateAgentProcess(

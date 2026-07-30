@@ -214,7 +214,7 @@ export function buildTerminalSpawnCommand(
   command: string,
   args: string[] | undefined,
 ): TerminalSpawnCommand {
-  return { command, args: args ?? [], killProcessGroup: false };
+  return { command, args: args ?? [], killProcessGroup: true };
 }
 
 export function buildTerminalShellSpawnCommand(

@@ -16,6 +16,7 @@ import {
 } from "./index.js";
 import { parseSessionRecord } from "./parse.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
+import { withSessionWriteLock } from "./write-lock.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
 
@@ -86,23 +87,24 @@ function matchesSessionEntry(
 export async function writeSessionRecord(record: SessionRecord): Promise<void> {
   await measurePerf("session.write_record", async () => {
     await ensureSessionDir();
-
-    const persisted = serializeSessionRecordForDisk(record);
-    assertPersistedKeyPolicy(persisted);
-
-    const file = sessionFilePath(record.acpxRecordId);
-    const tempFile = createAtomicWriteTempPath(file);
-    const payload = JSON.stringify(persisted, null, 2);
-    await fs.writeFile(tempFile, `${payload}\n`, "utf8");
-    await fs.rename(tempFile, file);
-
     const sessionDir = sessionBaseDir();
-    const index = await loadOrRebuildSessionIndex(sessionDir);
-    const fileName = path.basename(file);
-    const entries = index.entries.filter((entry) => entry.file !== fileName);
-    entries.push(toSessionIndexEntry(record, fileName));
-    const files = [...new Set([...index.files.filter((entry) => entry !== fileName), fileName])];
-    await writeSessionIndex(sessionDir, { files, entries });
+    await withSessionWriteLock(sessionDir, async () => {
+      const persisted = serializeSessionRecordForDisk(record);
+      assertPersistedKeyPolicy(persisted);
+
+      const file = sessionFilePath(record.acpxRecordId);
+      const tempFile = createAtomicWriteTempPath(file);
+      const payload = JSON.stringify(persisted, null, 2);
+      await fs.writeFile(tempFile, `${payload}\n`, "utf8");
+      await fs.rename(tempFile, file);
+
+      const index = await loadOrRebuildSessionIndex(sessionDir);
+      const fileName = path.basename(file);
+      const entries = index.entries.filter((entry) => entry.file !== fileName);
+      entries.push(toSessionIndexEntry(record, fileName));
+      const files = [...new Set([...index.files.filter((entry) => entry !== fileName), fileName])];
+      await writeSessionIndex(sessionDir, { files, entries });
+    });
   });
 }
 

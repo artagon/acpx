@@ -25,6 +25,7 @@ const QUEUE_OWNER_MALFORMED_LOCK_STALE_MS = QUEUE_OWNER_STALE_HEARTBEAT_MS;
 
 export type QueueOwnerRecord = {
   pid: number;
+  processIdentity?: string;
   sessionId: string;
   socketPath: string;
   createdAt: string;
@@ -41,6 +42,7 @@ export type QueueOwnerLease = {
   socketPath: string;
   createdAt: string;
   ownerGeneration: number;
+  processIdentity?: string;
   mcpConfigPath?: string;
   mcpConfigFingerprint?: string;
 };
@@ -75,6 +77,9 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
 
   return {
     pid: record.pid,
+    ...(typeof record.processIdentity === "string"
+      ? { processIdentity: record.processIdentity }
+      : {}),
     sessionId: record.sessionId,
     socketPath: record.socketPath,
     createdAt: record.createdAt,
@@ -102,6 +107,7 @@ function hasValidQueueOwnerRecordFields(record: Record<string, unknown>): record
 } {
   return (
     isPositiveInteger(record.pid) &&
+    isOptionalNonEmptyString(record.processIdentity) &&
     typeof record.sessionId === "string" &&
     typeof record.socketPath === "string" &&
     typeof record.createdAt === "string" &&
@@ -117,6 +123,10 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isNonNegativeInteger(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) >= 0;
+}
+
+function isOptionalNonEmptyString(value: unknown): value is string | undefined {
+  return value === undefined || isNonEmptyString(value);
 }
 
 function createOwnerGeneration(): number {
@@ -217,8 +227,8 @@ async function cleanupStaleQueueOwner(
 }
 
 async function terminateClaimedQueueOwner(owner: QueueOwnerRecord | undefined): Promise<void> {
-  if (owner && isProcessAlive(owner.pid)) {
-    await terminateProcess(owner.pid);
+  if (owner?.processIdentity && owner.pid !== process.pid) {
+    await terminateProcess(owner.pid, owner.processIdentity);
   }
 }
 
@@ -234,9 +244,8 @@ async function resolveQueueOwnerForCleanup(
   if (currentOwner?.ownerGeneration !== owner.ownerGeneration) {
     return false;
   }
-  return isProcessAlive(currentOwner.pid) && !isQueueOwnerHeartbeatStale(currentOwner)
-    ? false
-    : currentOwner;
+  const processState = await queueOwnerProcessState(currentOwner);
+  return ownerShouldBePreserved(processState, currentOwner) ? false : currentOwner;
 }
 
 async function claimQueueOwnerLockForCleanup(
@@ -406,6 +415,11 @@ async function currentQueueOwnerLockClaimRecord(): Promise<QueueOwnerLockClaimRe
   };
 }
 
+async function readCurrentProcessIdentity(): Promise<string | undefined> {
+  currentProcessIdentityPromise ??= readProcessIdentity(process.pid);
+  return await currentProcessIdentityPromise;
+}
+
 async function createOrRecoverQueueOwnerLockClaim(
   claimPath: string,
   claimRecord: QueueOwnerLockClaimRecord,
@@ -503,6 +517,43 @@ async function queueOwnerLockClaimIsStale(claimPath: string, stat: Stats): Promi
 
 function claimantProcessIsAlive(pid: number): boolean {
   return pid === process.pid || isProcessAlive(pid);
+}
+
+type QueueOwnerProcessState = "matching" | "legacy" | "dead" | "mismatch" | "unverified";
+
+async function queueOwnerProcessState(owner: QueueOwnerRecord): Promise<QueueOwnerProcessState> {
+  if (!claimantProcessIsAlive(owner.pid)) {
+    return "dead";
+  }
+  if (!owner.processIdentity) {
+    return "legacy";
+  }
+  const currentIdentity = await readProcessIdentity(owner.pid);
+  if (!currentIdentity) {
+    return "unverified";
+  }
+  return currentIdentity === owner.processIdentity ? "matching" : "mismatch";
+}
+
+function ownerMayStillBeUsable(
+  processState: QueueOwnerProcessState,
+  owner: QueueOwnerRecord,
+): boolean {
+  // A fresh legacy lease may belong to an older acpx owner. Preserve it long
+  // enough for the authenticated socket handshake, but never signal its PID.
+  return (
+    (processState === "matching" || processState === "legacy") && !isQueueOwnerHeartbeatStale(owner)
+  );
+}
+
+function ownerShouldBePreserved(
+  processState: QueueOwnerProcessState,
+  owner: QueueOwnerRecord,
+): boolean {
+  return (
+    ownerMayStillBeUsable(processState, owner) ||
+    (processState === "unverified" && !isQueueOwnerHeartbeatStale(owner))
+  );
 }
 
 async function readQueueOwnerLockClaimRecord(
@@ -608,8 +659,14 @@ async function readQueueOwnerRecordAtPath(lockPath: string): Promise<QueueOwnerR
   }
 }
 
-export async function terminateProcess(pid: number): Promise<boolean> {
+export async function terminateProcess(
+  pid: number,
+  expectedProcessIdentity?: string,
+): Promise<boolean> {
   if (!isProcessAlive(pid)) {
+    return false;
+  }
+  if (!(await processMayBeSignaled(pid, expectedProcessIdentity))) {
     return false;
   }
 
@@ -620,6 +677,9 @@ export async function terminateProcess(pid: number): Promise<boolean> {
   }
 
   if (await waitForProcessExit(pid, PROCESS_SIGTERM_GRACE_MS)) {
+    return true;
+  }
+  if (!(await processMayBeSignaled(pid, expectedProcessIdentity))) {
     return true;
   }
 
@@ -633,14 +693,30 @@ export async function terminateProcess(pid: number): Promise<boolean> {
   return true;
 }
 
+async function processMayBeSignaled(
+  pid: number,
+  expectedProcessIdentity: string | undefined,
+): Promise<boolean> {
+  return (
+    expectedProcessIdentity === undefined ||
+    (await processIdentityMatches(pid, expectedProcessIdentity))
+  );
+}
+
+async function processIdentityMatches(pid: number, expectedIdentity: string): Promise<boolean> {
+  return (await readProcessIdentity(pid)) === expectedIdentity;
+}
+
 export async function ensureOwnerIsUsable(
   sessionId: string,
   owner: QueueOwnerRecord,
 ): Promise<boolean> {
-  const alive = isProcessAlive(owner.pid);
-  const stale = isQueueOwnerHeartbeatStale(owner);
-  if (alive && !stale) {
+  const processState = await queueOwnerProcessState(owner);
+  if (ownerMayStillBeUsable(processState, owner)) {
     return true;
+  }
+  if (ownerShouldBePreserved(processState, owner)) {
+    return false;
   }
 
   await retireStaleQueueOwner(sessionId, owner);
@@ -686,6 +762,7 @@ export async function tryAcquireQueueOwnerLease(
   const mcpConfigFingerprint = readMcpConfigFingerprint(mcpConfigOrNowIsoFactory);
   const mcpConfigMetadata = createMcpConfigMetadata(mcpConfigPath, mcpConfigFingerprint);
   await ensureQueueDir();
+  const processIdentity = await readCurrentProcessIdentity();
   const lockPath = queueLockFilePath(sessionId);
   const socketPath = queueSocketPath(sessionId);
   let createdAt = clock();
@@ -694,6 +771,7 @@ export async function tryAcquireQueueOwnerLease(
     JSON.stringify(
       {
         pid: process.pid,
+        ...(processIdentity ? { processIdentity } : {}),
         sessionId,
         socketPath,
         createdAt,
@@ -737,6 +815,7 @@ export async function tryAcquireQueueOwnerLease(
     socketPath,
     createdAt,
     ownerGeneration,
+    ...(processIdentity ? { processIdentity } : {}),
     ...mcpConfigMetadata,
   };
   queueOwnerLeaseStates.set(lease, {
@@ -786,10 +865,10 @@ async function handleLeaseCollision(sessionId: string, error: unknown): Promise<
     return false;
   }
 
-  if (!isProcessAlive(owner.pid) || isQueueOwnerHeartbeatStale(owner)) {
-    return await retireStaleQueueOwner(sessionId, owner);
+  if (ownerShouldBePreserved(await queueOwnerProcessState(owner), owner)) {
+    return false;
   }
-  return false;
+  return await retireStaleQueueOwner(sessionId, owner);
 }
 
 function resolveLeaseArguments(
@@ -837,6 +916,7 @@ export async function refreshQueueOwnerLease(
     const payload = JSON.stringify(
       {
         pid: process.pid,
+        ...(lease.processIdentity ? { processIdentity: lease.processIdentity } : {}),
         sessionId: lease.sessionId,
         socketPath: lease.socketPath,
         createdAt: lease.createdAt,

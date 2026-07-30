@@ -352,17 +352,17 @@ test("buildTerminalSpawnCommand preserves explicit argv", () => {
   assert.deepEqual(buildTerminalSpawnCommand("node", ["-e", "console.log('ok')"]), {
     command: "node",
     args: ["-e", "console.log('ok')"],
-    killProcessGroup: false,
+    killProcessGroup: true,
   });
   assert.deepEqual(buildTerminalSpawnCommand("/tmp/tool with space", []), {
     command: "/tmp/tool with space",
     args: [],
-    killProcessGroup: false,
+    killProcessGroup: true,
   });
   assert.deepEqual(buildTerminalSpawnCommand("/tmp/tool with space", undefined), {
     command: "/tmp/tool with space",
     args: [],
-    killProcessGroup: false,
+    killProcessGroup: true,
   });
 });
 

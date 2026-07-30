@@ -532,6 +532,46 @@ test("terminal manager kills descendants that detach into a new process group", 
   }
 });
 
+test("terminal manager kills detached descendants of structured direct commands", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX detached descendant assertion");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-test-"));
+  const childPidPath = path.join(tmp, "direct-detached-child.pid");
+
+  try {
+    const manager = new TerminalManager({
+      cwd: tmp,
+      permissionMode: "approve-all",
+      killGraceMs: 200,
+    });
+    const detachedScript = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+    const launcherScript = [
+      "const { spawn } = require('node:child_process');",
+      "const fs = require('node:fs');",
+      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(detachedScript)}], { detached: true, stdio: 'ignore' });`,
+      `fs.writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));`,
+      "setInterval(() => {}, 1000);",
+    ].join("");
+    const created = await manager.createTerminal({
+      sessionId: "session-1",
+      command: process.execPath,
+      args: ["-e", launcherScript],
+    });
+
+    const childPid = await waitForPidFile(childPidPath);
+    await manager.killTerminal({
+      sessionId: "session-1",
+      terminalId: created.terminalId,
+    });
+
+    await assertPidExits(childPid);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("terminal manager releases shell command groups after wrapper exit", async (t) => {
   if (process.platform === "win32") {
     t.skip("POSIX process group assertion");

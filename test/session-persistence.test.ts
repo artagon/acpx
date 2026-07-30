@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -17,6 +17,7 @@ import {
 type SessionModule = typeof import("../src/session/session.js");
 
 const SESSION_MODULE_URL = new URL("../src/session/session.js", import.meta.url);
+const SESSION_REPOSITORY_URL = new URL("../src/session/persistence/repository.js", import.meta.url);
 
 test("SessionRecord allows optional closed and closedAt fields", () => {
   const record = makeSessionRecord({
@@ -563,6 +564,90 @@ test("writeSessionRecord maintains an index and listSessions rebuilds it when mi
   });
 });
 
+test("writeSessionRecord serializes cross-process record and index publication", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const indexPath = path.join(sessionDir, "index.json");
+    const firstReadyPath = path.join(homeDir, "first-index-ready");
+    const releaseFirstPath = path.join(homeDir, "release-first-index");
+    const firstRecord = makeSessionRecord({
+      acpxRecordId: "concurrent-first",
+      acpSessionId: "concurrent-first",
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "first"),
+    });
+    const secondRecord = makeSessionRecord({
+      acpxRecordId: "concurrent-second",
+      acpSessionId: "concurrent-second",
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "second"),
+    });
+    const first = spawnSessionRecordWriter({
+      homeDir,
+      record: firstRecord,
+      pauseIndexPath: indexPath,
+      readyPath: firstReadyPath,
+      releasePath: releaseFirstPath,
+    });
+    let second: ChildProcess | undefined;
+
+    try {
+      await waitForFile(firstReadyPath);
+      second = spawnSessionRecordWriter({ homeDir, record: secondRecord });
+      const secondResult = waitForSuccessfulChild(second);
+
+      await Promise.race([secondResult, sleep(1_000)]);
+      await fs.writeFile(releaseFirstPath, "release\n", "utf8");
+      await Promise.all([waitForSuccessfulChild(first), secondResult]);
+
+      const index = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+        entries?: Array<{ acpxRecordId?: string }>;
+      };
+      assert.deepEqual(index.entries?.map((entry) => entry.acpxRecordId).toSorted(), [
+        "concurrent-first",
+        "concurrent-second",
+      ]);
+    } finally {
+      await fs.writeFile(releaseFirstPath, "release\n", "utf8").catch(() => {});
+      stopChild(first);
+      if (second) {
+        stopChild(second);
+      }
+    }
+  });
+});
+
+test("writeSessionRecord recovers a stale cross-process write lock", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "stale-writer",
+        pid: 999_999,
+        createdAt: "2000-01-01T00:00:00.000Z",
+      })}\n`,
+      "utf8",
+    );
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?write_lock_test=${Date.now()}-${Math.random()}`
+    );
+
+    await repository.writeSessionRecord(
+      makeSessionRecord({
+        acpxRecordId: "stale-lock-recovery",
+        acpSessionId: "stale-lock-recovery",
+        agentCommand: "agent-a",
+        cwd: path.join(homeDir, "stale-lock"),
+      }),
+    );
+
+    assert.equal(await fileExists(lockPath), false);
+  });
+});
+
 test("closeSession soft-closes and terminates matching process", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
@@ -641,6 +726,82 @@ function makeSessionRecord(
   overrides: Parameters<typeof makeSessionRecordFixture>[0],
 ): ReturnType<typeof makeSessionRecordFixture> {
   return makeSessionRecordFixture(overrides, { defaultName: false, defaultAcpx: false });
+}
+
+function spawnSessionRecordWriter(options: {
+  homeDir: string;
+  record: ReturnType<typeof makeSessionRecord>;
+  pauseIndexPath?: string;
+  readyPath?: string;
+  releasePath?: string;
+}): ChildProcess {
+  const script = `
+    import fs from "node:fs/promises";
+    const pauseIndexPath = ${JSON.stringify(options.pauseIndexPath)};
+    const readyPath = ${JSON.stringify(options.readyPath)};
+    const releasePath = ${JSON.stringify(options.releasePath)};
+    if (pauseIndexPath && readyPath && releasePath) {
+      const originalRename = fs.rename.bind(fs);
+      let paused = false;
+      fs.rename = async (source, destination) => {
+        if (!paused && String(destination) === pauseIndexPath) {
+          paused = true;
+          await fs.writeFile(readyPath, "ready\\n", "utf8");
+          for (;;) {
+            try {
+              await fs.access(releasePath);
+              break;
+            } catch {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+          }
+        }
+        return await originalRename(source, destination);
+      };
+    }
+    const repository = await import(${JSON.stringify(SESSION_REPOSITORY_URL.href)});
+    await repository.writeSessionRecord(${JSON.stringify(options.record)});
+  `;
+  return spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: options.homeDir },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+}
+
+async function waitForSuccessfulChild(child: ChildProcess): Promise<void> {
+  const stderrChunks: Buffer[] = [];
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderrChunks.push(chunk);
+  });
+  const [code, signal] = (await once(child, "close")) as [number | null, string | null];
+  assert.equal(
+    code,
+    0,
+    `session writer failed: signal=${signal ?? "none"} stderr=${Buffer.concat(stderrChunks).toString("utf8")}`,
+  );
+}
+
+function stopChild(child: ChildProcess): void {
+  if (child.exitCode == null && child.signalCode == null) {
+    child.kill("SIGKILL");
+  }
+}
+
+async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fileExists(filePath)) {
+      return;
+    }
+    await sleep(10);
+  }
+  throw new Error(`Timed out waiting for file: ${filePath}`);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function waitForExit(pid: number | undefined): Promise<boolean> {
