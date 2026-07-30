@@ -337,11 +337,18 @@ test("formula automation rejects versions that do not advance live main", () => 
   const policy = jobBlocks(supplyChain).get("policy") ?? "";
 
   assert.match(formula, /contents\/Formula\/acpx\.rb\?ref=main/);
-  assert.match(formula, /target version.*strictly greater than current main/is);
-  assert.match(formula, /compareVersions\(targetVersion, currentVersion\) <= 0/);
+  assert.match(
+    formula,
+    /formula-version\.rb\s+\\\n\s+assert-target-advance "\$TARGET_VERSION" "\$current_formula"/,
+  );
+  assert.match(formula, /baseline-sha256: \$\{\{ steps\.baseline\.outputs\.sha256 \}\}/);
+  assert.match(formula, /candidate-sha256: \$\{\{ steps\.render\.outputs\.sha256 \}\}/);
 
   assert.match(formulaPr, /git fetch --no-tags origin main/);
-  assert.match(formulaPr, /compareVersions\(candidateVersion, mainVersion\) <= 0/);
+  assert.match(formulaPr, /EXPECTED_BASELINE_SHA256/);
+  assert.match(formulaPr, /EXPECTED_CANDIDATE_SHA256/);
+  assert.match(formulaPr, /main changed after version validation/);
+  assert.match(formulaPr, /Downloaded formula differs from the parser-validated render/);
   assert.match(formulaPr, /path: \$\{\{ runner\.temp \}\}\/formula/);
   assert.ok(
     formulaPr.indexOf('git checkout -B "$branch" origin/main') <
@@ -351,8 +358,10 @@ test("formula automation rejects versions that do not advance live main", () => 
 
   assert.match(policy, /Formula version never moves backward/);
   assert.match(policy, /contents\/Formula\/acpx\.rb\?ref=main/);
-  assert.match(policy, /candidate version.*strictly greater than live main/is);
-  assert.match(policy, /compareVersions\(candidateVersion, mainVersion\) <= 0/);
+  assert.match(
+    policy,
+    /formula-version\.rb\s+\\\n\s+assert-advance Formula\/acpx\.rb "\$main_formula"/,
+  );
 
   // GITHUB_TOKEN-created PRs produce approval-required pull_request runs. The
   // explicit human approval boundary is documented in the generated PR body,
@@ -562,7 +571,11 @@ test("binary publishing runs default-branch workflow code for an exact dispatch 
 
 test("binary publishing verifies the exact npm provenance before any release write", () => {
   const publish = jobBlocks(readWorkflow("release-binaries.yml")).get("publish") ?? "";
+  const verifyStart = publish.indexOf("Verify exact npm provenance before any release write");
+  const verifyEnd = publish.indexOf("\n      - name:", verifyStart + 1);
+  const verify = publish.slice(verifyStart, verifyEnd);
 
+  assert.match(verify, /GH_REPO: \$\{\{ github\.repository \}\}/);
   assert.match(publish, /gh attestation verify/);
   assert.match(publish, /--repo "\$GH_REPO"/);
   assert.match(publish, /--signer-workflow "\$\{GH_REPO\}\/\.github\/workflows\/release\.yml"/);

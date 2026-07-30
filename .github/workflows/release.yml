@@ -171,6 +171,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: true
 
+      - run: node scripts/supply-chain/verify-release-age.mjs --minimum-age-minutes 2880
       - run: pnpm install --frozen-lockfile
 
       - name: Ensure version is not already published

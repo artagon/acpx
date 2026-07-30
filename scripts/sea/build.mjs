@@ -29,8 +29,8 @@ const CJS_WRAPPER_SHIM =
   "var module = typeof module === 'undefined' ? { exports: {} } : module;\n" +
   "var exports = module.exports;\n";
 
-function run(command, args) {
-  execFileSync(command, args, { cwd: repoRoot, stdio: "inherit" });
+function run(command, args, env = process.env) {
+  execFileSync(command, args, { cwd: repoRoot, env, stdio: "inherit" });
 }
 
 /**
@@ -50,6 +50,31 @@ function assertSeaCapable(nodePath) {
         "  ACPX_SEA_NODE=~/.local/share/nvm/v24.11.0/bin/node node scripts/sea/build.mjs",
     );
   }
+}
+
+function readSeaNodeVersion(nodePath) {
+  const version = execFileSync(nodePath, ["-p", "process.versions.node"], {
+    encoding: "utf8",
+  })
+    .trim()
+    .replace(/^v/, "");
+  if (!/^\d+\.\d+\.\d+(?:[-+].+)?$/u.test(version)) {
+    throw new Error(`Unable to determine a valid Node.js version from ${nodePath}: ${version}`);
+  }
+  return version;
+}
+
+function resolveSeaNodeVersion(nodePath, configuredVersion) {
+  const actualVersion = readSeaNodeVersion(nodePath);
+  if (configuredVersion !== undefined) {
+    const normalizedConfigured = configuredVersion.trim().replace(/^v/, "");
+    if (normalizedConfigured !== actualVersion) {
+      throw new Error(
+        `ACPX_SEA_NODE_VERSION ${configuredVersion} does not match ${nodePath} (${actualVersion}).`,
+      );
+    }
+  }
+  return actualVersion;
 }
 
 function materializeFlowRuntimeEsbuild() {
@@ -160,14 +185,23 @@ function addFlowRuntimeEsbuildToSbom(sbom, runtimeEsbuild) {
 
 const seaNode = process.env.ACPX_SEA_NODE ?? process.execPath;
 assertSeaCapable(seaNode);
+const seaNodeVersion = resolveSeaNodeVersion(seaNode, process.env.ACPX_SEA_NODE_VERSION);
+const seaBuildEnv = {
+  ...process.env,
+  ACPX_SEA_NODE_VERSION: seaNodeVersion,
+};
 
 // `pnpm exec`, never `npx`: npx resolves from the registry at run time, so a
 // compromised release of a build tool would be fetched unpinned and handed
 // write access to the exact bytes users install. pnpm exec resolves from the
 // lockfile and fails closed when the tool is absent.
-run("pnpm", ["exec", "tsdown", "-c", path.join(here, "tsdown.sea.config.ts")]);
-run("pnpm", ["exec", "tsdown", "-c", path.join(here, "tsdown.runtime.config.ts")]);
-run("pnpm", ["exec", "tsdown", "-c", path.join(here, "tsdown.flow-runtime.config.ts")]);
+run("pnpm", ["exec", "tsdown", "-c", path.join(here, "tsdown.sea.config.ts")], seaBuildEnv);
+run("pnpm", ["exec", "tsdown", "-c", path.join(here, "tsdown.runtime.config.ts")], seaBuildEnv);
+run(
+  "pnpm",
+  ["exec", "tsdown", "-c", path.join(here, "tsdown.flow-runtime.config.ts")],
+  seaBuildEnv,
+);
 const runtimeEsbuild = materializeFlowRuntimeEsbuild();
 
 fs.writeFileSync(bundlePath, CJS_WRAPPER_SHIM + fs.readFileSync(bundlePath, "utf8"));

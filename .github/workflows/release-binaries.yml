@@ -192,6 +192,10 @@ jobs:
           console.log(`${tag} matches package.json.`);
           NODE
 
+      # Run once before the build matrix fans out; each build depends on this
+      # gate, so four platforms do not hammer npm with the same metadata reads.
+      - run: node scripts/supply-chain/verify-release-age.mjs --minimum-age-minutes 2880
+
       - name: Refuse any pre-existing release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -458,6 +462,7 @@ jobs:
       - name: Verify exact npm provenance before any release write
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.gate.outputs.tag }}
           VALIDATED_SHA: ${{ needs.gate.outputs.sha }}
         run: |
@@ -586,6 +591,9 @@ jobs:
     name: Render Homebrew formula
     needs: [gate, publish]
     runs-on: ubuntu-24.04
+    outputs:
+      baseline-sha256: ${{ steps.baseline.outputs.sha256 }}
+      candidate-sha256: ${{ steps.render.outputs.sha256 }}
     permissions:
       contents: read
       attestations: read
@@ -604,6 +612,7 @@ jobs:
           check-latest: false
 
       - name: Require the formula version to advance live main
+        id: baseline
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -616,35 +625,10 @@ jobs:
             "repos/${GH_REPO}/contents/Formula/acpx.rb?ref=main" \
             > "$current_formula"
 
-          CURRENT_FORMULA="$current_formula" node - <<'NODE'
-          const { readFileSync } = require("node:fs");
-
-          const targetVersion = process.env.TARGET_VERSION ?? "";
-          const currentFormula = readFileSync(process.env.CURRENT_FORMULA, "utf8");
-          const currentVersion = currentFormula.match(/^\s*version "(\d+\.\d+\.\d+)"$/m)?.[1] ?? "";
-          const parseVersion = (value) => {
-            if (!/^\d+\.\d+\.\d+$/.test(value)) {
-              throw new Error(`Expected a semantic version, received "${value || "<missing>"}".`);
-            }
-            return value.split(".").map(Number);
-          };
-          const compareVersions = (left, right) => {
-            const a = parseVersion(left);
-            const b = parseVersion(right);
-            for (let index = 0; index < 3; index += 1) {
-              if (a[index] !== b[index]) return a[index] - b[index];
-            }
-            return 0;
-          };
-
-          if (compareVersions(targetVersion, currentVersion) <= 0) {
-            console.error(
-              `Formula target version ${targetVersion} must be strictly greater than current main ${currentVersion}.`,
-            );
-            process.exit(1);
-          }
-          console.log(`Formula advancement validated: ${currentVersion} -> ${targetVersion}.`);
-          NODE
+          ruby scripts/release/formula-version.rb \
+            assert-target-advance "$TARGET_VERSION" "$current_formula"
+          baseline_sha256="$(sha256sum "$current_formula" | cut -d' ' -f1)"
+          echo "sha256=${baseline_sha256}" >> "$GITHUB_OUTPUT"
 
       - name: Fetch the release checksum manifest
         env:
@@ -693,6 +677,7 @@ jobs:
           exit 1
 
       - name: Regenerate the formula
+        id: render
         env:
           TAG: ${{ needs.gate.outputs.tag }}
           NPM_SHA256: ${{ steps.npm.outputs.sha256 }}
@@ -707,6 +692,9 @@ jobs:
           # run. Keep a pre-PR syntax proof so approval is not spent discovering
           # a generated syntax error. A full `brew audit` is unavailable on Linux.
           ruby -c Formula/acpx.rb
+          ruby scripts/release/formula-version.rb assert-version Formula/acpx.rb "${TAG#v}"
+          candidate_sha256="$(sha256sum Formula/acpx.rb | cut -d' ' -f1)"
+          echo "sha256=${candidate_sha256}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -746,6 +734,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.gate.outputs.tag }}
+          EXPECTED_BASELINE_SHA256: ${{ needs.formula.outputs.baseline-sha256 }}
+          EXPECTED_CANDIDATE_SHA256: ${{ needs.formula.outputs.candidate-sha256 }}
         run: |
           set -euo pipefail
           candidate="${RUNNER_TEMP}/formula/acpx.rb"
@@ -753,34 +743,21 @@ jobs:
           git fetch --no-tags origin main
           git show origin/main:Formula/acpx.rb > "$main_formula"
 
-          CANDIDATE_FORMULA="$candidate" MAIN_FORMULA="$main_formula" node - <<'NODE'
-          const { readFileSync } = require("node:fs");
-
-          const versionOf = (file) => {
-            const source = readFileSync(file, "utf8");
-            const version = source.match(/^\s*version "(\d+\.\d+\.\d+)"$/m)?.[1];
-            if (!version) throw new Error(`No semantic formula version in ${file}.`);
-            return version;
-          };
-          const compareVersions = (left, right) => {
-            const a = left.split(".").map(Number);
-            const b = right.split(".").map(Number);
-            for (let index = 0; index < 3; index += 1) {
-              if (a[index] !== b[index]) return a[index] - b[index];
-            }
-            return 0;
-          };
-
-          const candidateVersion = versionOf(process.env.CANDIDATE_FORMULA);
-          const mainVersion = versionOf(process.env.MAIN_FORMULA);
-          if (compareVersions(candidateVersion, mainVersion) <= 0) {
-            console.error(
-              `Formula candidate version ${candidateVersion} must be strictly greater than live main ${mainVersion}.`,
-            );
-            process.exit(1);
-          }
-          console.log(`Formula PR advancement validated: ${mainVersion} -> ${candidateVersion}.`);
-          NODE
+          if ! [[ "$EXPECTED_BASELINE_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+            ! [[ "$EXPECTED_CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Formula render job returned malformed digest outputs."
+            exit 1
+          fi
+          baseline_sha256="$(sha256sum "$main_formula" | cut -d' ' -f1)"
+          candidate_sha256="$(sha256sum "$candidate" | cut -d' ' -f1)"
+          if [ "$baseline_sha256" != "$EXPECTED_BASELINE_SHA256" ]; then
+            echo "::error::Formula/acpx.rb on main changed after version validation; rerun the release workflow."
+            exit 1
+          fi
+          if [ "$candidate_sha256" != "$EXPECTED_CANDIDATE_SHA256" ]; then
+            echo "::error::Downloaded formula differs from the parser-validated render."
+            exit 1
+          fi
 
           if cmp -s "$candidate" "$main_formula"; then
             echo "Formula already matches $TAG; nothing to propose."

@@ -109,7 +109,11 @@ digests to match before scanning the npm tree with a checksum-pinned
 built-in adapters are present and representative dev-only packages are absent
 before attesting the document.
 
-**The binary bundles everything.** It is one rolled-up chunk inside a V8 startup snapshot, injected into a copy of Node. Neither obvious scan target describes it:
+**The binary embeds its runtime closure.** The rolled-up CLI lives in a V8
+startup snapshot injected into a copy of Node. Delegated flow runtime modules,
+the esbuild JavaScript package files, and the platform esbuild executable are
+embedded as separate SEA assets. Neither obvious scan target describes that
+layout:
 
 | Scan target                | Components     | Why it is wrong                                  |
 | -------------------------- | -------------- | ------------------------------------------------ |
@@ -118,14 +122,19 @@ before attesting the document.
 | The finished binary (Syft) | zero observed  | No per-package boundaries survive bundling       |
 | **Bundler module graph**   | build-specific | Exactly the packages whose code was inlined      |
 
-So the binary's SBOM is produced by [`rollup-plugin-sbom`](https://github.com/janbiasi/rollup-plugin-sbom) during the build that makes the binary, reading the bundler's own module graph. See `scripts/sea/tsdown.sea.config.ts`.
+So the binary's SBOM is produced by [`rollup-plugin-sbom`](https://github.com/janbiasi/rollup-plugin-sbom) during the build that makes the binary, reading the bundler's own module graph. The SEA build then adds the embedded platform esbuild executable as an explicit component with its artifact hash and dependency edge. See `scripts/sea/tsdown.sea.config.ts` and `scripts/sea/build.mjs`.
 
 That leaves one gap the bundler cannot see: the Node.js runtime. The executable is a copy of an official Node build, so Node — and with it V8, OpenSSL, zlib, and ICU — is the majority of the file and its largest attack surface. It is added as an explicit component with a `pkg:generic/node@<version>` purl, so scanners match Node advisories against the artifact.
 
 Consequences worth knowing:
 
-- **Build tooling is absent from the binary's SBOM, deliberately.** The bundler, type checker, and test runner never reach it. A devDependency advisory does not describe that artifact.
-- **Native sidecars are represented by their JavaScript only.** Packages that ship a platform-specific binary have their JS inlined; the native executable is not inside the SEA.
+- **Build-only tooling is absent from the binary's SBOM, deliberately.** The
+  bundler, type checker, and test runner never reach the artifact. Esbuild is
+  the exception because flow execution uses it at runtime, so both its
+  JavaScript and embedded platform executable are represented.
+- **The embedded esbuild executable is explicit.** Its platform package,
+  version, SHA-256 hash, and dependency edge are added after bundling so the
+  SBOM describes the native bytes shipped inside the SEA.
 - **No timestamps.** The binary SBOM disables them at generation time. The npm
   workflow removes Syft's timestamp and random serial number before attestation,
   so repeated builds do not differ solely because of wall-clock or UUID noise.
