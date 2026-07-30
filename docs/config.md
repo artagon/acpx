@@ -185,8 +185,7 @@ Other ACP-relevant behavior:
 {
   "agents": {
     "codex": {
-      "command": "/opt/internal/codex-acp",
-      "args": ["--profile", "internal-stable"]
+      "argv": ["/opt/internal/codex-acp", "--profile", "internal-stable"]
     }
   }
 }
@@ -198,7 +197,7 @@ Other ACP-relevant behavior:
 {
   "agents": {
     "ci-bot": {
-      "command": "node ./scripts/ci-acp-bridge.mjs"
+      "argv": ["node", "./scripts/ci-acp-bridge.mjs"]
     }
   }
 }

@@ -349,6 +349,7 @@ export type FlowRunnerOptions = {
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
   fs?: boolean;
+  terminal?: boolean;
   timeoutMs?: number;
   defaultNodeTimeoutMs?: number;
   ttlMs?: number;

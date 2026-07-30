@@ -15,7 +15,7 @@ If your Cursor install exposes ACP as `agent acp` instead of `cursor-agent acp`,
 {
   "agents": {
     "cursor": {
-      "command": "agent acp"
+      "argv": ["agent", "acp"]
     }
   }
 }

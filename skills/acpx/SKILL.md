@@ -116,6 +116,8 @@ Friendly agent names resolve to commands:
 Rules:
 
 - Default agent is `codex` for top-level `prompt`, `exec`, and `sessions`.
+- Repo-local OpenClaw overrides should use structured `agents.openclaw.argv`;
+  see `agents/OpenClaw.md` for the cross-platform launch guidance.
 - Unknown positional agent tokens are treated as raw agent commands.
 - `--agent <command>` explicitly sets a raw ACP adapter command.
 - Do not combine a positional agent and `--agent` in the same command.

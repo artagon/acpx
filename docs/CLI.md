@@ -176,11 +176,28 @@ Built-in command mapping: `openclaw -> openclaw acp`
 
 For repo-local OpenClaw checkouts, override the built-in command in config:
 
+This launch uses the Unix `env` executable. Replace the token-file placeholder
+with an absolute path. On Windows, use a wrapper that sets the two environment
+variables and put that wrapper plus its arguments in `argv`.
+
 ```json
 {
   "agents": {
     "openclaw": {
-      "command": "env OPENCLAW_HIDE_BANNER=1 OPENCLAW_SUPPRESS_NOTES=1 node scripts/run-node.mjs acp --url ws://127.0.0.1:18789 --token-file ~/.openclaw/gateway.token --session agent:main:main"
+      "argv": [
+        "env",
+        "OPENCLAW_HIDE_BANNER=1",
+        "OPENCLAW_SUPPRESS_NOTES=1",
+        "node",
+        "scripts/run-node.mjs",
+        "acp",
+        "--url",
+        "ws://127.0.0.1:18789",
+        "--token-file",
+        "/absolute/path/to/.openclaw/gateway.token",
+        "--session",
+        "agent:main:main"
+      ]
     }
   }
 }

@@ -17,8 +17,8 @@ import { fileURLToPath } from "node:url";
  */
 const ACP_ADAPTER_PACKAGE_RANGES = {
   pi: "^0.0.31",
-  codex: "^1.1.5",
-  claude: "^0.60.0",
+  codex: "^1.1.7",
+  claude: "^0.61.0",
   mux: "^0.28.0",
 } as const;
 

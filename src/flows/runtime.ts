@@ -152,6 +152,7 @@ export class FlowRunner {
   private readonly authCredentials?;
   private readonly authPolicy?;
   private readonly fs?;
+  private readonly terminal?;
   private readonly timeoutMs?;
   private readonly defaultNodeTimeoutMs;
   private readonly verbose?;
@@ -171,6 +172,7 @@ export class FlowRunner {
     this.authCredentials = options.authCredentials;
     this.authPolicy = options.authPolicy;
     this.fs = options.fs;
+    this.terminal = options.terminal;
     this.timeoutMs = options.timeoutMs;
     this.defaultNodeTimeoutMs =
       options.defaultNodeTimeoutMs ?? options.timeoutMs ?? DEFAULT_FLOW_STEP_TIMEOUT_MS;
@@ -1070,6 +1072,7 @@ export class FlowRunner {
       authCredentials: this.authCredentials,
       authPolicy: this.authPolicy,
       fs: this.fs,
+      terminal: this.terminal,
       timeoutMs,
       verbose: this.verbose,
       sessionOptions: this.sessionOptions,
@@ -1117,9 +1120,6 @@ export class FlowRunner {
     let eventEndSeq: number | undefined;
     const pendingEventWrites: Promise<void>[] = [];
     const initialClient = this.pendingPersistentSessionClients.get(binding.key);
-    if (initialClient) {
-      this.pendingPersistentSessionClients.delete(binding.key);
-    }
 
     try {
       await sendSessionDirect({
@@ -1133,6 +1133,7 @@ export class FlowRunner {
         authCredentials: this.authCredentials,
         authPolicy: this.authPolicy,
         fs: this.fs,
+        terminal: this.terminal,
         outputFormatter: capture.formatter,
         onAcpMessage: (direction, message) => {
           const pending = this.store
@@ -1180,6 +1181,7 @@ export class FlowRunner {
       };
     } finally {
       if (initialClient) {
+        this.pendingPersistentSessionClients.delete(binding.key);
         await initialClient.close().catch(() => {
           // best effort cleanup; persisted session state already exists
         });
@@ -1226,6 +1228,7 @@ export class FlowRunner {
       authCredentials: this.authCredentials,
       authPolicy: this.authPolicy,
       fs: this.fs,
+      terminal: this.terminal,
       outputFormatter: capture.formatter,
       onAcpMessage: (direction, message) => {
         const pending = this.store

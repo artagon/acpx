@@ -87,11 +87,28 @@ Notes that override or extend the cross-agent behavior live below.
 
 For repo-local OpenClaw checkouts, override the built-in command in `~/.acpx/config.json` so `acpx openclaw …` spawns the ACP bridge directly without the `pnpm` wrapper:
 
+This launch uses the Unix `env` executable. Replace the token-file placeholder
+with an absolute path. On Windows, use a wrapper that sets the two environment
+variables and put that wrapper plus its arguments in `argv`.
+
 ```json
 {
   "agents": {
     "openclaw": {
-      "command": "env OPENCLAW_HIDE_BANNER=1 OPENCLAW_SUPPRESS_NOTES=1 node scripts/run-node.mjs acp --url ws://127.0.0.1:18789 --token-file ~/.openclaw/gateway.token --session agent:main:main"
+      "argv": [
+        "env",
+        "OPENCLAW_HIDE_BANNER=1",
+        "OPENCLAW_SUPPRESS_NOTES=1",
+        "node",
+        "scripts/run-node.mjs",
+        "acp",
+        "--url",
+        "ws://127.0.0.1:18789",
+        "--token-file",
+        "/absolute/path/to/.openclaw/gateway.token",
+        "--session",
+        "agent:main:main"
+      ]
     }
   }
 }
@@ -106,7 +123,7 @@ For repo-local OpenClaw checkouts, override the built-in command in `~/.acpx/con
 If your Cursor install exposes ACP as `agent acp` instead of `cursor-agent acp`, override:
 
 ```json
-{ "agents": { "cursor": { "command": "agent acp" } } }
+{ "agents": { "cursor": { "argv": ["agent", "acp"] } } }
 ```
 
 ### Gemini
@@ -225,14 +242,13 @@ Configure at least one model provider before prompting (for example `ANTHROPIC_A
 
 ## Overriding a built-in
 
-Any built-in can be replaced wholesale through config, including `args` for adapter sub-commands:
+Any built-in can be replaced wholesale through config, including adapter sub-commands:
 
 ```json
 {
   "agents": {
     "codex": {
-      "command": "/usr/local/bin/codex-acp",
-      "args": ["--profile", "ci"]
+      "argv": ["/usr/local/bin/codex-acp", "--profile", "ci"]
     }
   }
 }

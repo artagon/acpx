@@ -34,6 +34,8 @@ Rules:
 - Do not combine `--agent` with a positional agent token in the same command. That is a usage error.
 - The resolved command string becomes the session scope key (`agentCommand`). Two different command strings are two different sessions, even if the underlying binary is the same.
 - Empty commands and unterminated quoting are rejected as usage errors.
+- Raw `--agent <command>` strings are Unix-only. On Windows, define the launch
+  in config with structured `argv`.
 
 ## 3. Config-defined agents
 
@@ -43,8 +45,7 @@ For commands you use repeatedly, define them in [`~/.acpx/config.json`](config.m
 {
   "agents": {
     "ci-bot": {
-      "command": "node ./scripts/ci-acp-bridge.mjs",
-      "args": ["--profile", "internal"]
+      "argv": ["node", "./scripts/ci-acp-bridge.mjs", "--profile", "internal"]
     }
   }
 }
@@ -106,8 +107,7 @@ Per-repo override with config:
 {
   "agents": {
     "internal": {
-      "command": "/opt/internal/acp-bridge",
-      "args": ["--profile", "stable"]
+      "argv": ["/opt/internal/acp-bridge", "--profile", "stable"]
     }
   }
 }
@@ -123,11 +123,28 @@ acpx internal exec 'list TODO comments'
 
 OpenClaw repo-local checkout (the canonical "override a built-in" example):
 
+This launch uses the Unix `env` executable. Replace the token-file placeholder
+with an absolute path. On Windows, use a wrapper that sets the two environment
+variables and put that wrapper plus its arguments in `argv`.
+
 ```json
 {
   "agents": {
     "openclaw": {
-      "command": "env OPENCLAW_HIDE_BANNER=1 OPENCLAW_SUPPRESS_NOTES=1 node scripts/run-node.mjs acp --url ws://127.0.0.1:18789 --token-file ~/.openclaw/gateway.token --session agent:main:main"
+      "argv": [
+        "env",
+        "OPENCLAW_HIDE_BANNER=1",
+        "OPENCLAW_SUPPRESS_NOTES=1",
+        "node",
+        "scripts/run-node.mjs",
+        "acp",
+        "--url",
+        "ws://127.0.0.1:18789",
+        "--token-file",
+        "/absolute/path/to/.openclaw/gateway.token",
+        "--session",
+        "agent:main:main"
+      ]
     }
   }
 }

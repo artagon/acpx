@@ -43,7 +43,7 @@ bridges stdio to the gateway's ACP-over-WebSocket endpoint:
 {
   "agents": {
     "zeroclaw": {
-      "command": "zeroclaw-acp-bridge"
+      "argv": ["zeroclaw-acp-bridge"]
     }
   }
 }

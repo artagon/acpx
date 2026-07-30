@@ -162,6 +162,62 @@ test("integration: flow run --no-fs disables advertised filesystem capabilities"
   });
 });
 
+test("integration: flow run --no-terminal disables the advertised terminal capability", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseLoadCapableAgentArgs(cwd),
+          "--format",
+          "json",
+          "--no-terminal",
+          "flow",
+          "run",
+          FLOW_FIXTURE_PATH,
+          "--input-json",
+          JSON.stringify({ next: "yes_path" }),
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as { runDir?: string };
+      assert.equal(typeof payload.runDir, "string", result.stdout);
+
+      const manifest = JSON.parse(
+        await fs.readFile(path.join(payload.runDir ?? "", "manifest.json"), "utf8"),
+      ) as { sessions?: Array<{ eventsPath?: string }> };
+      const eventsPath = manifest.sessions?.[0]?.eventsPath;
+      assert.equal(typeof eventsPath, "string");
+
+      const events = (await fs.readFile(path.join(payload.runDir ?? "", eventsPath ?? ""), "utf8"))
+        .trim()
+        .split("\n")
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              message?: {
+                method?: string;
+                params?: {
+                  clientCapabilities?: {
+                    terminal?: unknown;
+                  };
+                };
+              };
+            },
+        );
+      const initializeRequest = events.find((event) => event.message?.method === "initialize");
+
+      assert(initializeRequest, JSON.stringify(events, null, 2));
+      assert.equal(initializeRequest.message?.params?.clientCapabilities?.terminal, false);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: flow run executes multiple ACP steps in one session and branches", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
