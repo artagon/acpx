@@ -44,10 +44,12 @@ export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
 export {
   isProcessAlive,
+  readQueueOwnerRecord,
   releaseQueueOwnerLease,
   terminateProcess,
   terminateQueueOwnerForSession,
   tryAcquireQueueOwnerLease,
+  waitForQueueOwnerGenerationRelease,
   waitMs,
 } from "./lease-store.js";
 export type { QueueOwnerLease } from "./lease-store.js";
@@ -78,9 +80,14 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
     return false;
   }
 
-  await terminateQueueOwnerForSession(params.sessionId).catch(() => {
-    // Preserve existing behavior if cleanup fails.
-  });
+  if (await ensureOwnerIsUsable(params.sessionId, params.owner)) {
+    return false;
+  }
+  try {
+    await terminateQueueOwnerForSession(params.sessionId);
+  } catch {
+    return false;
+  }
   incrementPerfCounter("queue.owner.stale_recovered");
 
   if (params.verbose) {

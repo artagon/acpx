@@ -690,6 +690,103 @@ test("writeSessionRecord recovers a stale cross-process write lock", async () =>
   });
 });
 
+test("writeSessionRecord recovers an old malformed write lock", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(lockPath, '{"lockId":', "utf8");
+    const oldTime = new Date(Date.now() - 180_000);
+    await fs.utimes(lockPath, oldTime, oldTime);
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?malformed_write_lock_test=${Date.now()}-${Math.random()}`
+    );
+
+    await repository.writeSessionRecord(
+      makeSessionRecord({
+        acpxRecordId: "malformed-lock-recovery",
+        acpSessionId: "malformed-lock-recovery",
+        agentCommand: "agent-a",
+        cwd: path.join(homeDir, "malformed-lock"),
+      }),
+    );
+
+    assert.equal(await fileExists(lockPath), false);
+  });
+});
+
+test("session write locks are not visible until their complete record is published", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    await fs.mkdir(sessionDir, { recursive: true });
+    const { withSessionWriteLock } = await import(
+      `${SESSION_WRITE_LOCK_URL.href}?atomic_publication=${Date.now()}-${Math.random()}`
+    );
+    const originalWriteFile = fs.writeFile.bind(fs);
+    let releaseWrite: (() => void) | undefined;
+    const writeReleased = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let partialWriteReady: (() => void) | undefined;
+    const partialWriteStarted = new Promise<void>((resolve) => {
+      partialWriteReady = resolve;
+    });
+    let intercepted = false;
+
+    Object.defineProperty(fs, "writeFile", {
+      configurable: true,
+      value: async (
+        file: Parameters<typeof fs.writeFile>[0],
+        data: Parameters<typeof fs.writeFile>[1],
+        options?: Parameters<typeof fs.writeFile>[2],
+      ) => {
+        const fileName =
+          typeof file === "string"
+            ? path.basename(file)
+            : file instanceof URL
+              ? path.basename(file.pathname)
+              : Buffer.isBuffer(file)
+                ? path.basename(file.toString())
+                : "";
+        if (!intercepted && fileName.startsWith(".write.lock")) {
+          intercepted = true;
+          await originalWriteFile(file, '{"lockId":', options);
+          partialWriteReady?.();
+          await writeReleased;
+          await originalWriteFile(file, data, {
+            encoding: "utf8",
+            flag: "w",
+            mode: 0o600,
+          });
+          return;
+        }
+        return await originalWriteFile(file, data, options);
+      },
+    });
+
+    const lockedOperation = withSessionWriteLock(sessionDir, async () => {});
+    let publishedWhilePartial = false;
+    try {
+      await partialWriteStarted;
+      publishedWhilePartial = await fileExists(lockPath);
+    } finally {
+      Object.defineProperty(fs, "writeFile", {
+        configurable: true,
+        value: originalWriteFile,
+      });
+      releaseWrite?.();
+      await lockedOperation;
+    }
+
+    assert.equal(publishedWhilePartial, false);
+    assert.equal(
+      (await fs.readdir(sessionDir)).some((name) => name.startsWith(".write.lock.")),
+      false,
+    );
+  });
+});
+
 test("session write lock reentrancy canonicalizes symlink aliases", async () => {
   await withTempHome(async (homeDir) => {
     const realSessionDir = path.join(homeDir, "real-sessions");

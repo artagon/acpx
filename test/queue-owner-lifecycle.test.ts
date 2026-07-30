@@ -16,7 +16,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { isProcessAlive } from "../src/cli/queue/lease-store.js";
+import { isProcessAlive, readQueueOwnerRecord } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath, queueSocketPath } from "../src/cli/queue/paths.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
@@ -78,6 +78,41 @@ async function waitForTerminalQueueMessage(
     }
   }
   throw new Error(`Queue result not received within ${timeoutMs}ms`);
+}
+
+async function waitForQueueMessageType(
+  iterator: AsyncIterator<string>,
+  expectedType: string,
+  timeoutMs = 5_000,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now());
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const line = await Promise.race([
+        iterator.next(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`timeout waiting for ${expectedType}`)),
+            remainingMs,
+          );
+        }),
+      ]);
+      if (line.done) {
+        throw new Error(`queue socket closed before ${expectedType}`);
+      }
+      const message = JSON.parse(line.value) as Record<string, unknown>;
+      if (message.type === expectedType) {
+        return message;
+      }
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+  throw new Error(`Queue message ${expectedType} not received within ${timeoutMs}ms`);
 }
 
 function waitForProcessExit(
@@ -334,6 +369,70 @@ describe("queue owner lifecycle — graceful SIGTERM shutdown", () => {
         assert.equal(await fileExists(lockPath), false, "lease must be released after shutdown");
       } finally {
         idleSocket?.destroy();
+        if (child.exitCode == null && child.signalCode == null) {
+          child.kill("SIGKILL");
+        }
+      }
+    });
+  });
+
+  it("exits and releases its lease after a close_session control request", async () => {
+    await withTempHome("acpx-lifecycle-close-request-", async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+
+      const record = makeSessionRecord({
+        acpxRecordId: "lifecycle-close-request-test",
+        acpSessionId: "lifecycle-close-request-session",
+        agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)}`,
+        cwd,
+      });
+      await writeSessionRecordFile(homeDir, record);
+
+      const socketPath = queueSocketPath(record.acpxRecordId, homeDir);
+      const lockPath = queueLockFilePath(record.acpxRecordId, homeDir);
+      const child = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
+        env: {
+          ...process.env,
+          HOME: homeDir,
+          ACPX_QUEUE_OWNER_PAYLOAD: JSON.stringify({
+            sessionId: record.acpxRecordId,
+            permissionMode: "approve-reads",
+          }),
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      const stderrChunks: Buffer[] = [];
+      child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+      let socket: net.Socket | undefined;
+
+      try {
+        await waitUntil(() => fileExists(socketPath));
+        const owner = await readQueueOwnerRecord(record.acpxRecordId);
+        assert(owner);
+        socket = await new Promise<net.Socket>((resolve, reject) => {
+          const connection = net.createConnection(socketPath);
+          connection.once("connect", () => resolve(connection));
+          connection.once("error", reject);
+        });
+        const lines = readline.createInterface({ input: socket, crlfDelay: Infinity });
+        socket.write(
+          `${JSON.stringify({
+            type: "close_session",
+            requestId: "close-owner",
+            ownerGeneration: owner.ownerGeneration,
+          })}\n`,
+        );
+
+        await waitForQueueMessageType(lines[Symbol.asyncIterator](), "close_session_result");
+
+        const { code, signal } = await waitForProcessExit(child);
+        const stderr = Buffer.concat(stderrChunks).toString("utf8");
+        assert.equal(signal, null, `queue owner should exit gracefully; stderr=${stderr}`);
+        assert.equal(code, 0, `expected queue owner exit code 0; stderr=${stderr}`);
+        assert.equal(await fileExists(lockPath), false);
+      } finally {
+        socket?.destroy();
         if (child.exitCode == null && child.signalCode == null) {
           child.kill("SIGKILL");
         }

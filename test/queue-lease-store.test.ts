@@ -758,7 +758,7 @@ test("readQueueOwnerStatus returns live owner details for a healthy owner", asyn
   });
 });
 
-test("ensureOwnerIsUsable cleans up stale live owners", async (t) => {
+test("ensureOwnerIsUsable preserves stale live owners", async (t) => {
   await withTempHome(async (homeDir) => {
     const sessionId = "stale-live-owner";
     const keeper = await startKeeperProcess();
@@ -781,16 +781,16 @@ test("ensureOwnerIsUsable cleans up stale live owners", async (t) => {
 
       const owner = await readQueueOwnerRecord(sessionId);
       assert(owner);
-      assert.equal(await ensureOwnerIsUsable(sessionId, owner), false);
-      assert.equal(await readQueueOwnerRecord(sessionId), undefined);
-      assert.equal(isProcessAlive(keeper.pid), false);
+      assert.equal(await ensureOwnerIsUsable(sessionId, owner), true);
+      assert.equal((await readQueueOwnerRecord(sessionId))?.pid, keeper.pid);
+      assert.equal(isProcessAlive(keeper.pid), true);
     } finally {
       stopProcess(keeper);
     }
   });
 });
 
-test("stale cleanup preserves an owner refreshed before its cleanup claim", async () => {
+test("stale live owners remain usable while their lease refreshes", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "stale-owner-refreshed-before-claim";
     const keeper = await startKeeperProcess();
@@ -825,7 +825,7 @@ test("stale cleanup preserves an owner refreshed before its cleanup claim", asyn
       );
       await fs.rename(refreshedPath, lockPath);
 
-      assert.equal(await cleanup, false);
+      assert.equal(await cleanup, true);
       assert.equal(isProcessAlive(keeper.pid), true);
       assert.equal((await readQueueOwnerStatus(sessionId))?.alive, true);
     } finally {
@@ -839,7 +839,7 @@ test("stale cleanup preserves an owner refreshed before its cleanup claim", asyn
   });
 });
 
-test("tryAcquireQueueOwnerLease terminates stale live owners and acquires in the same attempt", async (t) => {
+test("tryAcquireQueueOwnerLease fails closed for stale live owners", async (t) => {
   await withTempHome(async (homeDir) => {
     const sessionId = "stale-live-owner-acquire";
     const keeper = await startKeeperProcess();
@@ -861,10 +861,9 @@ test("tryAcquireQueueOwnerLease terminates stale live owners and acquires in the
       });
 
       const lease = await tryAcquireQueueOwnerLease(sessionId);
-      assert(lease);
-      assert.equal((await readQueueOwnerRecord(sessionId))?.ownerGeneration, lease.ownerGeneration);
-      assert.equal(isProcessAlive(keeper.pid), false);
-      await releaseQueueOwnerLease(lease);
+      assert.equal(lease, undefined);
+      assert.equal((await readQueueOwnerRecord(sessionId))?.pid, keeper.pid);
+      assert.equal(isProcessAlive(keeper.pid), true);
     } finally {
       stopProcess(keeper);
     }

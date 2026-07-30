@@ -755,7 +755,7 @@ test("SessionQueueOwner rejects no-wait prompts when queue depth exceeds the lim
   });
 });
 
-test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", async () => {
+test("trySubmitToRunningOwner preserves a live owner after protocol mismatch", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "submit-stale-owner-protocol-mismatch";
     const keeper = await startKeeperProcess();
@@ -790,15 +790,19 @@ test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", asy
     await listenServer(server, socketPath);
 
     try {
-      const outcome = await trySubmitToRunningOwner({
-        sessionId,
-        message: "hello",
-        permissionMode: "approve-reads",
-        outputFormatter: NOOP_OUTPUT_FORMATTER,
-        waitForCompletion: true,
-      });
-      assert.equal(outcome, undefined);
-      await assert.rejects(fs.access(lockPath));
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        QueueProtocolError,
+      );
+      await fs.access(lockPath);
+      assert.equal(keeper.exitCode == null && keeper.signalCode == null, true);
     } finally {
       await closeServer(server);
       await cleanupOwnerArtifacts({ socketPath, lockPath });
@@ -1010,7 +1014,7 @@ test("trySubmitToRunningOwner rejects MCP config changes for a live owner", asyn
   });
 });
 
-test("trySubmitToRunningOwner recovers stale legacy owners before MCP conflict checks", async () => {
+test("trySubmitToRunningOwner preserves stale live legacy owners", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "submit-stale-mcp-config-owner";
     const keeper = await startKeeperProcess();
@@ -1026,20 +1030,26 @@ test("trySubmitToRunningOwner recovers stale legacy owners before MCP conflict c
     });
 
     try {
-      const outcome = await trySubmitToRunningOwner({
-        sessionId,
-        message: "hello",
-        mcpConfigPath: "/tmp/new-mcp.json",
-        mcpConfigFingerprint: "fingerprint-v2",
-        permissionMode: "approve-reads",
-        outputFormatter: NOOP_OUTPUT_FORMATTER,
-        waitForCompletion: true,
-      });
-      assert.equal(outcome, undefined);
-      await assert.rejects(fs.access(lockPath));
-      // Legacy leases have no process identity. Retire the stale lease so the
-      // request can proceed, but do not signal a PID that may have been reused.
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            mcpConfigPath: "/tmp/new-mcp.json",
+            mcpConfigFingerprint: "fingerprint-v2",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_MCP_CONFIG_CONFLICT");
+          return true;
+        },
+      );
+      await fs.access(lockPath);
       assert.equal(keeper.exitCode == null && keeper.signalCode == null, true);
+      assert.equal(await tryAcquireQueueOwnerLease(sessionId), undefined);
     } finally {
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);

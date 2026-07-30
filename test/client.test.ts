@@ -1401,6 +1401,24 @@ test("AcpClient close records the adapter exit while initialization is still pen
   }
 });
 
+test("AcpClient close cancels a start request before launch preparation resumes", async () => {
+  const client = makeClient();
+  const internals = asInternals(client) as ReturnType<typeof asInternals> & {
+    resolveAgentLaunchPlan: () => Promise<never>;
+  };
+  let launchPreparationCalls = 0;
+  internals.resolveAgentLaunchPlan = async () => {
+    launchPreparationCalls += 1;
+    throw new Error("launch preparation must not run after close");
+  };
+
+  const startResult = client.start();
+  await client.close();
+
+  await assert.rejects(startResult, /closed during startup/u);
+  assert.equal(launchPreparationCalls, 0);
+});
+
 test("AcpClient close resets in-memory state and shuts down terminal manager", async () => {
   const client = makeClient();
   const internals = asInternals(client);

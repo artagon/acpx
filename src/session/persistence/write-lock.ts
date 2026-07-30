@@ -83,18 +83,26 @@ async function tryCreateSessionWriteLock(
   lockPath: string,
   lockRecord: SessionWriteLockRecord,
 ): Promise<boolean> {
+  const tempPath = `${lockPath}.${process.pid}.${lockRecord.lockId}.tmp`;
   try {
-    await fs.writeFile(lockPath, `${JSON.stringify(lockRecord)}\n`, {
+    await fs.writeFile(tempPath, `${JSON.stringify(lockRecord)}\n`, {
       encoding: "utf8",
       flag: "wx",
       mode: 0o600,
     });
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      return false;
+    try {
+      await fs.link(tempPath, lockPath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        return false;
+      }
+      throw error;
     }
-    throw error;
+  } finally {
+    await fs.rm(tempPath, { force: true }).catch(() => {
+      // best-effort cleanup after publication or contention
+    });
   }
 }
 

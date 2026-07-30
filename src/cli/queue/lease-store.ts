@@ -14,6 +14,8 @@ const QUEUE_OWNER_CLEANUP_CLAIM_WAIT_MS = 1_000;
 const QUEUE_OWNER_CLEANUP_CLAIM_POLL_MS = 10;
 const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
 const QUEUE_OWNER_MALFORMED_LOCK_STALE_MS = QUEUE_OWNER_STALE_HEARTBEAT_MS;
+const QUEUE_OWNER_RELEASE_WAIT_MS = 6_500;
+const QUEUE_OWNER_RELEASE_POLL_MS = 50;
 
 export type QueueOwnerRecord = {
   pid: number;
@@ -243,7 +245,7 @@ async function resolveQueueOwnerForCleanup(
     return false;
   }
   const processState = await queueOwnerProcessState(currentOwner);
-  return ownerShouldBePreserved(processState, currentOwner) ? false : currentOwner;
+  return ownerShouldBePreserved(processState) ? false : currentOwner;
 }
 
 async function claimQueueOwnerLockForCleanup(
@@ -533,25 +535,14 @@ async function queueOwnerProcessState(owner: QueueOwnerRecord): Promise<QueueOwn
   return currentIdentity === owner.processIdentity ? "matching" : "mismatch";
 }
 
-function ownerMayStillBeUsable(
-  processState: QueueOwnerProcessState,
-  owner: QueueOwnerRecord,
-): boolean {
-  // A fresh legacy lease may belong to an older acpx owner. Preserve it long
-  // enough for the authenticated socket handshake, but never signal its PID.
-  return (
-    (processState === "matching" || processState === "legacy") && !isQueueOwnerHeartbeatStale(owner)
-  );
+function ownerMayStillBeUsable(processState: QueueOwnerProcessState): boolean {
+  // A live owner must remain available for its generation-checked socket
+  // handshake. Heartbeat age alone cannot make replacing its lease safe.
+  return processState === "matching" || processState === "legacy" || processState === "unverified";
 }
 
-function ownerShouldBePreserved(
-  processState: QueueOwnerProcessState,
-  owner: QueueOwnerRecord,
-): boolean {
-  return (
-    ownerMayStillBeUsable(processState, owner) ||
-    (processState === "unverified" && !isQueueOwnerHeartbeatStale(owner))
-  );
+function ownerShouldBePreserved(processState: QueueOwnerProcessState): boolean {
+  return ownerMayStillBeUsable(processState);
 }
 
 async function readQueueOwnerLockClaimRecord(
@@ -662,10 +653,10 @@ export async function ensureOwnerIsUsable(
   owner: QueueOwnerRecord,
 ): Promise<boolean> {
   const processState = await queueOwnerProcessState(owner);
-  if (ownerMayStillBeUsable(processState, owner)) {
+  if (ownerMayStillBeUsable(processState)) {
     return true;
   }
-  if (ownerShouldBePreserved(processState, owner)) {
+  if (ownerShouldBePreserved(processState)) {
     return false;
   }
 
@@ -815,7 +806,7 @@ async function handleLeaseCollision(sessionId: string, error: unknown): Promise<
     return false;
   }
 
-  if (ownerShouldBePreserved(await queueOwnerProcessState(owner), owner)) {
+  if (ownerShouldBePreserved(await queueOwnerProcessState(owner))) {
     return false;
   }
   return await retireStaleQueueOwner(sessionId, owner);
@@ -983,6 +974,23 @@ export async function terminateQueueOwnerForSession(sessionId: string): Promise<
     }
     throw new Error(`Queue owner cleanup is busy for session ${sessionId}; retry the operation`);
   }
+}
+
+export async function waitForQueueOwnerGenerationRelease(
+  sessionId: string,
+  ownerGeneration: number,
+  timeoutMs = QUEUE_OWNER_RELEASE_WAIT_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() <= deadline) {
+    const owner = await readQueueOwnerRecord(sessionId);
+    if (!owner || owner.ownerGeneration !== ownerGeneration) {
+      return true;
+    }
+    await waitMs(QUEUE_OWNER_RELEASE_POLL_MS);
+  }
+  const owner = await readQueueOwnerRecord(sessionId);
+  return !owner || owner.ownerGeneration !== ownerGeneration;
 }
 
 export async function waitMs(ms: number): Promise<void> {

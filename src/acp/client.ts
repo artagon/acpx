@@ -631,9 +631,11 @@ export class AcpClient {
   }
 
   async start(): Promise<void> {
+    const requestedGeneration = this.lifecycleGeneration;
     if (!(await this.prepareForStart())) {
       return;
     }
+    this.assertStartupRequestIsCurrent(requestedGeneration);
 
     const startupGeneration = ++this.lifecycleGeneration;
     this.closing = false;
@@ -703,6 +705,12 @@ export class AcpClient {
       await this.close();
     }
     return true;
+  }
+
+  private assertStartupRequestIsCurrent(requestedGeneration: number): void {
+    if (this.closing || requestedGeneration !== this.lifecycleGeneration) {
+      throw new Error("ACP client closed during startup");
+    }
   }
 
   private assertStartupIsCurrent(startupGeneration: number): void {

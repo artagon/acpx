@@ -20,12 +20,14 @@ import type {
   SessionSetModeResult,
 } from "../../types.js";
 import {
+  readQueueOwnerRecord,
   terminateQueueOwnerForSession,
   tryCancelOnRunningOwner,
   tryCloseSessionOnRunningOwner,
   trySetConfigOptionOnRunningOwner,
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
+  waitForQueueOwnerGenerationRelease,
 } from "../queue/ipc.js";
 import type {
   SessionCancelOptions,
@@ -171,9 +173,17 @@ export const sessionControlTestInternals = { firstAgentCommandToken, splitComman
 
 export async function closeSession(sessionId: string): Promise<SessionRecord> {
   const record = await resolveSessionRecord(sessionId);
-  await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId }).catch(() => {
-    // Preserve local close semantics even if best-effort ACP session shutdown fails.
-  });
-  await terminateQueueOwnerForSession(record.acpxRecordId);
+  const queueOwner = await readQueueOwnerRecord(record.acpxRecordId);
+  if (queueOwner) {
+    const closeResult = await tryCloseSessionOnRunningOwner({
+      sessionId: record.acpxRecordId,
+    }).catch(() => undefined);
+    if (
+      closeResult === undefined ||
+      !(await waitForQueueOwnerGenerationRelease(record.acpxRecordId, queueOwner.ownerGeneration))
+    ) {
+      await terminateQueueOwnerForSession(record.acpxRecordId);
+    }
+  }
   return await closePersistedSession(record.acpxRecordId);
 }

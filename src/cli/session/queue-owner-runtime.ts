@@ -444,7 +444,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           await applyPendingCancel();
           return true;
         },
-        closeSession: async (timeoutMs?: number) => await closeActiveBackendSession(timeoutMs),
+        closeSession: async (timeoutMs?: number) => {
+          const closed = await closeActiveBackendSession(timeoutMs);
+          setImmediate(() => {
+            shutdown.request();
+          });
+          return closed;
+        },
         setSessionMode: async (modeId: string, timeoutMs?: number) => {
           await turnController.setSessionMode(modeId, timeoutMs);
         },
