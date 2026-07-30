@@ -258,6 +258,30 @@ test("tryAcquireQueueOwnerLease removes a malformed lock only after it is stale"
   });
 });
 
+test("stale cleanup never trusts a persisted socket path outside the queue directory", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "untrusted-socket-path";
+    const { lockPath } = queuePaths(homeDir, sessionId);
+    const unrelatedPath = path.join(homeDir, "unrelated-user-file");
+    await fs.writeFile(unrelatedPath, "preserve me\n", "utf8");
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: 999_999,
+      sessionId,
+      socketPath: unrelatedPath,
+      heartbeatAt: "2000-01-01T00:00:00.000Z",
+    });
+    const staleTime = new Date("2000-01-01T00:00:00.000Z");
+    await fs.utimes(lockPath, staleTime, staleTime);
+
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+
+    assert(lease);
+    assert.equal(await fs.readFile(unrelatedPath, "utf8"), "preserve me\n");
+    await releaseQueueOwnerLease(lease);
+  });
+});
+
 test(
   "tryAcquireQueueOwnerLease ages out a stale dangling symlink lock",
   { skip: process.platform === "win32" },

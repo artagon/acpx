@@ -641,7 +641,7 @@ export class AcpClient {
     this.agentStartedAt = isoNow();
     this.lastAgentExit = undefined;
     this.lastKnownPid = child.pid ?? undefined;
-    this.attachAgentLifecycleObservers(child);
+    this.attachAgentLifecycleObservers(child, startupGeneration);
     const startupStderr: string[] = [];
 
     child.stderr.on("data", (chunk: Buffer | string) => {
@@ -662,7 +662,12 @@ export class AcpClient {
     connection.signal.addEventListener(
       "abort",
       () => {
-        this.recordAgentExit("connection_close", child.exitCode ?? null, child.signalCode ?? null);
+        this.recordAgentExit(
+          "connection_close",
+          child.exitCode ?? null,
+          child.signalCode ?? null,
+          startupGeneration,
+        );
       },
       { once: true },
     );
@@ -1424,7 +1429,6 @@ export class AcpClient {
 
   private async closeInternal(): Promise<void> {
     this.closing = true;
-    this.lifecycleGeneration += 1;
 
     await this.terminalManager.shutdown();
 
@@ -1922,17 +1926,23 @@ export class AcpClient {
 
   private attachAgentLifecycleObservers(
     child: ChildProcessByStdio<Writable, Readable, Readable>,
+    lifecycleGeneration: number,
   ): void {
     child.once("exit", (exitCode, signal) => {
-      this.recordAgentExit("process_exit", exitCode, signal);
+      this.recordAgentExit("process_exit", exitCode, signal, lifecycleGeneration);
     });
 
     child.once("close", (exitCode, signal) => {
-      this.recordAgentExit("process_close", exitCode, signal);
+      this.recordAgentExit("process_close", exitCode, signal, lifecycleGeneration);
     });
 
     child.stdout.once("close", () => {
-      this.recordAgentExit("pipe_close", child.exitCode ?? null, child.signalCode ?? null);
+      this.recordAgentExit(
+        "pipe_close",
+        child.exitCode ?? null,
+        child.signalCode ?? null,
+        lifecycleGeneration,
+      );
     });
   }
 
@@ -1940,7 +1950,11 @@ export class AcpClient {
     reason: AgentDisconnectReason,
     exitCode: number | null,
     signal: NodeJS.Signals | null,
+    lifecycleGeneration?: number,
   ): void {
+    if (lifecycleGeneration !== undefined && lifecycleGeneration !== this.lifecycleGeneration) {
+      return;
+    }
     if (this.lastAgentExit) {
       return;
     }

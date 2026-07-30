@@ -18,6 +18,7 @@ type SessionModule = typeof import("../src/session/session.js");
 
 const SESSION_MODULE_URL = new URL("../src/session/session.js", import.meta.url);
 const SESSION_REPOSITORY_URL = new URL("../src/session/persistence/repository.js", import.meta.url);
+const SESSION_WRITE_LOCK_URL = new URL("../src/session/persistence/write-lock.js", import.meta.url);
 
 test("SessionRecord allows optional closed and closedAt fields", () => {
   const record = makeSessionRecord({
@@ -564,6 +565,47 @@ test("writeSessionRecord maintains an index and listSessions rebuilds it when mi
   });
 });
 
+test("a dirty marker rebuilds index metadata after an interrupted record update", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const recordPath = sessionFilePath(homeDir, "dirty-index-session");
+    const dirtyPath = path.join(sessionDir, ".index.dirty");
+    const cwd = path.join(homeDir, "repo");
+    const initial = makeSessionRecord({
+      acpxRecordId: "dirty-index-session",
+      acpSessionId: "dirty-index-session",
+      agentCommand: "agent-a",
+      cwd,
+      closed: false,
+    });
+    await writeSessionRecord(homeDir, initial);
+    await session.listSessions();
+
+    await fs.writeFile(
+      recordPath,
+      `${JSON.stringify(
+        serializeSessionRecordForDisk({
+          ...initial,
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await fs.writeFile(dirtyPath, "interrupted\n", "utf8");
+
+    const found = await session.findSession({
+      agentCommand: "agent-a",
+      cwd,
+    });
+    assert.equal(found, undefined);
+    assert.equal(await fileExists(dirtyPath), false);
+  });
+});
+
 test("writeSessionRecord serializes cross-process record and index publication", async () => {
   await withTempHome(async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
@@ -648,6 +690,58 @@ test("writeSessionRecord recovers a stale cross-process write lock", async () =>
   });
 });
 
+test("session write lock reentrancy canonicalizes symlink aliases", async () => {
+  await withTempHome(async (homeDir) => {
+    const realSessionDir = path.join(homeDir, "real-sessions");
+    const aliasSessionDir = path.join(homeDir, "session-alias");
+    await fs.mkdir(realSessionDir, { recursive: true });
+    await fs.symlink(
+      realSessionDir,
+      aliasSessionDir,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const { withSessionWriteLock } = await import(
+      `${SESSION_WRITE_LOCK_URL.href}?symlink_reentrancy=${Date.now()}-${Math.random()}`
+    );
+    let nestedOperationRan = false;
+
+    await withSessionWriteLock(aliasSessionDir, async () => {
+      await withSessionWriteLock(realSessionDir, async () => {
+        nestedOperationRan = true;
+      });
+    });
+
+    assert.equal(nestedOperationRan, true);
+  });
+});
+
+test("session write locks preserve live owners without a verifiable process identity", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "live-legacy-writer",
+        pid: process.pid,
+        createdAt: "2000-01-01T00:00:00.000Z",
+      })}\n`,
+      "utf8",
+    );
+    const staleTime = new Date("2000-01-01T00:00:00.000Z");
+    await fs.utimes(lockPath, staleTime, staleTime);
+    const writeLockModule = await import(
+      `${SESSION_WRITE_LOCK_URL.href}?live_legacy=${Date.now()}-${Math.random()}`
+    );
+
+    assert.equal(
+      await writeLockModule.sessionWriteLockIsStale(lockPath, await fs.lstat(lockPath)),
+      false,
+    );
+  });
+});
+
 test("closeSession soft-closes and terminates matching process", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
@@ -690,6 +784,89 @@ test("closeSession soft-closes and terminates matching process", async () => {
         child.kill("SIGKILL");
       }
     }
+  });
+});
+
+test("closeSession does not signal a live process that does not match the recorded agent", async () => {
+  await withTempHome(async (homeDir) => {
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?close_process_match=${Date.now()}-${Math.random()}`
+    );
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+      stdio: "ignore",
+    });
+    await once(child, "spawn");
+
+    const sessionId = "mismatched-live-session";
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: sessionId,
+        acpSessionId: sessionId,
+        agentCommand: "definitely-not-the-node-runtime",
+        cwd: path.join(homeDir, "repo"),
+        pid: child.pid,
+      }),
+    );
+
+    try {
+      await repository.closeSession(sessionId);
+      await sleep(100);
+      assert.equal(await waitForExit(child.pid), false);
+    } finally {
+      stopChild(child);
+    }
+  });
+});
+
+test("closeSession reads and updates the record while holding the session write lock", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    const sessionId = "concurrent-close";
+    const initial = makeSessionRecord({
+      acpxRecordId: sessionId,
+      acpSessionId: sessionId,
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "repo"),
+      title: "initial title",
+    });
+    await writeSessionRecord(homeDir, initial);
+    await session.listSessions();
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "active-writer",
+        pid: process.pid,
+        createdAt: new Date().toISOString(),
+      })}\n`,
+      "utf8",
+    );
+
+    const closing = session.closeSession(sessionId);
+    await sleep(200);
+    await fs.writeFile(
+      sessionFilePath(homeDir, sessionId),
+      `${JSON.stringify(
+        serializeSessionRecordForDisk({
+          ...initial,
+          title: "concurrent title",
+        }),
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await fs.unlink(lockPath);
+
+    await closing;
+    const stored = parseSessionRecord(
+      JSON.parse(await fs.readFile(sessionFilePath(homeDir, sessionId), "utf8")),
+    );
+    assert.ok(stored);
+    assert.equal(stored.closed, true);
+    assert.equal(stored.title, "concurrent title");
   });
 });
 

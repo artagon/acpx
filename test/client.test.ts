@@ -80,6 +80,7 @@ type ClientInternals = {
     reason: "process_exit" | "process_close" | "pipe_close" | "connection_close",
     exitCode: number | null,
     signal: NodeJS.Signals | null,
+    lifecycleGeneration?: number,
   ) => void;
   filesystem?: {
     readTextFile: (params: {
@@ -140,6 +141,7 @@ type ClientInternals = {
   lastKnownPid?: number;
   agentStartedAt?: string;
   closing: boolean;
+  lifecycleGeneration: number;
   observedSessionUpdates: number;
   processedSessionUpdates: number;
   suppressSessionUpdates: boolean;
@@ -1174,6 +1176,18 @@ test("AcpClient lifecycle snapshot and cancel helpers reflect active prompt stat
   assert.deepEqual(cancelled, { stopReason: "cancelled" });
 });
 
+test("AcpClient ignores lifecycle events from an earlier agent generation", () => {
+  const client = makeClient();
+  const internals = asInternals(client);
+  internals.lifecycleGeneration = 2;
+
+  internals.recordAgentExit?.("process_exit", 1, "SIGTERM", 1);
+  assert.equal(client.getAgentLifecycleSnapshot().lastExit, undefined);
+
+  internals.recordAgentExit?.("process_exit", 0, null, 2);
+  assert.equal(client.getAgentLifecycleSnapshot().lastExit?.exitCode, 0);
+});
+
 test("AcpClient rejects rich prompt content not advertised by promptCapabilities", async () => {
   const client = makeClient();
   const internals = asInternals(client);
@@ -1348,7 +1362,7 @@ test("AcpClient startup failure kills descendants left by an exited npx wrapper"
   }
 });
 
-test("AcpClient close terminates an adapter while initialization is still pending", async (t) => {
+test("AcpClient close records the adapter exit while initialization is still pending", async (t) => {
   if (process.platform === "win32") {
     t.skip("POSIX process-group cleanup assertion");
     return;
@@ -1373,6 +1387,11 @@ test("AcpClient close terminates an adapter while initialization is still pendin
       await waitForPidExit(pid),
       true,
       "close must terminate the detached adapter before initialization finishes",
+    );
+    assert.equal(
+      typeof client.getAgentLifecycleSnapshot().lastExit?.exitedAt,
+      "string",
+      "close must retain the current adapter's exit lifecycle",
     );
     assert.equal((await startResult).type, "rejected");
   } finally {

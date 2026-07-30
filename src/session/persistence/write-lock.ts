@@ -30,7 +30,10 @@ export async function withSessionWriteLock<T>(
   sessionDir: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const lockPath = path.join(path.resolve(sessionDir), SESSION_WRITE_LOCK_FILE);
+  const resolvedSessionDir = path.resolve(sessionDir);
+  await fs.mkdir(resolvedSessionDir, { recursive: true });
+  const canonicalSessionDir = await fs.realpath(resolvedSessionDir);
+  const lockPath = path.join(canonicalSessionDir, SESSION_WRITE_LOCK_FILE);
   const heldLocks = heldSessionWriteLocks.getStore();
   if (heldLocks?.has(lockPath)) {
     return await operation();
@@ -124,7 +127,7 @@ async function recoverStaleSessionWriteLock(lockPath: string): Promise<boolean> 
   return true;
 }
 
-async function sessionWriteLockIsStale(lockPath: string, stat: Stats): Promise<boolean> {
+export async function sessionWriteLockIsStale(lockPath: string, stat: Stats): Promise<boolean> {
   const record = await readSessionWriteLockRecord(lockPath);
   if (!record) {
     return lockAgeMs(stat) > SESSION_WRITE_LOCK_UNVERIFIED_STALE_MS;
@@ -133,12 +136,10 @@ async function sessionWriteLockIsStale(lockPath: string, stat: Stats): Promise<b
     return true;
   }
   if (!record.processIdentity) {
-    return lockAgeMs(stat) > SESSION_WRITE_LOCK_UNVERIFIED_STALE_MS;
+    return false;
   }
   const currentIdentity = await readProcessIdentity(record.pid);
-  return currentIdentity
-    ? currentIdentity !== record.processIdentity
-    : lockAgeMs(stat) > SESSION_WRITE_LOCK_UNVERIFIED_STALE_MS;
+  return currentIdentity ? currentIdentity !== record.processIdentity : false;
 }
 
 function sessionWriterIsAlive(pid: number): boolean {

@@ -4,20 +4,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { readProcessIdentity } from "../../acp/process-tree.js";
 import { isProcessAlive } from "../../process-liveness.js";
+import { terminateProcess } from "../../process-termination.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir, queueSocketPath } from "./paths.js";
 
 export { isProcessAlive } from "../../process-liveness.js";
+export { terminateProcess } from "../../process-termination.js";
 
-// Budget for graceful SIGTERM shutdown of a queue-owner process.
-// The owner runs AcpClient.close() during shutdown:
-//   stdin-close grace (100 ms) + SIGTERM wait (1 500 ms) + SIGKILL wait (1 000 ms) = 2 600 ms worst case.
-// Process identity validation can add two bounded 1 000 ms process-list calls.
-// Add ~1 900 ms of headroom for those calls, event-loop latency, and process startup overhead.
-// If the owner does not exit within this window we escalate to SIGKILL.
-const PROCESS_SIGTERM_GRACE_MS = 6_500;
-// After SIGKILL the OS terminates the process almost immediately; 1 500 ms is generous.
-const PROCESS_SIGKILL_GRACE_MS = 1_500;
-const PROCESS_POLL_MS = 50;
 const QUEUE_OWNER_CLEANUP_CLAIM_WAIT_MS = 1_000;
 const QUEUE_OWNER_CLEANUP_CLAIM_POLL_MS = 10;
 const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
@@ -108,13 +100,21 @@ function hasValidQueueOwnerRecordFields(record: Record<string, unknown>): record
   return (
     isPositiveInteger(record.pid) &&
     isOptionalNonEmptyString(record.processIdentity) &&
-    typeof record.sessionId === "string" &&
-    typeof record.socketPath === "string" &&
+    hasValidQueueOwnerSocket(record) &&
     typeof record.createdAt === "string" &&
     typeof record.heartbeatAt === "string" &&
     isPositiveInteger(record.ownerGeneration) &&
     isNonNegativeInteger(record.queueDepth)
   );
+}
+
+function hasValidQueueOwnerSocket(
+  record: Record<string, unknown>,
+): record is Record<string, unknown> & { sessionId: string; socketPath: string } {
+  if (typeof record.sessionId !== "string" || typeof record.socketPath !== "string") {
+    return false;
+  }
+  return record.socketPath === queueSocketPath(record.sessionId);
 }
 
 function isPositiveInteger(value: unknown): value is number {
@@ -184,18 +184,6 @@ async function removeSocketFile(socketPath: string): Promise<void> {
   }
 }
 
-async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + Math.max(0, timeoutMs);
-  while (Date.now() <= deadline) {
-    if (!isProcessAlive(pid)) {
-      return true;
-    }
-    await waitMs(PROCESS_POLL_MS);
-  }
-
-  return !isProcessAlive(pid);
-}
-
 async function cleanupStaleQueueOwner(
   sessionId: string,
   owner: QueueOwnerRecord | undefined,
@@ -218,7 +206,9 @@ async function cleanupStaleQueueOwner(
       return false;
     }
     const socketPath = claimedOwner?.socketPath ?? queueSocketPath(sessionId);
-    await terminateClaimedQueueOwner(claimedOwner);
+    if (!(await terminateClaimedQueueOwner(claimedOwner))) {
+      return false;
+    }
     await removeClaimedQueueOwnerFiles(claim, socketPath, lockPath);
     return true;
   } finally {
@@ -226,10 +216,18 @@ async function cleanupStaleQueueOwner(
   }
 }
 
-async function terminateClaimedQueueOwner(owner: QueueOwnerRecord | undefined): Promise<void> {
-  if (owner?.processIdentity && owner.pid !== process.pid) {
-    await terminateProcess(owner.pid, owner.processIdentity);
+async function terminateClaimedQueueOwner(owner: QueueOwnerRecord | undefined): Promise<boolean> {
+  if (!owner || owner.pid === process.pid) {
+    return true;
   }
+  const processState = await queueOwnerProcessState(owner);
+  if (processState === "dead" || processState === "mismatch" || processState === "legacy") {
+    return true;
+  }
+  if (processState === "unverified" || !owner.processIdentity) {
+    return false;
+  }
+  return await terminateProcess(owner.pid, owner.processIdentity);
 }
 
 async function resolveQueueOwnerForCleanup(
@@ -657,54 +655,6 @@ async function readQueueOwnerRecordAtPath(lockPath: string): Promise<QueueOwnerR
   } catch {
     return undefined;
   }
-}
-
-export async function terminateProcess(
-  pid: number,
-  expectedProcessIdentity?: string,
-): Promise<boolean> {
-  if (!isProcessAlive(pid)) {
-    return false;
-  }
-  if (!(await processMayBeSignaled(pid, expectedProcessIdentity))) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    return false;
-  }
-
-  if (await waitForProcessExit(pid, PROCESS_SIGTERM_GRACE_MS)) {
-    return true;
-  }
-  if (!(await processMayBeSignaled(pid, expectedProcessIdentity))) {
-    return true;
-  }
-
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    return false;
-  }
-
-  await waitForProcessExit(pid, PROCESS_SIGKILL_GRACE_MS);
-  return true;
-}
-
-async function processMayBeSignaled(
-  pid: number,
-  expectedProcessIdentity: string | undefined,
-): Promise<boolean> {
-  return (
-    expectedProcessIdentity === undefined ||
-    (await processIdentityMatches(pid, expectedProcessIdentity))
-  );
-}
-
-async function processIdentityMatches(pid: number, expectedIdentity: string): Promise<boolean> {
-  return (await readProcessIdentity(pid)) === expectedIdentity;
 }
 
 export async function ensureOwnerIsUsable(

@@ -81,6 +81,51 @@ test("pruneSessions deletes closed session files and removes them from the index
   });
 });
 
+test("pruneSessions waits for the cross-process session write lock", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "locked-prune",
+        acpSessionId: "locked-prune",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await session.listSessions();
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "active-writer",
+        pid: process.pid,
+        createdAt: new Date().toISOString(),
+      })}\n`,
+      "utf8",
+    );
+
+    const pruning = session.pruneSessions({ agentCommand: "agent-a" });
+    const completedEarly = await Promise.race([
+      pruning.then(() => true),
+      new Promise<false>((resolve) => {
+        setTimeout(() => resolve(false), 500);
+      }),
+    ]);
+    assert.equal(completedEarly, false);
+    assert.equal(await fileExists(sessionFilePath(homeDir, "locked-prune")), true);
+
+    await fs.unlink(lockPath);
+    const result = await pruning;
+    assert.equal(result.pruned.map((record) => record.acpxRecordId).join(","), "locked-prune");
+  });
+});
+
 test("pruneSessions --dry-run does not delete files but returns correct count", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
