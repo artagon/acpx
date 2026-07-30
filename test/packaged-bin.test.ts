@@ -217,6 +217,34 @@ test("packaged bin prints version with top-level output flags", async (t) => {
   });
 });
 
+test("SEA preserves top-level version and help short-circuits before flow delegation", async (t) => {
+  if (!process.env.ACPX_TEST_PACKAGE_BIN) {
+    t.skip("set ACPX_TEST_PACKAGE_BIN to a SEA before running this smoke test");
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const cases = [
+      { args: ["--version", "flow"], expected: readPackageVersion() },
+      { args: ["-V", "flow"], expected: readPackageVersion() },
+      { args: ["--help", "flow"], expected: "Usage: acpx" },
+      { args: ["-h", "flow"], expected: "Usage: acpx" },
+    ];
+
+    for (const testCase of cases) {
+      const result = await runPackageBin(testCase.args, homeDir, 15_000, {
+        PATH: homeDir,
+      });
+
+      assert.equal(result.code, 0, `${testCase.args.join(" ")}\n${result.stderr}`);
+      assert.equal(result.signal, null);
+      assert.equal(result.stderr, "");
+      assert.match(result.stdout, new RegExp(testCase.expected.replaceAll(".", "\\.")));
+      assert.doesNotMatch(result.stdout, /Unable to start SEA flow runtime/);
+    }
+  });
+});
+
 test("SEA build SBOM identifies the embedded esbuild runtime and platform binary", (t) => {
   if (!process.env.ACPX_TEST_PACKAGE_BIN || !existsSync(DIST_SEA_SBOM_PATH)) {
     t.skip("build the SEA and set ACPX_TEST_PACKAGE_BIN before checking its SBOM");
@@ -545,6 +573,124 @@ test("SEA flow delegation forwards termination signals and removes its temp runt
       });
     });
   }
+});
+
+test("SEA signal cleanup reaps a detached ACP adapter before the launcher exits", async (t) => {
+  if (!process.env.ACPX_TEST_PACKAGE_BIN) {
+    t.skip("set ACPX_TEST_PACKAGE_BIN to a SEA before running this smoke test");
+    return;
+  }
+  if (process.platform === "win32") {
+    t.skip("POSIX signal semantics are unavailable on Windows");
+    return;
+  }
+
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const adapterPidPath = path.join(homeDir, "adapter.pid");
+    const promptActivePath = path.join(homeDir, "prompt-active");
+    const blockingTerminalPath = path.join(homeDir, "blocking-terminal.cjs");
+    const flowPath = path.join(homeDir, "blocking-adapter.flow.mjs");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.writeFile(
+      blockingTerminalPath,
+      [
+        'const fs = require("node:fs");',
+        'fs.writeFileSync(process.argv[2], "ready\\n", "utf8");',
+        "setInterval(() => {}, 1_000);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const terminalPrompt = [
+      "terminal",
+      JSON.stringify(process.execPath),
+      JSON.stringify(blockingTerminalPath),
+      JSON.stringify(promptActivePath),
+    ].join(" ");
+    await fs.writeFile(
+      flowPath,
+      [
+        'import { acp, defineFlow } from "acpx/flows";',
+        "export default defineFlow({",
+        '  name: "packaged-adapter-signal-flow",',
+        '  startAt: "wait",',
+        "  nodes: {",
+        "    wait: acp({",
+        `      prompt: async () => ${JSON.stringify(terminalPrompt)},`,
+        "    }),",
+        "  },",
+        "  edges: [],",
+        "});",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const agentCommand = [
+      JSON.stringify(process.execPath),
+      JSON.stringify(MOCK_AGENT_PATH),
+      "--ignore-sigterm",
+      "--cancel-delay-ms",
+      "3000",
+      "--pid-file",
+      JSON.stringify(adapterPidPath),
+    ].join(" ");
+    const command = packageBinSpawnArgs([
+      "--agent",
+      agentCommand,
+      "--approve-all",
+      "--cwd",
+      cwd,
+      "flow",
+      "run",
+      flowPath,
+    ]);
+    const child = spawn(command.command, command.args, {
+      env: { ...process.env, HOME: homeDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let adapterPid: number | undefined;
+    let stderr = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    try {
+      await waitForCondition(
+        `blocking ACP prompt marker ${promptActivePath}`,
+        () => existsSync(promptActivePath),
+        10_000,
+      );
+      adapterPid = Number((await fs.readFile(adapterPidPath, "utf8")).trim());
+      assert.equal(Number.isInteger(adapterPid) && adapterPid > 0, true);
+      assert.equal(isProcessAlive(adapterPid), true);
+
+      const exitPromise = waitForChildExit(child, 12_000);
+      assert.equal(child.kill("SIGTERM"), true);
+      const parentExit = await exitPromise;
+      assert.equal(parentExit.code, null, stderr);
+      assert.equal(parentExit.signal, "SIGTERM", stderr);
+      assert.equal(
+        isProcessAlive(adapterPid),
+        false,
+        `detached ACP adapter PID ${adapterPid} survived SEA signal cleanup`,
+      );
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      if (adapterPid !== undefined && isProcessAlive(adapterPid)) {
+        process.kill(adapterPid, "SIGKILL");
+        await waitForCondition(
+          `test-owned adapter PID ${adapterPid} cleanup`,
+          () => !isProcessAlive(adapterPid as number),
+          5_000,
+        );
+      }
+    }
+  });
 });
 
 test("packaged bin serializes concurrent cold prompts through one detached queue owner", async (t) => {

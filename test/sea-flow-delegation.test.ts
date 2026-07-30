@@ -14,7 +14,9 @@ type FixtureProcess = {
   stdout: () => string;
 };
 
-function startFixture(mode: "operation-error" | "signal" | "success"): FixtureProcess {
+function startFixture(
+  mode: "operation-error" | "signal" | "stubborn-descendant" | "success",
+): FixtureProcess {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env.NODE_V8_COVERAGE;
   const child = spawn(process.execPath, [CLEANUP_FAILURE_FIXTURE, mode], {
@@ -69,6 +71,27 @@ async function waitForReadyPid(fixture: FixtureProcess): Promise<number> {
   }
 }
 
+async function waitForReadyProcessTree(
+  fixture: FixtureProcess,
+): Promise<{ delegatedPid: number; descendantPid: number }> {
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    const match = /^READY (\d+) (\d+)$/m.exec(fixture.stdout());
+    if (match) {
+      return {
+        delegatedPid: Number(match[1]),
+        descendantPid: Number(match[2]),
+      };
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for delegated process tree: ${fixture.stderr()}`);
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 25);
+    });
+  }
+}
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -79,6 +102,19 @@ function isProcessAlive(pid: number): boolean {
     }
     throw error;
   }
+}
+
+async function waitForPidExit(pid: number, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) {
+      return true;
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 25);
+    });
+  }
+  return !isProcessAlive(pid);
 }
 
 test("SEA flow delegation surfaces cleanup failure after a successful child", async () => {
@@ -127,5 +163,41 @@ test("SEA flow delegation preserves forwarded signals when cleanup fails", async
         }
       }
     });
+  }
+});
+
+test("SEA flow delegation kills stubborn process-group descendants after the child exits", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX process-group cleanup assertion");
+    return;
+  }
+
+  const fixture = startFixture("stubborn-descendant");
+  let delegatedPid: number | undefined;
+  let descendantPid: number | undefined;
+
+  try {
+    const processTree = await waitForReadyProcessTree(fixture);
+    delegatedPid = processTree.delegatedPid;
+    descendantPid = processTree.descendantPid;
+    assert.equal(fixture.child.kill("SIGTERM"), true);
+
+    const result = await fixture.exited;
+    assert.equal(result.code, null, fixture.stderr());
+    assert.equal(result.signal, "SIGTERM", fixture.stderr());
+    assert.equal(
+      await waitForPidExit(processTree.descendantPid),
+      true,
+      `delegated descendant PID ${processTree.descendantPid} survived signal cleanup`,
+    );
+  } finally {
+    if (fixture.child.exitCode === null && fixture.child.signalCode === null) {
+      fixture.child.kill("SIGKILL");
+    }
+    for (const pid of [delegatedPid, descendantPid]) {
+      if (pid !== undefined && isProcessAlive(pid)) {
+        process.kill(pid, "SIGKILL");
+      }
+    }
   }
 });

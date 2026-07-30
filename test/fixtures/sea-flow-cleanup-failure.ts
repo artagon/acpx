@@ -18,6 +18,24 @@ const getAsset = (key: string): ArrayBuffer => {
   if (mode === "operation-error") {
     throw new Error("injected operation failure");
   }
+  if (key === "acpx-flow-cli" && mode === "stubborn-descendant") {
+    return toArrayBuffer(
+      [
+        'const { spawn } = require("node:child_process");',
+        "const descendant = spawn(",
+        "  process.execPath,",
+        '  ["-e", "process.on(\\"SIGTERM\\", () => {}); process.stdout.write(\\"READY\\\\n\\"); setInterval(() => {}, 1_000);"],',
+        '  { stdio: ["ignore", "pipe", "ignore"] },',
+        ");",
+        'descendant.stdout.once("data", () => {',
+        "  process.stdout.write(`READY ${process.pid} ${descendant.pid}\\n`);",
+        '  process.on("SIGTERM", () => process.exit(0));',
+        "});",
+        "setInterval(() => {}, 1_000);",
+        "",
+      ].join("\n"),
+    );
+  }
   if (key === "acpx-flow-cli" && mode === "signal") {
     return toArrayBuffer(
       "process.stdout.write(`READY ${process.pid}\\n`);\nsetInterval(() => {}, 1_000);\n",
