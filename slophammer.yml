@@ -29,6 +29,11 @@ typescript:
         - src/async-control
         - src/errors
         - src/filesystem
+        # Instrumentation is cross-cutting and already reachable from src/cli,
+        # src/session, and src/runtime. The connect path is where startup
+        # latency is actually spent, so leaving src/acp out would measure
+        # everything except the part that matters.
+        - src/perf-metrics
         - src/permission-prompt
         - src/permissions
         - src/prompt-content
