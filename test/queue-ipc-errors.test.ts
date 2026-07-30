@@ -1010,7 +1010,7 @@ test("trySubmitToRunningOwner rejects MCP config changes for a live owner", asyn
   });
 });
 
-test("trySubmitToRunningOwner recovers stale owners before MCP conflict checks", async () => {
+test("trySubmitToRunningOwner recovers stale legacy owners before MCP conflict checks", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "submit-stale-mcp-config-owner";
     const keeper = await startKeeperProcess();
@@ -1037,7 +1037,9 @@ test("trySubmitToRunningOwner recovers stale owners before MCP conflict checks",
       });
       assert.equal(outcome, undefined);
       await assert.rejects(fs.access(lockPath));
-      assert.equal(keeper.exitCode == null && keeper.signalCode == null, false);
+      // Legacy leases have no process identity. Retire the stale lease so the
+      // request can proceed, but do not signal a PID that may have been reused.
+      assert.equal(keeper.exitCode == null && keeper.signalCode == null, true);
     } finally {
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);
