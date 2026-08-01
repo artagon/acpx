@@ -3,6 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { resolveWindowsCommand } from "../spawn-command-options.js";
 
 /**
  * Cache for capability probes that shell out to an agent CLI.
@@ -41,35 +42,92 @@ function cacheFilePath(homeDir: string = os.homedir()): string {
  * resolve them the same way before fingerprinting. Returns the input unchanged
  * when it already contains a separator.
  */
-async function resolveExecutablePath(command: string): Promise<string | undefined> {
-  if (command.includes(path.sep) || command.includes("/")) {
-    return command;
+export type ExecutableResolutionOptions = {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+};
+
+async function isExecutableFile(candidate: string): Promise<boolean> {
+  try {
+    const stats = await fs.stat(candidate);
+    if (!stats.isFile()) {
+      return false;
+    }
+    await fs.access(candidate, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
   }
-  const pathEntries = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+}
+
+async function firstExecutableCandidate(
+  pathEntries: readonly string[],
+  candidateNames: readonly string[],
+): Promise<string | undefined> {
   for (const entry of pathEntries) {
-    const candidate = path.join(entry, command);
-    try {
-      await fs.access(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch {
-      // Not here; keep looking.
+    for (const candidateName of candidateNames) {
+      const candidate = path.join(entry, candidateName);
+      if (await isExecutableFile(candidate)) {
+        return candidate;
+      }
     }
   }
   return undefined;
+}
+
+export async function resolveExecutablePath(
+  command: string,
+  options: ExecutableResolutionOptions = {},
+): Promise<string | undefined> {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  if (platform === "win32") {
+    return resolveWindowsCommand(command, env, cwd, false);
+  }
+  return await resolvePosixExecutablePath(command, env, cwd);
+}
+
+async function resolvePosixExecutablePath(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+): Promise<string | undefined> {
+  if (command.includes(path.sep) || command.includes("/")) {
+    return path.resolve(cwd, command);
+  }
+  const pathEntries = (env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .map((entry) => path.resolve(cwd, entry));
+  return await firstExecutableCandidate(pathEntries, [command]);
 }
 
 /**
  * Identifies the exact binary a capability answer belongs to. Returns undefined
  * when the path cannot be resolved or stat'd, which forces a live probe.
  */
-export async function fingerprintExecutable(binaryPath: string): Promise<string | undefined> {
+export async function fingerprintExecutable(
+  binaryPath: string,
+  options: ExecutableResolutionOptions = {},
+): Promise<string | undefined> {
   try {
-    const resolved = await resolveExecutablePath(binaryPath);
+    const platform = options.platform ?? process.platform;
+    if (platform === "win32") {
+      // Windows launchers may be stable, cwd-sensitive shims whose selected
+      // target cannot be inferred reliably from the launcher file itself.
+      return undefined;
+    }
+    const resolved = await resolveExecutablePath(binaryPath, options);
     if (!resolved) {
       return undefined;
     }
     const realPath = await fs.realpath(resolved);
     const stats = await fs.stat(realPath);
+    if (!stats.isFile()) {
+      return undefined;
+    }
     return createHash("sha256")
       .update(`${realPath}\0${stats.size}\0${stats.mtimeMs}`)
       .digest("hex")

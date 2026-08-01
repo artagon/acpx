@@ -766,12 +766,19 @@ export class AcpClient {
 
   private async ensureLaunchSupport(plan: AgentLaunchPlan): Promise<void> {
     if (plan.copilotAcp) {
-      await ensureCopilotAcpSupport(plan.spawnCommand);
+      await ensureCopilotAcpSupport(plan.spawnCommand, {
+        cwd: plan.spawnOptions.cwd,
+        env: plan.spawnOptions.env,
+      });
     }
     if (!plan.claudeAcp) {
       return;
     }
-    const claudeExe = resolveClaudeCodeExecutable(process.platform, plan.spawnOptions.env);
+    const claudeExe = resolveClaudeCodeExecutable(
+      process.platform,
+      plan.spawnOptions.env,
+      plan.spawnOptions.cwd,
+    );
     if (claudeExe) {
       plan.spawnOptions.env.CLAUDE_CODE_EXECUTABLE = claudeExe;
       this.log(`resolved system Claude Code executable: ${claudeExe}`);
@@ -786,6 +793,7 @@ export class AcpClient {
       plan.args,
       process.platform,
       plan.spawnOptions.env,
+      plan.spawnOptions.cwd,
     );
     const rootCreatedAfterMs = Date.now();
     const spawnedChild = spawn(spawnCommand.command, spawnCommand.args, {
