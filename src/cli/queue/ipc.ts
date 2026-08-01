@@ -51,57 +51,10 @@ export {
 } from "./lease-store.js";
 export type { QueueOwnerLease } from "./lease-store.js";
 
-const QUEUE_OWNER_STARTUP_GRACE_MS = 10_000;
 const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
 ]);
-
-function queueOwnerIsWithinStartupGrace(owner: QueueOwnerRecord): boolean {
-  const createdAt = Date.parse(owner.createdAt);
-  return Number.isFinite(createdAt) && Date.now() - createdAt < QUEUE_OWNER_STARTUP_GRACE_MS;
-}
-
-async function queueOwnerIsStillStarting(
-  sessionId: string,
-  expectedOwnerGeneration: number,
-): Promise<boolean> {
-  const latestOwner = await readQueueOwnerRecord(sessionId);
-  return (
-    !latestOwner ||
-    latestOwner.ownerGeneration !== expectedOwnerGeneration ||
-    queueOwnerIsWithinStartupGrace(latestOwner)
-  );
-}
-
-async function handleUnreachableQueueOwner(
-  sessionId: string,
-  owner: QueueOwnerRecord,
-): Promise<void> {
-  const health = await probeQueueOwnerHealth(sessionId);
-  if (!health.hasLease) {
-    return;
-  }
-
-  // The lease is intentionally acquired before the socket binds so competing
-  // cold starts cannot create multiple owners. A packaged SEA can need longer
-  // than the socket connector's retry window to deserialize under contention.
-  // Let sendSession's bounded startup loop keep polling only while the same
-  // owner is still inside its startup window; older unreachable owners retain
-  // the fail-closed QUEUE_NOT_ACCEPTING_REQUESTS behavior.
-  if (await queueOwnerIsStillStarting(sessionId, owner.ownerGeneration)) {
-    return;
-  }
-
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting queue requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
-}
 
 async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
   sessionId: string;
@@ -790,8 +743,19 @@ export async function trySubmitToRunningOwner(
     return submitted;
   }
 
-  await handleUnreachableQueueOwner(options.sessionId, owner);
-  return undefined;
+  const health = await probeQueueOwnerHealth(options.sessionId);
+  if (!health.hasLease) {
+    return undefined;
+  }
+
+  throw new QueueConnectionError(
+    "Session queue owner is running but not accepting queue requests",
+    {
+      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
+      origin: "queue",
+      retryable: true,
+    },
+  );
 }
 
 export async function tryCloseSessionOnRunningOwner(options: {

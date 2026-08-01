@@ -1,4 +1,4 @@
-import { randomInt, randomUUID } from "node:crypto";
+import { randomInt } from "node:crypto";
 import fs from "node:fs/promises";
 import { isProcessAlive } from "../../process-liveness.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir, queueSocketPath } from "./paths.js";
@@ -15,7 +15,6 @@ const PROCESS_SIGTERM_GRACE_MS = 4_000;
 const PROCESS_SIGKILL_GRACE_MS = 1_500;
 const PROCESS_POLL_MS = 50;
 const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
-const QUEUE_OWNER_MALFORMED_LOCK_STALE_MS = QUEUE_OWNER_STALE_HEARTBEAT_MS;
 
 export type QueueOwnerRecord = {
   pid: number;
@@ -190,43 +189,6 @@ async function cleanupStaleQueueOwner(
   });
 }
 
-function queueOwnerLockTempPath(lockPath: string): string {
-  return `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
-}
-
-async function writeQueueOwnerFileAtomically(
-  lockPath: string,
-  payload: string,
-  operation: "create" | "replace",
-): Promise<void> {
-  const tempPath = queueOwnerLockTempPath(lockPath);
-  try {
-    await fs.writeFile(tempPath, payload, {
-      encoding: "utf8",
-      flag: "wx",
-      mode: 0o600,
-    });
-    if (operation === "create") {
-      await fs.link(tempPath, lockPath);
-    } else {
-      await fs.rename(tempPath, lockPath);
-    }
-  } finally {
-    await fs.rm(tempPath, { force: true }).catch(() => {
-      // best-effort cleanup after publication or a failed collision
-    });
-  }
-}
-
-async function malformedQueueOwnerLockIsStale(lockPath: string): Promise<boolean> {
-  try {
-    const stat = await fs.stat(lockPath);
-    return Date.now() - stat.mtimeMs > QUEUE_OWNER_MALFORMED_LOCK_STALE_MS;
-  } catch {
-    return false;
-  }
-}
-
 async function retireStaleQueueOwner(
   sessionId: string,
   owner: QueueOwnerRecord | undefined,
@@ -349,7 +311,10 @@ export async function tryAcquireQueueOwnerLease(
   );
 
   try {
-    await writeQueueOwnerFileAtomically(lockPath, `${payload}\n`, "create");
+    await fs.writeFile(lockPath, `${payload}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
     await removeSocketFile(socketPath).catch(() => {
       // best-effort stale socket cleanup after ownership is acquired
     });
@@ -398,10 +363,7 @@ async function handleLeaseCollision(sessionId: string, error: unknown): Promise<
 
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
-    const lockPath = queueLockFilePath(sessionId);
-    if (await malformedQueueOwnerLockIsStale(lockPath)) {
-      await cleanupStaleQueueOwner(sessionId, owner);
-    }
+    await cleanupStaleQueueOwner(sessionId, owner);
     return undefined;
   }
 
@@ -456,7 +418,9 @@ export async function refreshQueueOwnerLease(
     null,
     2,
   );
-  await writeQueueOwnerFileAtomically(lease.lockPath, `${payload}\n`, "replace");
+  await fs.writeFile(lease.lockPath, `${payload}\n`, {
+    encoding: "utf8",
+  });
 }
 
 export async function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<void> {
