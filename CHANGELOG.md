@@ -23,11 +23,6 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
-- Session queue owner: keep polling during the bounded cold-start window when a
-  live owner has acquired its lease but has not bound its IPC socket yet,
-  preventing concurrent SEA prompts from failing prematurely while preserving
-  fail-closed behavior for older unreachable owners.
-
 ## 2026.7.27 (v0.13.0)
 
 ### Highlights
