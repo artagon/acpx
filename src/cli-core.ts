@@ -20,7 +20,8 @@ import {
   parseTtlSeconds,
   resolveOutputPolicy,
 } from "./cli/flags.js";
-import { createOutputFormatter, getTextErrorRemediationHints } from "./cli/output/output.js";
+// output.ts is ~1300 lines and is only reached on error/format paths, so it is
+// loaded at its call sites rather than eagerly.
 import { runQueueOwnerFromEnv } from "./cli/queue/owner-env.js";
 import { flushPerfMetricsCapture, installPerfMetricsCapture } from "./perf-metrics-capture.js";
 import { EXIT_CODES, OUTPUT_FORMATS, type OutputFormat, type OutputPolicy } from "./types.js";
@@ -418,6 +419,7 @@ export function shouldShortCircuitTopLevelCli(argv: readonly string[]): boolean 
 }
 
 async function emitJsonErrorEvent(error: NormalizedOutputError): Promise<void> {
+  const { createOutputFormatter } = await import("./cli/output/output.js");
   const formatter = createOutputFormatter("json", {
     jsonContext: {
       sessionId: "unknown",
@@ -450,6 +452,7 @@ async function emitRequestedError(
   }
 
   if (outputPolicy.format === "quiet") {
+    const { createOutputFormatter } = await import("./cli/output/output.js");
     const formatter = createOutputFormatter("quiet");
     formatter.onError(normalized);
     formatter.flush();
@@ -459,6 +462,7 @@ async function emitRequestedError(
   if (!outputPolicy.suppressNonJsonStderr) {
     process.stderr.write(`${normalized.message}\n`);
     if (outputPolicy.format === "text") {
+      const { getTextErrorRemediationHints } = await import("./cli/output/output.js");
       for (const hint of getTextErrorRemediationHints(normalized)) {
         process.stderr.write(`${hint}\n`);
       }

@@ -19,6 +19,7 @@ const ACP_ADAPTER_PACKAGE_RANGES = {
   pi: "^0.0.31",
   codex: "^1.1.7",
   claude: "^0.61.0",
+  agy: "^0.3.2",
   mux: "^0.28.0",
 } as const;
 

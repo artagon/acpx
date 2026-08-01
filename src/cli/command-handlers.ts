@@ -3,6 +3,7 @@ import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import { AgentSpawnError } from "../errors.js";
+import { measurePerf } from "../perf-metrics.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   mergePromptSourceWithText,
@@ -11,7 +12,8 @@ import {
   textPrompt,
 } from "../prompt-content.js";
 import { exportSession } from "../session/export.js";
-import { importSession } from "../session/import.js";
+// importSession is loaded at its call site: the archive validator builds zod
+// schemas at module scope, and only `acpx sessions import` needs them.
 import {
   findGitRepositoryRoot,
   findSession,
@@ -712,8 +714,14 @@ async function tryListAgentSessions(
   config: ResolvedAcpxConfig,
 ): Promise<SessionListResult | "spawn-failed"> {
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
-  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const { listAgentSessions } = await loadSessionModule();
+  const permissionPolicy = await measurePerf("sessions.list.permission_policy", () =>
+    resolvePermissionPolicyFromFlags(globalFlags),
+  );
+  // Deferring the session module moved the ACP SDK + zod off the startup path;
+  // this span is where that cost is now paid.
+  const { listAgentSessions } = await measurePerf("sessions.list.load_session_module", () =>
+    loadSessionModule(),
+  );
   try {
     return await listAgentSessions({
       agentCommand: agent.agentCommand,
@@ -758,10 +766,12 @@ export async function handleSessionsList(
     return;
   }
 
-  const [result, { printAgentSessionsByFormat }] = await Promise.all([
-    tryListAgentSessions(agent, flags, globalFlags, config),
-    loadOutputRenderModule(),
-  ]);
+  const [result, { printAgentSessionsByFormat }] = await measurePerf("sessions.list.total", () =>
+    Promise.all([
+      tryListAgentSessions(agent, flags, globalFlags, config),
+      loadOutputRenderModule(),
+    ]),
+  );
 
   if (!result || result === "spawn-failed") {
     if (result !== "spawn-failed" && (flags.cursor || flags.filterCwd)) {
@@ -1112,6 +1122,7 @@ export async function handleSessionsImport(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { importSession } = await import("../session/import.js");
   const result = await importSession(archivePath, {
     name: flags.name,
     newCwd: flags.destinationCwd ? path.resolve(globalFlags.cwd, flags.destinationCwd) : undefined,

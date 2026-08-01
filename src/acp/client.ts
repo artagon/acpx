@@ -47,6 +47,7 @@ import {
   UnsupportedPromptContentError,
 } from "../errors.js";
 import { FileSystemHandlers } from "../filesystem.js";
+import { measurePerf } from "../perf-metrics.js";
 import {
   classifyPermissionDecision,
   decisionToResponse,
@@ -127,6 +128,10 @@ const REPLAY_DRAIN_TIMEOUT_MS = 5_000;
 const DRAIN_POLL_INTERVAL_MS = 20;
 const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
+// Read-only, single-shot commands do not need to wait out an adapter that
+// ignores stdin-end; escalation to SIGKILL still reaps the child.
+const AGENT_CLOSE_FAST_TERM_GRACE_MS = 150;
+const AGENT_CLOSE_FAST_KILL_GRACE_MS = 250;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
 const DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META = Object.freeze({
   "cognition.ai/requestDiagnostics": true,
@@ -616,10 +621,12 @@ export class AcpClient {
       await this.close();
     }
 
-    const launch = await this.resolveAgentLaunchPlan();
+    const launch = await measurePerf("acp.start.resolve_launch", () =>
+      this.resolveAgentLaunchPlan(),
+    );
     this.logAgentLaunch(launch);
-    await this.ensureLaunchSupport(launch);
-    const child = await this.spawnAgentProcess(launch);
+    await measurePerf("acp.start.launch_support", () => this.ensureLaunchSupport(launch));
+    const child = await measurePerf("acp.start.spawn", () => this.spawnAgentProcess(launch));
     this.closing = false;
     this.agentStartedAt = isoNow();
     this.lastAgentExit = undefined;
@@ -651,13 +658,15 @@ export class AcpClient {
     );
     const startupFailure = this.createStartupFailureWatcher(child, startupStderr);
 
-    await this.initializeAgentConnection({
-      child,
-      connection,
-      startupFailure,
-      startupStderr,
-      launch,
-    });
+    await measurePerf("acp.start.initialize", () =>
+      this.initializeAgentConnection({
+        child,
+        connection,
+        startupFailure,
+        startupStderr,
+        launch,
+      }),
+    );
   }
 
   private async resolveAgentLaunchPlan(): Promise<AgentLaunchPlan> {
@@ -833,10 +842,14 @@ export class AcpClient {
       }),
       clientInfo: resolveClientInfo(launch.devinAcp),
     });
-    const initialized = launch.geminiAcp
-      ? await withTimeout(initializePromise, resolveGeminiAcpStartupTimeoutMs())
-      : await initializePromise;
-    await this.authenticateIfRequired(connection, initialized.authMethods ?? []);
+    const initialized = await measurePerf("acp.initialize.rpc", () =>
+      launch.geminiAcp
+        ? withTimeout(initializePromise, resolveGeminiAcpStartupTimeoutMs())
+        : initializePromise,
+    );
+    await measurePerf("acp.initialize.authenticate", () =>
+      this.authenticateIfRequired(connection, initialized.authMethods ?? []),
+    );
     return initialized;
   }
 
@@ -1396,12 +1409,18 @@ export class AcpClient {
     child: ChildProcessByStdio<Writable, Readable, Readable>,
   ): Promise<void> {
     const stdinCloseGraceMs = resolveAgentCloseAfterStdinEndMs(this.options.agentCommand);
+    const termGraceMs = this.options.fastTeardown
+      ? AGENT_CLOSE_FAST_TERM_GRACE_MS
+      : AGENT_CLOSE_TERM_GRACE_MS;
+    const killGraceMs = this.options.fastTeardown
+      ? AGENT_CLOSE_FAST_KILL_GRACE_MS
+      : AGENT_CLOSE_KILL_GRACE_MS;
     this.endAgentStdin(child);
     let exited = await waitForChildExit(child, stdinCloseGraceMs);
-    exited = await this.killAgentIfRunning(child, exited, "SIGTERM", AGENT_CLOSE_TERM_GRACE_MS);
+    exited = await this.killAgentIfRunning(child, exited, "SIGTERM", termGraceMs);
     if (!exited) {
-      this.log(`agent did not exit after ${AGENT_CLOSE_TERM_GRACE_MS}ms; forcing SIGKILL`);
-      exited = await this.killAgentIfRunning(child, exited, "SIGKILL", AGENT_CLOSE_KILL_GRACE_MS);
+      this.log(`agent did not exit after ${termGraceMs}ms; forcing SIGKILL`);
+      exited = await this.killAgentIfRunning(child, exited, "SIGKILL", killGraceMs);
     }
 
     // Ensure stdio handles don't keep this process alive after close() returns.
