@@ -701,7 +701,8 @@ jobs:
           node scripts/sea/generate-formula.mjs \
             --version "${TAG#v}" \
             --npm-sha256 "$NPM_SHA256" \
-            --sums "${RUNNER_TEMP}/SHA256SUMS"
+            --sums "${RUNNER_TEMP}/SHA256SUMS" \
+            --current-formula "${RUNNER_TEMP}/main-acpx.rb"
           # The GITHUB_TOKEN-created PR receives an approval-required workflow
           # run. Keep a pre-PR syntax proof so approval is not spent discovering
           # a generated syntax error. A full `brew audit` is unavailable on Linux.

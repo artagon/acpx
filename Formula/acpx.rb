@@ -26,6 +26,7 @@ class Acpx < Formula
   version "0.12.1"
   sha256 "c759e05bfc628a99da32e04e384272a49ff34ada454ce87550d2a6ac234e58de"
   license "MIT"
+  disable! date: "2026-07-30", because: "v0.12.1 predates the locked npm fallback and binary assets"
   depends_on "node"
 
   def install

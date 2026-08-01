@@ -8,6 +8,7 @@ import test, { type TestContext } from "node:test";
 const GENERATOR = path.join(process.cwd(), "scripts", "sea", "generate-formula.mjs");
 const CHECKED_FORMULA = path.join(process.cwd(), "Formula", "acpx.rb");
 const VERSION = "1.2.3";
+const CURRENT_VERSION = "1.2.2";
 const NPM_SHA = "a".repeat(64);
 
 type GeneratorResult = {
@@ -16,6 +17,15 @@ type GeneratorResult = {
   stderr: string;
   formulaPath: string;
 };
+
+function writeCurrentFormula(
+  dir: string,
+  source = ["class Acpx < Formula", `  version "${CURRENT_VERSION}"`, "end", ""].join("\n"),
+): string {
+  const currentFormulaPath = path.join(dir, "current-acpx.rb");
+  writeFileSync(currentFormulaPath, source);
+  return currentFormulaPath;
+}
 
 function invokeGenerator(
   t: TestContext,
@@ -43,9 +53,11 @@ function runGenerator(
   extraArgs: readonly string[] = [],
   version = VERSION,
   npmSha = NPM_SHA,
+  currentFormula = ["class Acpx < Formula", `  version "${CURRENT_VERSION}"`, "end", ""].join("\n"),
 ): GeneratorResult {
   return invokeGenerator(t, (dir, formulaPath) => {
     const sumsPath = path.join(dir, "SHA256SUMS");
+    const currentFormulaPath = writeCurrentFormula(dir, currentFormula);
     writeFileSync(sumsPath, sums);
     return [
       "--version",
@@ -54,6 +66,8 @@ function runGenerator(
       npmSha,
       "--sums",
       sumsPath,
+      "--current-formula",
+      currentFormulaPath,
       "--out",
       formulaPath,
       ...extraArgs,
@@ -118,9 +132,119 @@ test("generator requires --sums before reading the checksum manifest", (t) => {
   assert.doesNotMatch(result.stderr, /ENOENT/);
 });
 
+test("generator requires the live-main formula", (t) => {
+  const result = invokeGenerator(t, (dir, formulaPath) => {
+    const sumsPath = path.join(dir, "SHA256SUMS");
+    writeFileSync(sumsPath, `${tarballLine("linux-x64")}\n`);
+    return [
+      "--version",
+      VERSION,
+      "--npm-sha256",
+      NPM_SHA,
+      "--sums",
+      sumsPath,
+      "--out",
+      formulaPath,
+    ];
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--current-formula is required and must name the live-main formula/);
+});
+
+test("generator rejects a formula version equal to live main", (t) => {
+  const result = runGenerator(
+    t,
+    `${tarballLine("linux-x64")}\n`,
+    [],
+    VERSION,
+    NPM_SHA,
+    ["class Acpx < Formula", `  version "${VERSION}"`, "end", ""].join("\n"),
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must be strictly greater than current formula version 1\.2\.3/);
+});
+
+test("generator rejects a formula version older than live main", (t) => {
+  const result = runGenerator(
+    t,
+    `${tarballLine("linux-x64")}\n`,
+    [],
+    VERSION,
+    NPM_SHA,
+    ["class Acpx < Formula", '  version "2.0.0"', "end", ""].join("\n"),
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must be strictly greater than current formula version 2\.0\.0/);
+});
+
+test("generator rejects an ambiguous live-main formula version", (t) => {
+  const result = runGenerator(
+    t,
+    `${tarballLine("linux-x64")}\n`,
+    [],
+    VERSION,
+    NPM_SHA,
+    ["class Acpx < Formula", '  version "1.2.1"', '  version "1.2.2"', "end", ""].join("\n"),
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must contain exactly one X\.Y\.Z version declaration/);
+});
+
+test("generator rejects a missing live-main formula file", (t) => {
+  const result = invokeGenerator(t, (dir, formulaPath) => {
+    const sumsPath = path.join(dir, "SHA256SUMS");
+    const missingFormulaPath = path.join(dir, "missing-acpx.rb");
+    writeFileSync(sumsPath, `${tarballLine("linux-x64")}\n`);
+    return [
+      "--version",
+      VERSION,
+      "--npm-sha256",
+      NPM_SHA,
+      "--sums",
+      sumsPath,
+      "--current-formula",
+      missingFormulaPath,
+      "--out",
+      formulaPath,
+    ];
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--current-formula file does not exist:/);
+  assert.doesNotMatch(result.stderr, /ENOENT/);
+});
+
+test("generator rejects a live-main formula path that is not a regular file", (t) => {
+  const result = invokeGenerator(t, (dir, formulaPath) => {
+    const sumsPath = path.join(dir, "SHA256SUMS");
+    writeFileSync(sumsPath, `${tarballLine("linux-x64")}\n`);
+    return [
+      "--version",
+      VERSION,
+      "--npm-sha256",
+      NPM_SHA,
+      "--sums",
+      sumsPath,
+      "--current-formula",
+      dir,
+      "--out",
+      formulaPath,
+    ];
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--current-formula must name a regular file/);
+  assert.doesNotMatch(result.stderr, /EISDIR/);
+});
+
 test("generator rejects a missing --sums file with its path and remediation", (t) => {
   const result = invokeGenerator(t, (dir, formulaPath) => {
     const missingPath = path.join(dir, "missing-SHA256SUMS");
+    const currentFormulaPath = writeCurrentFormula(dir);
     return [
       "--version",
       VERSION,
@@ -128,6 +252,8 @@ test("generator rejects a missing --sums file with its path and remediation", (t
       NPM_SHA,
       "--sums",
       missingPath,
+      "--current-formula",
+      currentFormulaPath,
       "--out",
       formulaPath,
     ];
@@ -141,16 +267,21 @@ test("generator rejects a missing --sums file with its path and remediation", (t
 });
 
 test("generator rejects a --sums path that is not a regular file", (t) => {
-  const result = invokeGenerator(t, (dir, formulaPath) => [
-    "--version",
-    VERSION,
-    "--npm-sha256",
-    NPM_SHA,
-    "--sums",
-    dir,
-    "--out",
-    formulaPath,
-  ]);
+  const result = invokeGenerator(t, (dir, formulaPath) => {
+    const currentFormulaPath = writeCurrentFormula(dir);
+    return [
+      "--version",
+      VERSION,
+      "--npm-sha256",
+      NPM_SHA,
+      "--sums",
+      dir,
+      "--current-formula",
+      currentFormulaPath,
+      "--out",
+      formulaPath,
+    ];
+  });
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /--sums must name a regular file/);
@@ -163,16 +294,20 @@ test("generated npm fallbacks require the shipped shrinkwrap and enforce it with
   assert.equal(result.status, 0, result.stderr);
   const formula = readFileSync(result.formulaPath, "utf8");
   assert.match(formula, /npm-shrinkwrap\.json/);
-  assert.match(formula, /system "npm", "ci", "--omit=dev", \*std_npm_args\(prefix: false\)/);
+  assert.match(
+    formula,
+    /system "npm", "ci", "--omit=dev", "--ignore-scripts", \*std_npm_args\(prefix: false\)/,
+  );
   assert.doesNotMatch(formula, /system "npm", "install"/);
   assert.match(formula, /libexec\.install Dir\["\*"\]/);
   assert.match(formula, /bin\.install_symlink libexec\/"dist\/cli\.js" => "acpx"/);
 });
 
-test("the checked v0.12.1 formula marks its dynamic npm fallback as legacy-only", () => {
+test("the checked v0.12.1 formula disables its legacy dynamic npm fallback", () => {
   const formula = readFileSync(CHECKED_FORMULA, "utf8");
 
   assert.match(formula, /version "0\.12\.1"/);
+  assert.match(formula, /disable!.*v0\.12\.1 predates the locked npm fallback and binary assets/);
   assert.match(formula, /fallback remains\s+# legacy-only/s);
   assert.match(formula, /system "npm", "install", \*std_npm_args/);
   assert.doesNotMatch(formula, /exact production dependency bytes/);
