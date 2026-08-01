@@ -21,7 +21,10 @@
     "acpx": "dist/cli.js"
   },
   "files": [
-    "dist",
+    "dist/*.js",
+    "dist/*.js.map",
+    "dist/*.d.ts",
+    "dist/*.d.ts.map",
     "skills",
     "npm-shrinkwrap.json",
     "README.md",
@@ -63,7 +66,7 @@
     "mutate": "stryker run",
     "perf:report": "tsx scripts/perf-report.ts",
     "precommit": "pnpm exec lint-staged && pnpm run -s build",
-    "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
+    "prepack": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
     "prepare": "husky",
     "sea": "node scripts/sea/build.mjs",
     "test": "pnpm run build && pnpm run build:test && node --test dist-test/test/*.test.js",

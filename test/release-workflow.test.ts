@@ -427,6 +427,11 @@ test("npm pack ships a production shrinkwrap whose root matches package.json", (
     packed.files.includes("npm-shrinkwrap.json"),
     "the published archive must include npm-shrinkwrap.json",
   );
+  assert.equal(
+    packed.files.some((file) => file.startsWith("dist/docs-site/")),
+    false,
+    "prepack must remove generated documentation that is not part of the CLI archive",
+  );
   const manifest = JSON.parse(
     readFileSync(path.join(packed.packageDir, "package.json"), "utf8"),
   ) as {
