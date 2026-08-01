@@ -234,6 +234,34 @@ test("createFileSessionStore persists records inside the provided state director
   );
 });
 
+test("createFileSessionStore supports concurrent saves in the same millisecond", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-store-concurrent-"));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  const originalNow = Date.now;
+  Date.now = () => 1_750_000_000_000;
+  t.after(() => {
+    Date.now = originalNow;
+  });
+
+  const store = createFileSessionStore({ stateDir });
+  const record = createSessionRecord({
+    acpxRecordId: "agent:codex:acp:concurrent",
+    acpSessionId: "sid-concurrent",
+  });
+
+  await Promise.all(Array.from({ length: 8 }, () => store.save(record)));
+
+  const loaded = await store.load(record.acpxRecordId);
+  assert.equal(loaded?.acpSessionId, "sid-concurrent");
+  assert.deepEqual(
+    (await fs.readdir(path.join(stateDir, "sessions"))).filter((file) => file.endsWith(".tmp")),
+    [],
+  );
+});
+
 test("createFileSessionStore.load() returns undefined for a corrupt session file (#378)", async (t) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-store-corrupt-"));
   t.after(async () => {
@@ -291,6 +319,26 @@ test("doctor reports backend unavailable probe failures and agent registry honor
   assert.equal(report.ok, false);
   assert.equal(report.code, "ACP_BACKEND_UNAVAILABLE");
   assert.deepEqual(report.details, ["agent=codex", "command=codex-override --acp"]);
+});
+
+test("agent registry preserves structured argv overrides", () => {
+  const registry = createAgentRegistry({
+    overrides: {
+      Custom: ["C:\\tools\\bin\\agent.sh", "--pipe", "\\\\.\\pipe\\acpx-agent"],
+      droid: ["C:\\tools\\droid.exe", "--acp"],
+      blank: "   ",
+    },
+  });
+
+  assert.deepEqual(registry.resolve("custom"), [
+    "C:\\tools\\bin\\agent.sh",
+    "--pipe",
+    "\\\\.\\pipe\\acpx-agent",
+  ]);
+  assert.equal(registry.resolve("blank"), "blank");
+  assert.deepEqual(registry.resolve("factorydroid"), ["C:\\tools\\droid.exe", "--acp"]);
+  assert.equal(registry.list().includes("Custom"), false);
+  assert.equal(registry.list().includes("custom"), true);
 });
 
 test("doctor coerces probe detail values to strings", async () => {

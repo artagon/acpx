@@ -3,7 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { normalizeAgentCommandInput } from "../src/acp/client-process.js";
 import {
+  AGENT_ARGV_REGISTRY,
   AGENT_REGISTRY,
   BUILT_IN_AGENT_PACKAGES,
   DEFAULT_AGENT_NAME,
@@ -13,6 +15,14 @@ import {
   resolvePackageExecBuiltInAgentLaunch,
   resolveAgentCommand,
 } from "../src/agent-registry.js";
+
+test("built-in command displays stay synchronized with structured argv", () => {
+  assert.deepEqual(Object.keys(AGENT_ARGV_REGISTRY), Object.keys(AGENT_REGISTRY));
+  for (const [name, argv] of Object.entries(AGENT_ARGV_REGISTRY)) {
+    assert.equal(argv.join(" "), AGENT_REGISTRY[name]);
+    assert.equal(normalizeAgentCommandInput(argv).agentCommand, AGENT_REGISTRY[name]);
+  }
+});
 
 test("resolveAgentCommand maps known agents to commands", () => {
   for (const [name, command] of Object.entries(AGENT_REGISTRY)) {
@@ -60,8 +70,20 @@ test("grok-build built-in runs the Grok Build ACP entrypoint", () => {
 });
 
 test("mux built-in runs the coder/mux ACP stdio bridge through npx", () => {
-  assert.equal(AGENT_REGISTRY.mux, "npx -y mux@^0.27.0 acp");
-  assert.equal(resolveAgentCommand("mux"), "npx -y mux@^0.27.0 acp");
+  assert.equal(AGENT_REGISTRY.mux, "npx -y mux@^0.28.0 acp");
+  assert.equal(resolveAgentCommand("mux"), "npx -y mux@^0.28.0 acp");
+});
+
+test("pool built-in runs the Poolside ACP entrypoint", () => {
+  assert.equal(AGENT_REGISTRY.pool, "pool acp");
+  assert.deepEqual(AGENT_ARGV_REGISTRY.pool, ["pool", "acp"]);
+  assert.equal(resolveAgentCommand("pool"), "pool acp");
+});
+
+test("zeroclaw built-in launches the native ZeroClaw ACP server", () => {
+  assert.equal(AGENT_REGISTRY.zeroclaw, "zeroclaw acp");
+  assert.deepEqual(AGENT_ARGV_REGISTRY.zeroclaw, ["zeroclaw", "acp"]);
+  assert.equal(resolveAgentCommand("zeroclaw"), "zeroclaw acp");
 });
 
 test("listBuiltInAgents preserves the required example prefix and alphabetical tail", () => {
@@ -86,9 +108,11 @@ test("listBuiltInAgents preserves the required example prefix and alphabetical t
     "kiro",
     "mux",
     "opencode",
+    "pool",
     "qoder",
     "qwen",
     "trae",
+    "zeroclaw",
   ]);
 });
 
@@ -129,7 +153,7 @@ test("npm-backed built-ins embed their pinned range in the fallback command", ()
     AGENT_REGISTRY.codex,
     `npx -y @agentclientprotocol/codex-acp@${BUILT_IN_AGENT_PACKAGES.codex.packageRange}`,
   );
-  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.26");
+  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.31");
 });
 
 test("resolveInstalledBuiltInAgentLaunch uses a locally installed adapter when available", (t) => {
@@ -232,4 +256,19 @@ test("resolveBuiltInAgentLaunch accepts the legacy Claude npm exec default", () 
     packageRange: BUILT_IN_AGENT_PACKAGES.claude.packageRange,
     npmCliPath,
   });
+});
+
+test("resolveBuiltInAgentLaunch leaves npm-backed commands untouched inside a SEA", () => {
+  const npmCliPath = path.join(os.tmpdir(), "acpx-test-sea-npm-cli.js");
+  const launch = resolveBuiltInAgentLaunch(AGENT_REGISTRY.codex, {
+    execPath: "/tmp/acpx",
+    existsSync: (candidate) => candidate === npmCliPath,
+    resolvePackageRoot: () => {
+      throw new Error("adapter not installed");
+    },
+    resolveNpmCliPath: () => npmCliPath,
+    runningInSea: true,
+  });
+
+  assert.equal(launch, undefined);
 });

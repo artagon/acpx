@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { isSea } from "node:sea";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -15,11 +16,11 @@ import { fileURLToPath } from "node:url";
  * ~2s of added latency before the adapter can answer `initialize`.
  */
 const ACP_ADAPTER_PACKAGE_RANGES = {
-  pi: "^0.0.26",
+  pi: "^0.0.31",
   codex: "^1.1.7",
   claude: "^0.61.0",
   agy: "^0.3.2",
-  mux: "^0.27.0",
+  mux: "^0.28.0",
 } as const;
 
 type BuiltInAgentPackageSpec = {
@@ -47,6 +48,7 @@ type BuiltInLaunchResolverOptions = {
   resolvePackageRoot?: (packageName: string) => string;
   execPath?: string;
   resolveNpmCliPath?: (execPath: string) => string;
+  runningInSea?: boolean;
 };
 
 export const AGENT_REGISTRY: Record<string, string> = {
@@ -66,9 +68,39 @@ export const AGENT_REGISTRY: Record<string, string> = {
   kiro: "kiro-cli-chat acp",
   mux: `npx -y mux@${ACP_ADAPTER_PACKAGE_RANGES.mux} acp`,
   opencode: "npx -y opencode-ai acp",
+  pool: "pool acp",
   qoder: "qodercli --acp",
   qwen: "qwen --acp",
   trae: "traecli acp serve",
+  zeroclaw: "zeroclaw acp",
+};
+
+export const AGENT_ARGV_REGISTRY: Record<string, string[]> = {
+  pi: ["npx", `pi-acp@${ACP_ADAPTER_PACKAGE_RANGES.pi}`],
+  openclaw: ["openclaw", "acp"],
+  codex: ["npx", "-y", `@agentclientprotocol/codex-acp@${ACP_ADAPTER_PACKAGE_RANGES.codex}`],
+  claude: [
+    "npx",
+    "-y",
+    `@agentclientprotocol/claude-agent-acp@${ACP_ADAPTER_PACKAGE_RANGES.claude}`,
+  ],
+  gemini: ["gemini", "--acp"],
+  cursor: ["cursor-agent", "acp"],
+  copilot: ["copilot", "--acp", "--stdio"],
+  droid: ["droid", "exec", "--output-format", "acp"],
+  "fast-agent": ["uvx", "fast-agent-mcp", "acp"],
+  "grok-build": ["grok", "agent", "stdio"],
+  iflow: ["iflow", "--experimental-acp"],
+  kilocode: ["npx", "-y", "@kilocode/cli", "acp"],
+  kimi: ["kimi", "acp"],
+  kiro: ["kiro-cli-chat", "acp"],
+  mux: ["npx", "-y", `mux@${ACP_ADAPTER_PACKAGE_RANGES.mux}`, "acp"],
+  opencode: ["npx", "-y", "opencode-ai", "acp"],
+  pool: ["pool", "acp"],
+  qoder: ["qodercli", "--acp"],
+  qwen: ["qwen", "--acp"],
+  trae: ["traecli", "acp", "serve"],
+  zeroclaw: ["zeroclaw", "acp"],
 };
 
 export const BUILT_IN_AGENT_PACKAGES = {
@@ -101,6 +133,11 @@ export function normalizeAgentName(value: string): string {
   return value.trim().toLowerCase();
 }
 
+export function resolveCanonicalAgentName(value: string): string {
+  const normalized = normalizeAgentName(value);
+  return AGENT_ALIASES[normalized] ?? normalized;
+}
+
 export function mergeAgentRegistry(overrides?: Record<string, string>): Record<string, string> {
   if (!overrides) {
     return { ...AGENT_REGISTRY };
@@ -121,6 +158,13 @@ export function resolveAgentCommand(agentName: string, overrides?: Record<string
   const normalized = normalizeAgentName(agentName);
   const registry = mergeAgentRegistry(overrides);
   return registry[normalized] ?? registry[AGENT_ALIASES[normalized] ?? normalized] ?? agentName;
+}
+
+export function resolveAgentArgv(agentName: string): string[] | undefined {
+  const normalized = normalizeAgentName(agentName);
+  const argv =
+    AGENT_ARGV_REGISTRY[normalized] ?? AGENT_ARGV_REGISTRY[resolveCanonicalAgentName(agentName)];
+  return argv ? [...argv] : undefined;
 }
 
 export function findBuiltInAgentPackage(agentCommand: string): BuiltInAgentPackageSpec | undefined {
@@ -301,12 +345,15 @@ export function resolveBuiltInAgentLaunch(
   agentCommand: string,
   options: BuiltInLaunchResolverOptions = {},
 ): BuiltInAgentLaunch | undefined {
+  if (options.runningInSea ?? isSea()) {
+    return undefined;
+  }
   return (
     resolveInstalledBuiltInAgentLaunch(agentCommand, options) ??
     resolvePackageExecBuiltInAgentLaunch(agentCommand, options)
   );
 }
 
-export function listBuiltInAgents(overrides?: Record<string, string>): string[] {
-  return Object.keys(mergeAgentRegistry(overrides));
+export function listBuiltInAgents(overrides?: Record<string, unknown>): string[] {
+  return [...new Set([...Object.keys(AGENT_REGISTRY), ...Object.keys(overrides ?? {})])];
 }

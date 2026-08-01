@@ -16,13 +16,23 @@ function formatRoutedFrom(sessionCwd: string, currentCwd: string): string | unde
   return relative.startsWith(".") ? relative : `.${path.sep}${relative}`;
 }
 
-type SessionConnectionStatus = "connected" | "needs reconnect";
+type SessionConnectionStatus = "connected" | "starting" | "needs reconnect";
+
+export function classifySessionConnectionStatus(health: {
+  healthy: boolean;
+  hasLease: boolean;
+}): SessionConnectionStatus {
+  if (health.healthy) {
+    return "connected";
+  }
+  return health.hasLease ? "needs reconnect" : "starting";
+}
 
 async function resolveSessionConnectionStatus(
   record: SessionRecord,
 ): Promise<SessionConnectionStatus> {
   const health = await probeQueueOwnerHealth(record.acpxRecordId);
-  return health.healthy ? "connected" : "needs reconnect";
+  return classifySessionConnectionStatus(health);
 }
 
 export function printSessionsByFormat(sessions: SessionRecord[], format: OutputFormat): void {
@@ -203,7 +213,7 @@ export function printQueuedPromptByFormat(
 export function formatPromptSessionBannerLine(
   record: SessionRecord,
   currentCwd: string,
-  connectionStatus: SessionConnectionStatus = "needs reconnect",
+  connectionStatus: SessionConnectionStatus = "starting",
 ): string {
   const label = formatSessionLabel(record);
   const normalizedSessionCwd = path.resolve(record.cwd);

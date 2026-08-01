@@ -103,6 +103,121 @@ test("integration: built-in cursor agent resolves to cursor-agent acp", async ()
   });
 });
 
+test("integration: flow run --no-fs disables advertised filesystem capabilities", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseLoadCapableAgentArgs(cwd),
+          "--format",
+          "json",
+          "--no-fs",
+          "flow",
+          "run",
+          FLOW_FIXTURE_PATH,
+          "--input-json",
+          JSON.stringify({ next: "yes_path" }),
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as { runDir?: string };
+      assert.equal(typeof payload.runDir, "string", result.stdout);
+
+      const manifest = JSON.parse(
+        await fs.readFile(path.join(payload.runDir ?? "", "manifest.json"), "utf8"),
+      ) as { sessions?: Array<{ eventsPath?: string }> };
+      const eventsPath = manifest.sessions?.[0]?.eventsPath;
+      assert.equal(typeof eventsPath, "string");
+
+      const events = (await fs.readFile(path.join(payload.runDir ?? "", eventsPath ?? ""), "utf8"))
+        .trim()
+        .split("\n")
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              message?: {
+                method?: string;
+                params?: {
+                  clientCapabilities?: {
+                    fs?: { readTextFile?: unknown; writeTextFile?: unknown };
+                  };
+                };
+              };
+            },
+        );
+      const initializeRequest = events.find((event) => event.message?.method === "initialize");
+
+      assert(initializeRequest, JSON.stringify(events, null, 2));
+      assert.deepEqual(initializeRequest.message?.params?.clientCapabilities?.fs, {
+        readTextFile: false,
+        writeTextFile: false,
+      });
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: flow run --no-terminal disables the advertised terminal capability", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseLoadCapableAgentArgs(cwd),
+          "--format",
+          "json",
+          "--no-terminal",
+          "flow",
+          "run",
+          FLOW_FIXTURE_PATH,
+          "--input-json",
+          JSON.stringify({ next: "yes_path" }),
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as { runDir?: string };
+      assert.equal(typeof payload.runDir, "string", result.stdout);
+
+      const manifest = JSON.parse(
+        await fs.readFile(path.join(payload.runDir ?? "", "manifest.json"), "utf8"),
+      ) as { sessions?: Array<{ eventsPath?: string }> };
+      const eventsPath = manifest.sessions?.[0]?.eventsPath;
+      assert.equal(typeof eventsPath, "string");
+
+      const events = (await fs.readFile(path.join(payload.runDir ?? "", eventsPath ?? ""), "utf8"))
+        .trim()
+        .split("\n")
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              message?: {
+                method?: string;
+                params?: {
+                  clientCapabilities?: {
+                    terminal?: unknown;
+                  };
+                };
+              };
+            },
+        );
+      const initializeRequest = events.find((event) => event.message?.method === "initialize");
+
+      assert(initializeRequest, JSON.stringify(events, null, 2));
+      assert.equal(initializeRequest.message?.params?.clientCapabilities?.terminal, false);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: flow run executes multiple ACP steps in one session and branches", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -875,6 +990,60 @@ test("integration: built-in grok-build agent resolves to grok agent stdio", asyn
   });
 });
 
+test("integration: built-in pool agent resolves to pool acp", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-pool-"));
+
+    try {
+      await writeFakePoolAgent(fakeBinDir);
+
+      const result = await runCli(
+        ["--approve-all", "--cwd", cwd, "--format", "quiet", "pool", "exec", "echo hello"],
+        homeDir,
+        {
+          env: {
+            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          },
+        },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /hello/);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: built-in zeroclaw agent resolves to zeroclaw acp", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-zeroclaw-"));
+
+    try {
+      await writeFakeZeroClawAgent(fakeBinDir);
+
+      const result = await runCli(
+        ["--approve-all", "--cwd", cwd, "--format", "quiet", "zeroclaw", "exec", "echo hello"],
+        homeDir,
+        {
+          env: {
+            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          },
+        },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /hello/);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: built-in iflow agent resolves to iflow --experimental-acp", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -1079,6 +1248,38 @@ test("integration: exec --no-terminal disables advertised terminal capability", 
         | undefined;
       assert(initializeRequest, result.stdout);
       assert.equal(initializeRequest.params?.clientCapabilities?.terminal, false);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec --no-fs disables advertised filesystem capabilities", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--no-fs", "exec", "echo hello"],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const initializeRequest = payloads.find((payload) => payload.method === "initialize") as
+        | {
+            params?: {
+              clientCapabilities?: {
+                fs?: { readTextFile?: unknown; writeTextFile?: unknown };
+              };
+            };
+          }
+        | undefined;
+      assert(initializeRequest, result.stdout);
+      assert.deepEqual(initializeRequest.params?.clientCapabilities?.fs, {
+        readTextFile: false,
+        writeTextFile: false,
+      });
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -4241,15 +4442,24 @@ test("integration: session remains resumable after queue owner exits and agent h
       const sessionId = createdPayload.acpxRecordId;
       assert.equal(typeof sessionId, "string");
 
-      // 2. Send a prompt with a very short TTL so the queue owner exits quickly
+      // 2. Use a positive sub-millisecond TTL. It must floor to 1 ms rather than
+      //    round to the zero sentinel, which would keep the owner alive forever.
       const prompt = await runCli(
-        [...baseAgentArgs(cwd), "--format", "quiet", "--ttl", "1", "prompt", "echo oneshot-done"],
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "--ttl",
+          "0.0001",
+          "prompt",
+          "echo oneshot-done",
+        ],
         homeDir,
       );
       assert.equal(prompt.code, 0, prompt.stderr);
       assert.match(prompt.stdout, /oneshot-done/);
 
-      // 3. Wait for the queue owner to exit (it should exit after 1s TTL)
+      // 3. Wait for the queue owner to exit after its 1 ms floored TTL.
       const { lockPath } = queuePaths(homeDir, sessionId as string);
       let ownerPid: number | undefined;
       try {
@@ -4546,6 +4756,72 @@ async function writeFakeGrokBuildAgent(binDir: string): Promise<void> {
       "  shift",
       "else",
       '  echo "unexpected grok command: $*" 1>&2',
+      "  exit 2",
+      "fi",
+      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+      "",
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o755 },
+  );
+}
+
+async function writeFakePoolAgent(binDir: string): Promise<void> {
+  if (process.platform === "win32") {
+    await fs.writeFile(
+      path.join(binDir, "pool.cmd"),
+      [
+        "@echo off",
+        "setlocal",
+        'if not "%~1"=="acp" exit /b 2',
+        `"${process.execPath}" "${MOCK_AGENT_PATH}" %2 %3 %4 %5 %6 %7 %8 %9`,
+        "",
+      ].join("\r\n"),
+      { encoding: "utf8" },
+    );
+    return;
+  }
+
+  await fs.writeFile(
+    path.join(binDir, "pool"),
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "acp" ]; then',
+      "  shift",
+      "else",
+      '  echo "unexpected pool command: $*" 1>&2',
+      "  exit 2",
+      "fi",
+      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+      "",
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o755 },
+  );
+}
+
+async function writeFakeZeroClawAgent(binDir: string): Promise<void> {
+  if (process.platform === "win32") {
+    await fs.writeFile(
+      path.join(binDir, "zeroclaw.cmd"),
+      [
+        "@echo off",
+        "setlocal",
+        'if not "%~1"=="acp" exit /b 2',
+        `"${process.execPath}" "${MOCK_AGENT_PATH}" %2 %3 %4 %5 %6 %7 %8 %9`,
+        "",
+      ].join("\r\n"),
+      { encoding: "utf8" },
+    );
+    return;
+  }
+
+  await fs.writeFile(
+    path.join(binDir, "zeroclaw"),
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "acp" ]; then',
+      "  shift",
+      "else",
+      '  echo "unexpected zeroclaw command: $*" 1>&2',
       "  exit 2",
       "fi",
       `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,

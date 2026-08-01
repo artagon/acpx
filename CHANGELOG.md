@@ -33,21 +33,73 @@ Repo: https://github.com/openclaw/acpx
   `acp.initialize.{rpc,authenticate}`), enabled via `ACPX_PERF_METRICS_FILE`.
   They attribute `sessions list` to a single ACP `initialize` round-trip rather
   than to process creation — spawn is ~4ms and authenticate ~0.4ms.
-- Packaging: `pnpm run sea` builds a self-contained single executable (Node SEA
-  plus V8 startup snapshot) that needs no system Node and starts in 50.2ms
-  versus 77.1ms for the npm install. See `docs/packaging.md` and
-  `packaging/homebrew/acpx.rb`.
 - CI: `pnpm run lint:eager-graph` fails the build if any third-party package
   other than commander enters the eager startup chunk closure. The regression it
   guards is silent — one value import from the `session/session.js` barrel
   re-welds the SDK into startup with nothing visibly breaking — so it is a
   static assertion rather than a benchmark.
+- Packaging: `pnpm run sea` builds a self-contained single executable (Node SEA
+  plus V8 startup snapshot) that starts in 67.8ms versus 120.5ms for the npm
+  install (25-run macOS arm64 benchmark). Adapter subprocesses still use system
+  Node, and `flow` commands delegate to an embedded runtime through system Node
+  because snapshots cannot dynamically load user modules. See
+  `docs/packaging.md` and `Formula/acpx.rb`.
+
+- Packaging/Homebrew: ship a production npm shrinkwrap and make newly generated
+  fallback formulas enforce it with `npm ci`, with release gates that compare
+  npm and pnpm package identities and integrity hashes before publication.
+
+### Breaking
+
+### Fixes
+
+## 2026.7.27 (v0.13.0)
+
+### Highlights
+
+- Windows agent launches now use structured argv end to end. Unambiguous legacy `command` plus `args` entries migrate automatically; ambiguous/raw commands and `.sh` wrappers must move to `agents.<name>.argv`, and existing saved custom-agent sessions without argv must be recreated.
+- Built-in Pool and ZeroClaw support makes both native ACP stdio servers available without custom registry configuration.
+- The new `--no-fs` flag lets compatible agents use their native filesystem implementation instead of ACP client filesystem methods.
+- The dependency and pnpm refresh resolves all four known PostCSS, fast-uri, js-yaml, and brace-expansion advisories.
+
+### Changes
+
+- Agents/built-ins: add Pool via `pool acp`. Thanks @dan-roberts-poolside and @osolmaz.
+
+- Agents/built-ins: add ZeroClaw via `zeroclaw acp`, ZeroClaw's native ACP v1 stdio server. Thanks @JordanTheJet.
+
+- CLI/ACP: add `--no-fs` to disable advertised ACP file read/write capabilities so compatible agents can use their native filesystem implementation. Thanks @zgxkbtl.
+
+- CLI/timers: preserve tiny positive timeout and TTL values from flags or config as 1 ms instead of disabling timers, and reject delays beyond Node's supported timer range. Thanks @realmehmetali.
+
+- Dependencies/tooling: refresh the ACP SDK, runtime and development toolchain, update pnpm to 10.34.5, and resolve the PostCSS, fast-uri, js-yaml, and brace-expansion advisories.
+
+### Breaking
+
+- Windows agent launches now require structured `agents.<name>.argv`; unambiguous legacy `command` plus `args` entries migrate automatically, while raw, ambiguous, or directly executable `.sh` commands fail with explicit migration guidance instead of lossy parsing or CreateProcess ENOENT. Existing custom-agent sessions without saved argv must be recreated. Fixes #466. Thanks @MarcelCFritsche.
+
+### Fixes
+
+- Flows: swallow best-effort heartbeat write failures at the timer boundary so storage errors do not become unhandled promise rejections. Thanks @SebTardif.
+
+- Runtime/sessions: use collision-resistant temporary paths for concurrent atomic session and index writes. Thanks @henkterharmsel.
+
+- CLI/status: report a normal cold-start session as `agent starting` while preserving `needs reconnect` for an unreachable live owner. Thanks @guettli.
+
+## 2026.7.23 (v0.12.1)
+
+### Changes
+
+- Agents/built-ins: refresh the default Pi, Codex, Claude, and Mux adapter ranges. Thanks @kelvinschen and @TheAngryPit.
 
 ### Breaking
 
 ### Fixes
 
 - Session queue owner: capture a bounded owner stderr tail and exit status during cold start only (stop retaining at first IPC accept; keep draining the pipe so long-lived owners are not killed by EPIPE) so a dead owner reports the real failure instead of a silent timeout. Thanks @SebTardif.
+- Packaging/sessions: let Node single-executable builds self-spawn detached queue
+  owners without repeating the embedded executable path, restoring persistent
+  prompts for Homebrew and other SEA installs.
 
 ## 2026.7.4 (v0.12.0)
 

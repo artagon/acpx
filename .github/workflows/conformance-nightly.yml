@@ -22,7 +22,7 @@ concurrency:
 
 env:
   NODE_VERSION: 24
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
 
 jobs:
   conformance-mock:
@@ -144,15 +144,11 @@ jobs:
           set -euo pipefail
           REPORT="conformance-artifacts/${{ matrix.id }}-report.json"
           if [ ! -f "$REPORT" ]; then
-            node - <<'NODE'
-            const fs = require("node:fs");
-            const lines = [
-              "### Adapter Smoke: ${{ matrix.id }}",
-              "",
-              "- Result: report not produced (adapter failed before report write)",
-            ];
-            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${lines.join("\n")}\n`);
-            NODE
+            {
+              echo "### Adapter Smoke: ${{ matrix.id }}"
+              echo
+              echo "- Result: report not produced (adapter failed before report write)"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           node - <<'NODE'

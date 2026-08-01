@@ -73,6 +73,7 @@ const TOP_LEVEL_VERSION_BOOLEAN_FLAGS = new Set([
   "--deny-all",
   "--suppress-reads",
   "--json-strict",
+  "--no-fs",
   "--no-terminal",
   "--verbose",
 ]);
@@ -288,6 +289,20 @@ function classifyTopLevelFlagScan(token: string): TopLevelFlagStep {
   };
 }
 
+export function findTopLevelCommandToken(argv: readonly string[]): string | undefined {
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    const scan = classifyTopLevelFlagScan(token);
+    if (scan.stop) {
+      return token === "--" ? undefined : token;
+    }
+    if (scan.skipNext) {
+      index += 1;
+    }
+  }
+  return undefined;
+}
+
 function readFormatFlagValue(
   token: string,
   nextToken: string | undefined,
@@ -355,7 +370,7 @@ function topLevelVersionTokenDecision(token: string): "version" | "stop" | "skip
   return "stop";
 }
 
-function isTopLevelVersionRequest(argv: string[]): boolean {
+function isTopLevelVersionRequest(argv: readonly string[]): boolean {
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
 
@@ -376,6 +391,31 @@ function isTopLevelVersionRequest(argv: string[]): boolean {
   }
 
   return false;
+}
+
+function isTopLevelHelpRequest(argv: readonly string[]): boolean {
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--") {
+      return false;
+    }
+    if (token === "--help" || token === "-h") {
+      return true;
+    }
+
+    const scan = classifyTopLevelFlagScan(token);
+    if (scan.stop) {
+      return false;
+    }
+    if (scan.skipNext) {
+      index += 1;
+    }
+  }
+  return false;
+}
+
+export function shouldShortCircuitTopLevelCli(argv: readonly string[]): boolean {
+  return isTopLevelVersionRequest(argv) || isTopLevelHelpRequest(argv);
 }
 
 async function emitJsonErrorEvent(error: NormalizedOutputError): Promise<void> {

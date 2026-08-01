@@ -9,34 +9,38 @@ name: Release binaries
 # repository or dependency code. `build` runs that code with read-only
 # permissions and no OIDC. `attest` holds the signing identity but runs no repo
 # code at all — no checkout, no install — and signs only bytes it downloaded.
-# `publish` writes the release and never touches OIDC.
+# `publish` writes the release and never touches OIDC. The same split repeats
+# for the Homebrew formula: `formula` renders it from the immutable tag with
+# read-only permissions, and `formula-pr` holds the contents-write credential
+# while executing no repository code.
 #
-# Release shape: this repository has immutable releases enabled, so assets and
-# the Git tag are frozen the moment a release is published. Assets are therefore
-# attached to a draft and the draft is published last.
+# Release shape: the gate below requires immutable releases before any build
+# starts. Once enabled, assets and the Git tag are frozen when the release is
+# published, so assets are attached to a draft and the draft is published last.
 
+# Manual-only, deliberately: two matrix legs use premium macOS runners. Trigger
+# the trusted default-branch workflow with:
+#
+# gh api --method POST repos/openclaw/acpx/dispatches \
+#   -f event_type=release-binaries \
+#   -F 'client_payload[tag]=vX.Y.Z'
+#
+# repository_dispatch uses the default branch's workflow code and commit. The
+# gate below requires that commit, the workflow revision, and the live tag to
+# match before any checkout or build.
 on:
-  push:
-    tags:
-      - "v*.*.*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing tag to build and attach assets to (e.g. v0.12.0)
-        required: true
+  repository_dispatch:
+    types: [release-binaries]
 
 concurrency:
-  # Keyed on the tag, not github.ref: on workflow_dispatch github.ref is the
-  # dispatch branch, so a tag-push run and a dispatch run for the same tag would
-  # otherwise land in different groups and race each other's uploads.
-  group: release-binaries-${{ inputs.tag || github.ref_name }}
+  group: release-binaries-${{ github.event.client_payload.tag }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
   # Pinned exactly. The shipped binary *is* this Node build with a blob injected,
   # so a floating version silently changes the release's largest attack surface
   # (V8, OpenSSL, zlib) and makes builds non-reproducible. The SBOM records this
@@ -47,64 +51,163 @@ jobs:
   gate:
     name: Validate tag
     runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.validate.outputs.sha }}
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Validate tag shape, version match, and ancestry
+      - name: Validate the dispatch before checkout
+        id: validate
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.client_payload.tag }}
+          TRUSTED_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
-          # Mirrors release.yml's gate. Without it a tag pointing at an
-          # unreviewed commit — including a fork PR head, which is reachable in
-          # this repo's object network — would produce a signed, published
-          # binary that never existed on main.
-          git fetch --no-tags origin main --depth=1
 
-          node - <<'NODE'
-          const { execFileSync } = require("node:child_process");
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must match vX.Y.Z; received '${RELEASE_TAG:-<missing>}'."
+            exit 1
+          fi
+
+          read -r object_type tag_sha < <(
+            gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" \
+              --jq '.object | [.type, .sha] | @tsv'
+          )
+          depth=0
+          while [ "$object_type" = "tag" ]; do
+            depth=$((depth + 1))
+            if [ "$depth" -gt 8 ]; then
+              echo "::error::$RELEASE_TAG has an unexpectedly deep annotated-tag chain."
+              exit 1
+            fi
+            read -r object_type tag_sha < <(
+              gh api "repos/${GH_REPO}/git/tags/${tag_sha}" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+          done
+          if [ "$object_type" != "commit" ]; then
+            echo "::error::$RELEASE_TAG resolves to ${object_type}:${tag_sha}, not a commit."
+            exit 1
+          fi
+          if [ "$tag_sha" != "$TRUSTED_SHA" ] || [ "$TRUSTED_SHA" != "$WORKFLOW_SHA" ]; then
+            echo "::error::Tag SHA $tag_sha, trusted SHA $TRUSTED_SHA, and workflow SHA $WORKFLOW_SHA must match."
+            exit 1
+          fi
+
+          main_sha="$(
+            gh api "repos/${GH_REPO}/git/ref/heads/main" --jq .object.sha
+          )"
+          comparison="$(
+            gh api "repos/${GH_REPO}/compare/${TRUSTED_SHA}...${main_sha}" --jq .status
+          )"
+          if [ "$comparison" != "ahead" ] && [ "$comparison" != "identical" ]; then
+            echo "::error::Trusted release commit $TRUSTED_SHA is not an ancestor of live main $main_sha."
+            exit 1
+          fi
+
+          echo "sha=${TRUSTED_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "$RELEASE_TAG validated at trusted default-branch commit $TRUSTED_SHA."
+
+      - name: Require repository release protections
+        env:
+          # GITHUB_TOKEN cannot receive repository Administration permission.
+          # Keep this fine-grained PAT scoped to this repository with only
+          # Administration: read.
+          GH_TOKEN: ${{ secrets.RELEASE_SETTINGS_READER }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Configure RELEASE_SETTINGS_READER with repository Administration: read."
+            exit 1
+          fi
+          enabled="$(
+            gh api \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GH_REPO}/immutable-releases" \
+              --jq .enabled 2>/dev/null || true
+          )"
+          if [ "$enabled" != "true" ]; then
+            echo "::error::Enable release immutability in repository Settings > General > Releases before publishing executable assets."
+            exit 1
+          fi
+          echo "Release immutability is enabled."
+
+          rules_file="${RUNNER_TEMP}/main-rules.json"
+          gh api \
+            --paginate \
+            --slurp \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GH_REPO}/rules/branches/main?per_page=100" \
+            > "$rules_file"
+          RULES_FILE="$rules_file" node - <<'NODE'
           const { readFileSync } = require("node:fs");
 
-          const tag = process.env.RELEASE_TAG ?? "";
-          if (!/^v\d+\.\d+\.\d+$/.test(tag)) {
-            console.error(`Release tags must match vX.Y.Z; received ${tag || "<missing>"}.`);
+          const pages = JSON.parse(readFileSync(process.env.RULES_FILE, "utf8"));
+          const rules = pages.flat();
+          const protectedByPolicy = rules.some(
+            (rule) =>
+              rule.type === "required_status_checks" &&
+              rule.parameters?.strict_required_status_checks_policy === true &&
+              rule.parameters?.required_status_checks?.some(
+                (check) =>
+                  check.context === "Policy invariants" &&
+                  check.integration_id === 15368,
+              ),
+          );
+          if (!protectedByPolicy) {
+            console.error(
+              "Active rules for main must strictly require the exact status context " +
+                '"Policy invariants" from GitHub Actions before binary releases can run.',
+            );
             process.exit(1);
           }
+          console.log('main strictly requires "Policy invariants" from GitHub Actions.');
+          NODE
 
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Validate package version
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          node - <<'NODE'
+          const { appendFileSync, readFileSync } = require("node:fs");
+
+          const tag = process.env.RELEASE_TAG ?? "";
           const pkg = JSON.parse(readFileSync("package.json", "utf8"));
           if (tag !== `v${pkg.version}`) {
             console.error(`Tag ${tag} does not match package.json version ${pkg.version}.`);
             process.exit(1);
           }
-
-          const sha = execFileSync("git", ["rev-list", "-n", "1", tag], { encoding: "utf8" }).trim();
-          try {
-            execFileSync("git", ["merge-base", "--is-ancestor", sha, "origin/main"], { stdio: "ignore" });
-          } catch {
-            console.error(`Tagged commit ${sha} is not contained in origin/main.`);
-            process.exit(1);
-          }
-          console.log(`${tag} validated.`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${pkg.version}\n`);
+          console.log(`${tag} matches package.json.`);
           NODE
 
-      - name: Refuse to overwrite a published release
+      # Run once before the build matrix fans out; each build depends on this
+      # gate, so four platforms do not hammer npm with the same metadata reads.
+      - run: node scripts/supply-chain/verify-release-age.mjs --minimum-age-minutes 2880
+
+      - name: Refuse any pre-existing release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ steps.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          # Fail here rather than after four platform builds. Immutable releases
-          # reject asset changes after publication, so a re-run against an
-          # already-published tag cannot succeed — and must not be worked around.
-          if gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null | grep -qx false; then
-            echo "::error::$TAG is already published and immutable. Cut a new version."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists. Delete the existing draft or cut a new version."
             exit 1
           fi
-          echo "$TAG is unpublished or absent; safe to build."
+          echo "No release exists for $TAG; safe to build."
 
   build:
     name: ${{ matrix.target }}
@@ -121,7 +224,9 @@ jobs:
         include:
           - runner: macos-14
             target: darwin-arm64
-          - runner: macos-13
+          # macos-13 was the last plain Intel label but is retired; the -intel
+          # variants are the supported Intel images.
+          - runner: macos-15-intel
             target: darwin-x64
           - runner: ubuntu-24.04
             target: linux-x64
@@ -130,7 +235,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          # Never re-resolve the tag after the gate: it is mutable until the
+          # draft release is published and repository immutability freezes it.
+          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
@@ -159,6 +266,7 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
+      - run: pnpm run build:test
 
       # rollup-plugin-sbom writes dist-sea/sbom.json during this build, from the
       # bundler's own module graph. These two variables are what it records as
@@ -173,7 +281,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
+          version="${{ needs.gate.outputs.version }}"
           # Validate before use: node -p prints the raw string, so an embedded
           # newline would write extra key=value pairs into $GITHUB_OUTPUT and
           # forge step outputs consumed as action inputs below.
@@ -209,6 +317,7 @@ jobs:
             exit 1
           fi
           env -i HOME="$HOME" PATH=/usr/bin:/bin "$workdir/acpx" --help > /dev/null
+          ACPX_TEST_PACKAGE_BIN="$workdir/acpx" node --test dist-test/test/packaged-bin.test.js
           echo "Verified acpx $reported"
 
       - name: Name and check the SBOM
@@ -306,67 +415,370 @@ jobs:
 
   publish:
     name: Publish release
-    needs: attest
+    needs: [gate, attest]
     runs-on: ubuntu-24.04
     # No id-token here: this job never signs anything. It writes the release.
     permissions:
       contents: write
+      attestations: read
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: assets
           merge-multiple: true
 
-      - name: Generate checksum manifest
+      - name: Generate and validate the exact checksum manifest
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
           cd assets
+          shopt -s nullglob
+          expected_assets=(
+            "acpx-${VERSION}-darwin-arm64.tar.gz"
+            "acpx-${VERSION}-darwin-arm64.tar.gz.cdx.json"
+            "acpx-${VERSION}-darwin-x64.tar.gz"
+            "acpx-${VERSION}-darwin-x64.tar.gz.cdx.json"
+            "acpx-${VERSION}-linux-arm64.tar.gz"
+            "acpx-${VERSION}-linux-arm64.tar.gz.cdx.json"
+            "acpx-${VERSION}-linux-x64.tar.gz"
+            "acpx-${VERSION}-linux-x64.tar.gz.cdx.json"
+          )
+          actual_assets=(*)
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          mapfile -t actual_assets < <(printf '%s\n' "${actual_assets[@]}" | sort)
+          if [ "${expected_assets[*]}" != "${actual_assets[*]}" ]; then
+            echo "::error::Downloaded release artifacts do not match the exact expected set."
+            printf 'expected: %s\n' "${expected_assets[*]}"
+            printf 'actual: %s\n' "${actual_assets[*]}"
+            exit 1
+          fi
           # A convenience index only. Each tarball carries its own provenance and
           # SBOM attestation, so `gh attestation verify` — not this file — is the
           # integrity mechanism.
-          shasum -a 256 *.tar.gz *.cdx.json > SHA256SUMS
+          shasum -a 256 -- *.tar.gz *.cdx.json > SHA256SUMS
           cat SHA256SUMS
+
+      - name: Verify exact npm provenance before any release write
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          VALIDATED_SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          for _ in $(seq 1 30); do
+            if curl -fsSL -o "${RUNNER_TEMP}/acpx.tgz" \
+              "https://registry.npmjs.org/acpx/-/acpx-${version}.tgz" &&
+              gh attestation verify "${RUNNER_TEMP}/acpx.tgz" \
+                --repo "$GH_REPO" \
+                --signer-workflow "${GH_REPO}/.github/workflows/release.yml" \
+                --source-digest "$VALIDATED_SHA" \
+                --source-ref "refs/heads/main"; then
+              echo "Verified npm provenance for acpx@${version}."
+              exit 0
+            fi
+            echo "Exact npm provenance for acpx@${version} is not available yet; retrying in 20s."
+            sleep 20
+          done
+          echo "::error::acpx@${version} never produced the required npm provenance."
+          exit 1
 
       - name: Attach assets to a draft, then publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          VALIDATED_SHA: ${{ needs.gate.outputs.sha }}
+          VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
+          assert_tag_matches() {
+            local object_type object_sha depth
+
+            # The tag is mutable until publication. Dereference annotated tags
+            # through the Git data API and fail if it moved after the gate.
+            read -r object_type object_sha < <(
+              gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+            depth=0
+            while [ "$object_type" = "tag" ]; do
+              depth=$((depth + 1))
+              if [ "$depth" -gt 8 ]; then
+                echo "::error::$TAG has an unexpectedly deep annotated-tag chain."
+                exit 1
+              fi
+              read -r object_type object_sha < <(
+                gh api "repos/${GH_REPO}/git/tags/${object_sha}" \
+                  --jq '.object | [.type, .sha] | @tsv'
+              )
+            done
+            if [ "$object_type" != "commit" ] || [ "$object_sha" != "$VALIDATED_SHA" ]; then
+              echo "::error::$TAG moved after validation; expected $VALIDATED_SHA, resolved ${object_type}:${object_sha}."
+              exit 1
+            fi
+          }
+
+          assert_tag_matches
+
           # Immutable releases freeze assets at publication, so everything is
           # attached to a draft first and the draft is flipped live last. The
           # older create-then-upload order cannot work here: the release would
           # be locked before the first asset landed.
           if gh release view "$TAG" >/dev/null 2>&1; then
-            if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then
-              echo "::error::$TAG is already published and immutable. Cut a new version."
-              exit 1
-            fi
-            echo "Reusing existing draft $TAG."
-          else
-            gh release create "$TAG" --draft --title "$TAG" --generate-notes
+            echo "::error::Release $TAG already exists. Delete the existing draft or cut a new version."
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --verify-tag \
+            --draft \
+            --title "$TAG" \
+            --generate-notes
+
+          # No --clobber: an unexpected collision is a hard failure.
+          gh release upload "$TAG" assets/*.tar.gz assets/*.cdx.json assets/SHA256SUMS
+
+          expected_assets=(
+            "SHA256SUMS"
+            "acpx-${VERSION}-darwin-arm64.tar.gz"
+            "acpx-${VERSION}-darwin-arm64.tar.gz.cdx.json"
+            "acpx-${VERSION}-darwin-x64.tar.gz"
+            "acpx-${VERSION}-darwin-x64.tar.gz.cdx.json"
+            "acpx-${VERSION}-linux-arm64.tar.gz"
+            "acpx-${VERSION}-linux-arm64.tar.gz.cdx.json"
+            "acpx-${VERSION}-linux-x64.tar.gz"
+            "acpx-${VERSION}-linux-x64.tar.gz.cdx.json"
+          )
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          mapfile -t actual_assets < <(
+            gh release view "$TAG" --json assets --jq '.assets | map(.name) | sort | .[]'
+          )
+          if [ "${expected_assets[*]}" != "${actual_assets[*]}" ]; then
+            echo "::error::$TAG does not contain the exact expected asset set."
+            printf 'expected: %s\n' "${expected_assets[*]}"
+            printf 'actual: %s\n' "${actual_assets[*]}"
+            exit 1
           fi
 
-          # No --clobber. A draft left behind by a failed run may already hold
-          # some assets; replacing them would silently swap bytes that were
-          # already attested. Delete the draft and re-run instead.
-          existing="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
-          for file in assets/*.tar.gz assets/*.cdx.json assets/SHA256SUMS; do
-            name="$(basename "$file")"
-            if grep -Fxq "$name" <<<"$existing"; then
-              echo "::error::$name is already attached to draft $TAG. Delete the draft and re-run."
-              exit 1
-            fi
-          done
+          read -r tag_name title draft prerelease < <(
+            gh release view "$TAG" \
+              --json tagName,name,isDraft,isPrerelease \
+              --jq '[.tagName, .name, .isDraft, .isPrerelease] | @tsv'
+          )
+          if [ "$tag_name" != "$TAG" ] ||
+            [ "$title" != "$TAG" ] ||
+            [ "$draft" != "true" ] ||
+            [ "$prerelease" != "false" ]; then
+            echo "::error::Expected tagName=$TAG, title=$TAG, draft=true, prerelease=false; got tagName=$tag_name, title=$title, draft=$draft, prerelease=$prerelease."
+            exit 1
+          fi
 
-          gh release upload "$TAG" assets/*.tar.gz assets/*.cdx.json assets/SHA256SUMS
+          # Upload can take long enough for a concurrent tag update. Check again
+          # at the last possible point before immutable publication freezes it.
+          # GitHub exposes no atomic compare-and-publish operation; repository
+          # tag-update/delete policy remains the final control for this gap.
+          assert_tag_matches
           gh release edit "$TAG" --draft=false
           echo "Published $TAG; assets and tag are now immutable."
 
-      - name: Formula checksums
+  # The formula pipeline mirrors the build/attest split above: `formula`
+  # executes the repository's generator script, so it gets no write credential;
+  # `formula-pr` holds the write credential, so it executes no repository code
+  # at all — it commits bytes it downloaded from the render job.
+  formula:
+    name: Render Homebrew formula
+    needs: [gate, publish]
+    runs-on: ubuntu-24.04
+    outputs:
+      baseline-sha256: ${{ steps.baseline.outputs.sha256 }}
+      candidate-sha256: ${{ steps.render.outputs.sha256 }}
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The validated tag, not main: the gate proved this ref is on main
+          # and matches the released version, and it cannot move afterwards —
+          # a branch checkout would run whatever landed on main since.
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+
+      - name: Require the formula version to advance live main
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
-          # Paste into Formula/acpx.rb. A stale checksum makes `brew install`
-          # fail loudly instead of installing a wrong artifact.
-          grep 'tar\.gz$' assets/SHA256SUMS
+          current_formula="${RUNNER_TEMP}/main-acpx.rb"
+          gh api \
+            --header "Accept: application/vnd.github.raw+json" \
+            "repos/${GH_REPO}/contents/Formula/acpx.rb?ref=main" \
+            > "$current_formula"
+
+          ruby scripts/release/formula-version.rb \
+            assert-target-advance "$TARGET_VERSION" "$current_formula"
+          baseline_sha256="$(sha256sum "$current_formula" | cut -d' ' -f1)"
+          echo "sha256=${baseline_sha256}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the release checksum manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # From the published release, not the build artifacts: the release is
+          # immutable, so this is the manifest users can verify against.
+          gh release download "$TAG" --pattern SHA256SUMS --dir "${RUNNER_TEMP}"
+
+      - name: Wait for the npm tarball, verify it, and record its checksum
+        id: npm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          VALIDATED_SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # release.yml publishes the npm package in a parallel workflow, so the
+          # tarball may lag this job by a few minutes. Fail after ~10 minutes:
+          # a formula whose fallback URL 404s must not be proposed.
+          for _ in $(seq 1 30); do
+            if curl -fsSL -o "${RUNNER_TEMP}/acpx.tgz" \
+              "https://registry.npmjs.org/acpx/-/acpx-${version}.tgz"; then
+              # Not trust-on-first-use: whatever the registry served must carry
+              # this repository's provenance attestation — created by release.yml
+              # over the exact packed tarball before publish — before its
+              # checksum is pinned into a formula every brew user will install.
+              gh attestation verify "${RUNNER_TEMP}/acpx.tgz" \
+                --repo "$GH_REPO" \
+                --signer-workflow "${GH_REPO}/.github/workflows/release.yml" \
+                --source-digest "$VALIDATED_SHA" \
+                --source-ref "refs/heads/main"
+              sha="$(sha256sum "${RUNNER_TEMP}/acpx.tgz" | cut -d' ' -f1)"
+              echo "sha256=${sha}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "npm tarball for ${version} not available yet; retrying in 20s."
+            sleep 20
+          done
+          echo "::error::acpx@${version} never appeared on the npm registry."
+          exit 1
+
+      - name: Regenerate the formula
+        id: render
+        env:
+          TAG: ${{ needs.gate.outputs.tag }}
+          NPM_SHA256: ${{ steps.npm.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          node scripts/sea/generate-formula.mjs \
+            --version "${TAG#v}" \
+            --npm-sha256 "$NPM_SHA256" \
+            --sums "${RUNNER_TEMP}/SHA256SUMS" \
+            --current-formula "${RUNNER_TEMP}/main-acpx.rb"
+          # The GITHUB_TOKEN-created PR receives an approval-required workflow
+          # run. Keep a pre-PR syntax proof so approval is not spent discovering
+          # a generated syntax error. A full `brew audit` is unavailable on Linux.
+          ruby -c Formula/acpx.rb
+          ruby scripts/release/formula-version.rb assert-version Formula/acpx.rb "${TAG#v}"
+          candidate_sha256="$(sha256sum Formula/acpx.rb | cut -d' ' -f1)"
+          echo "sha256=${candidate_sha256}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: formula
+          path: Formula/acpx.rb
+          if-no-files-found: error
+
+  formula-pr:
+    name: Propose formula update
+    needs: [gate, formula]
+    runs-on: ubuntu-24.04
+    # Writes a branch and opens a PR; requires "Allow GitHub Actions to create
+    # and approve pull requests" in the repository's Actions settings.
+    #
+    # This job holds the write credential, so it runs no repository code: the
+    # checkout is only a git work tree for the commit below, and every command
+    # is an inline git/gh invocation. The formula bytes come exclusively from
+    # the render job's artifact.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR targets main, so the branch forks from it. Nothing from this
+          # checkout is executed.
+          ref: main
+          persist-credentials: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formula
+          path: ${{ runner.temp }}/formula
+
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          EXPECTED_BASELINE_SHA256: ${{ needs.formula.outputs.baseline-sha256 }}
+          EXPECTED_CANDIDATE_SHA256: ${{ needs.formula.outputs.candidate-sha256 }}
+        run: |
+          set -euo pipefail
+          candidate="${RUNNER_TEMP}/formula/acpx.rb"
+          main_formula="${RUNNER_TEMP}/main-acpx.rb"
+          git fetch --no-tags origin main
+          git show origin/main:Formula/acpx.rb > "$main_formula"
+
+          if ! [[ "$EXPECTED_BASELINE_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+            ! [[ "$EXPECTED_CANDIDATE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Formula render job returned malformed digest outputs."
+            exit 1
+          fi
+          baseline_sha256="$(sha256sum "$main_formula" | cut -d' ' -f1)"
+          candidate_sha256="$(sha256sum "$candidate" | cut -d' ' -f1)"
+          if [ "$baseline_sha256" != "$EXPECTED_BASELINE_SHA256" ]; then
+            echo "::error::Formula/acpx.rb on main changed after version validation; rerun the release workflow."
+            exit 1
+          fi
+          if [ "$candidate_sha256" != "$EXPECTED_CANDIDATE_SHA256" ]; then
+            echo "::error::Downloaded formula differs from the parser-validated render."
+            exit 1
+          fi
+
+          if cmp -s "$candidate" "$main_formula"; then
+            echo "Formula already matches $TAG; nothing to propose."
+            exit 0
+          fi
+          branch="bot/homebrew-formula-${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch" origin/main
+          cp "$candidate" Formula/acpx.rb
+          git add Formula/acpx.rb
+          git commit -m "chore(brew): point the formula at $TAG"
+          # Plain --force: a fresh clone has no remote-tracking ref for the bot
+          # branch, so --force-with-lease would reject every re-run. The branch
+          # is namespaced to this job and carries generated content only.
+          git push --force origin "$branch"
+          # A PR rather than a direct push: the formula names the bytes every
+          # brew user installs, so it goes through the same review path as any
+          # other change to main.
+          if ! gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr create \
+              --title "chore(brew): point the formula at $TAG" \
+              --body "$(printf 'Regenerated by the formula jobs of release-binaries.yml from the %s release assets and the attestation-verified npm tarball.\n\nGitHub creates the required Policy invariants run in an approval-required state; a maintainer must approve that run before this PR can merge.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$TAG")"
+          fi

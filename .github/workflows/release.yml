@@ -1,45 +1,165 @@
 name: Release
 
-# Publishes the npm package. The single-executable binaries are built and
-# attested separately by release-binaries.yml.
-#
-# Trust model, and where it differs from the binary pipeline: that workflow
-# keeps the signing identity in a job that runs no repository code. This one
-# cannot. npm trusted publishing derives provenance from an OIDC token minted in
-# the job that holds the package, so build code and the signing identity are
-# necessarily co-resident here. The mitigations that remain are the gates below
-# — tag ancestry, metadata validation, a lockfile-frozen install — plus
-# publishing a tarball that was attested before it left the runner.
-
+# The unprivileged Release request workflow runs from the pushed tag. This
+# workflow runs only from the default branch after that request completes.
+# Before checkout, the gate requires the request commit, the trusted workflow
+# commit, the live tag, and the live default-branch tip to be the same commit.
+# Build code therefore gets no OIDC identity; the separate publisher receives
+# only this run's packed tarball and SBOM.
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_run:
+    workflows: ["Release request"]
+    types: [completed]
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
+  group: release-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 env:
   NODE_VERSION: 24
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
+  SYFT_VERSION: 1.44.0
+  SYFT_LINUX_AMD64_SHA256: 0e91737aee2b5baf1d255b959630194a302335d848ff97bb07921eb6205b5f5a
 
 jobs:
-  release:
-    # DO NOT change this job back to a self-hosted runner.
-    # npm trusted publishing + provenance for GitHub Actions releases
-    # requires a GitHub-hosted runner, and publishing fails on self-hosted
-    # environments with:
-    # "Unsupported GitHub Actions runner environment: self-hosted".
-    runs-on: ubuntu-latest
+  gate:
+    name: Validate trusted release request
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
-      id-token: write
-      attestations: write
+    outputs:
+      sha: ${{ steps.validate.outputs.sha }}
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Validate the release request before checkout
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUEST_EVENT: ${{ github.event.workflow_run.event }}
+          REQUEST_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          REQUEST_SHA: ${{ github.event.workflow_run.head_sha }}
+          TRUSTED_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+
+          resolve_tag_sha() {
+            local object_type object_sha depth
+            read -r object_type object_sha < <(
+              gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+            depth=0
+            while [ "$object_type" = "tag" ]; do
+              depth=$((depth + 1))
+              if [ "$depth" -gt 8 ]; then
+                echo "::error::$RELEASE_TAG has an unexpectedly deep annotated-tag chain."
+                exit 1
+              fi
+              read -r object_type object_sha < <(
+                gh api "repos/${GH_REPO}/git/tags/${object_sha}" \
+                  --jq '.object | [.type, .sha] | @tsv'
+              )
+            done
+            if [ "$object_type" != "commit" ]; then
+              echo "::error::$RELEASE_TAG resolves to ${object_type}:${object_sha}, not a commit."
+              exit 1
+            fi
+            printf '%s\n' "$object_sha"
+          }
+
+          if [ "$REQUEST_EVENT" != "push" ] || [ "$REQUEST_CONCLUSION" != "success" ]; then
+            echo "::error::Release must follow a successful push-based Release request."
+            exit 1
+          fi
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must match vX.Y.Z; received '${RELEASE_TAG:-<missing>}'."
+            exit 1
+          fi
+          if [ "$REQUEST_SHA" != "$TRUSTED_SHA" ] || [ "$TRUSTED_SHA" != "$WORKFLOW_SHA" ]; then
+            echo "::error::Request SHA $REQUEST_SHA, trusted SHA $TRUSTED_SHA, and workflow SHA $WORKFLOW_SHA must match."
+            exit 1
+          fi
+
+          tag_sha="$(resolve_tag_sha)"
+          if [ "$tag_sha" != "$TRUSTED_SHA" ]; then
+            echo "::error::$RELEASE_TAG resolves to $tag_sha, expected trusted commit $TRUSTED_SHA."
+            exit 1
+          fi
+
+          main_sha="$(
+            gh api "repos/${GH_REPO}/git/ref/heads/main" --jq .object.sha
+          )"
+          comparison="$(
+            gh api "repos/${GH_REPO}/compare/${TRUSTED_SHA}...${main_sha}" --jq .status
+          )"
+          if [ "$comparison" != "ahead" ] && [ "$comparison" != "identical" ]; then
+            echo "::error::Trusted release commit $TRUSTED_SHA is not an ancestor of live main $main_sha."
+            exit 1
+          fi
+
+          echo "sha=${TRUSTED_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "$RELEASE_TAG validated at trusted default-branch commit $TRUSTED_SHA."
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Validate package version and release metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          node - <<'NODE'
+          const { appendFileSync, readFileSync } = require("node:fs");
+
+          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          const releaseTag = process.env.RELEASE_TAG ?? "";
+          const expectedAuthor = "OpenClaw Team <dev@openclaw.ai>";
+          const normalizeRepoUrl = (value) =>
+            String(value ?? "")
+              .trim()
+              .replace(/^git\+/, "")
+              .replace(/\.git$/i, "")
+              .replace(/\/+$/, "");
+          const expectedRepoUrl = "https://github.com/openclaw/acpx";
+          const errors = [];
+
+          if (releaseTag !== `v${pkg.version}`) {
+            errors.push(
+              `Release tag ${releaseTag} does not match package.json version ${pkg.version}.`,
+            );
+          }
+          if (normalizeRepoUrl(pkg?.repository?.url) !== expectedRepoUrl) {
+            errors.push(`package.json repository.url must resolve to ${expectedRepoUrl}.`);
+          }
+          if ((pkg?.author ?? "") !== expectedAuthor) {
+            errors.push(`package.json author must be exactly "${expectedAuthor}".`);
+          }
+          if (errors.length > 0) {
+            for (const error of errors) console.error(error);
+            process.exit(1);
+          }
+
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${pkg.version}\n`);
+          console.log(`Validated acpx ${pkg.version} release metadata.`);
+          NODE
+
+  build:
+    name: Build and validate npm archive
+    needs: gate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
@@ -50,199 +170,420 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: true
-          cache: pnpm
 
+      - run: node scripts/supply-chain/verify-release-age.mjs --minimum-age-minutes 2880
       - run: pnpm install --frozen-lockfile
 
-      - name: Validate package metadata for trusted publishing
-        run: |
-          node - <<'NODE'
-          const { readFileSync } = require("node:fs");
-
-          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-          const expectedAuthor = "OpenClaw Team <dev@openclaw.ai>";
-          const expectedRepoUrl = "https://github.com/openclaw/acpx";
-
-          const normalizeRepoUrl = (value) =>
-            String(value ?? "")
-              .trim()
-              .replace(/^git\+/, "")
-              .replace(/\.git$/i, "")
-              .replace(/\/+$/, "");
-
-          const actualRepoUrl = normalizeRepoUrl(pkg?.repository?.url);
-          const expectedRepoUrlNormalized = normalizeRepoUrl(expectedRepoUrl);
-
-          const errors = [];
-          if (actualRepoUrl !== expectedRepoUrlNormalized) {
-            errors.push(
-              `package.json repository.url must resolve to ${expectedRepoUrlNormalized}; found ${actualRepoUrl || "<missing>"}`
-            );
-          }
-          if ((pkg?.author ?? "") !== expectedAuthor) {
-            errors.push(
-              `package.json author must be exactly "${expectedAuthor}"; found "${pkg?.author ?? ""}"`
-            );
-          }
-
-          if (errors.length > 0) {
-            for (const err of errors) {
-              console.error(err);
-            }
-            process.exit(1);
-          }
-
-          console.log("Package metadata validated.");
-          NODE
-
-      - name: Validate release tag
-        env:
-          RELEASE_SHA: ${{ github.sha }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin main --depth=1
-
-          node - <<'NODE'
-          const { execFileSync } = require("node:child_process");
-          const { readFileSync } = require("node:fs");
-
-          const releaseTag = process.env.RELEASE_TAG ?? "";
-          const releaseSha = process.env.RELEASE_SHA ?? "";
-          const semverTag = /^v\d+\.\d+\.\d+$/;
-
-          if (!semverTag.test(releaseTag)) {
-            console.error(
-              `Release tags must match vX.Y.Z; received ${releaseTag || "<missing>"}.`
-            );
-            process.exit(1);
-          }
-
-          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-          const expectedTag = `v${pkg.version}`;
-
-          if (releaseTag !== expectedTag) {
-            console.error(
-              `Release tag ${releaseTag} does not match package.json version ${pkg.version}; expected ${expectedTag}.`
-            );
-            process.exit(1);
-          }
-
-          try {
-            execFileSync(
-              "git",
-              ["merge-base", "--is-ancestor", releaseSha, "origin/main"],
-              { stdio: "ignore" }
-            );
-          } catch {
-            console.error(
-              `Tagged commit ${releaseSha} is not contained in origin/main.`
-            );
-            process.exit(1);
-          }
-
-          console.log(
-            `Release tag ${releaseTag} matches package.json and points to a commit on origin/main.`
-          );
-          NODE
-
       - name: Ensure version is not already published
+        env:
+          PACKAGE_VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
           error_log="$(mktemp)"
-
           if npm view "acpx@${PACKAGE_VERSION}" version >/dev/null 2>"${error_log}"; then
-            echo "acpx@$PACKAGE_VERSION is already published on npm."
+            echo "::error::acpx@$PACKAGE_VERSION is already published on npm."
             exit 1
           fi
-
           if ! grep -Eq "E404|404 Not Found" "${error_log}"; then
             cat "${error_log}" >&2
             exit 1
           fi
-
-          echo "Publishing acpx@$PACKAGE_VERSION"
+          echo "acpx@$PACKAGE_VERSION is not yet published."
 
       - run: pnpm run lint
       - run: pnpm run typecheck
       - run: pnpm run build
 
-      # Pack before publishing so the bytes that get attested are the bytes that
-      # get published. `npm publish` on its own repacks, which would leave the
-      # attestation describing a tarball no one can fetch.
       - name: Pack the package
         id: pack
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
-          tarball="$(npm pack --silent)"
-          if ! [[ "$tarball" =~ ^acpx-[0-9]+\.[0-9]+\.[0-9]+\.tgz$ ]]; then
-            echo "::error::npm pack produced an unexpected name: '$tarball'"
+          tarball="$(npm pack --ignore-scripts --silent)"
+          expected="acpx-${VERSION}.tgz"
+          if [ "$tarball" != "$expected" ] || [ ! -f "$tarball" ]; then
+            echo "::error::npm pack produced '${tarball:-<missing>}', expected $expected."
             exit 1
           fi
           echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
 
-      # Unlike the single executable, the npm package bundles nothing: `dist/`
-      # ships alone and every dependency is installed on the user's machine at
-      # install time. So the honest scan target is the production dependency
-      # closure, resolved from the same frozen lockfile — currently ~685
-      # packages, most of them pulled in by the bundled ACP adapters.
-      #
-      # Built in a scratch directory rather than by pruning the existing
-      # install, so a dev-only package cannot leak into the result.
-      - name: Resolve the production dependency closure
+      - name: Validate the packed Homebrew dependency closure
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          EXPECTED_VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/prod-tree"
-          cp package.json pnpm-lock.yaml pnpm-workspace.yaml "${RUNNER_TEMP}/prod-tree/"
-          cd "${RUNNER_TEMP}/prod-tree"
-          # --ignore-scripts: this installs untrusted dependency code, and there
-          # is an OIDC token in this job.
-          pnpm install --prod --frozen-lockfile --ignore-scripts
+          npm_tree="${RUNNER_TEMP}/npm-tree"
+          pnpm_tree="${RUNNER_TEMP}/pnpm-tree"
+          mkdir -p "$npm_tree"
+          tar -xzf "$TARBALL" -C "$npm_tree" --strip-components=1
+          if [ ! -f "$npm_tree/npm-shrinkwrap.json" ]; then
+            echo "::error::Packed npm archive is missing npm-shrinkwrap.json."
+            exit 1
+          fi
+          (
+            cd "$npm_tree"
+            npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+            reported="$(node dist/cli.js --version)"
+            if [ "$reported" != "$EXPECTED_VERSION" ]; then
+              echo "::error::Packed npm archive reported $reported, expected $EXPECTED_VERSION."
+              exit 1
+            fi
+            flow_smoke="${RUNNER_TEMP}/npm-fallback-smoke.flow.ts"
+            cat > "$flow_smoke" <<'FLOW'
+          import { compute, defineFlow } from "acpx/flows";
 
-      - name: Generate SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          path: ${{ runner.temp }}/prod-tree
-          format: cyclonedx-json
-          output-file: ${{ steps.pack.outputs.tarball }}.cdx.json
-          upload-artifact: false
-          upload-release-assets: false
+          enum NpmFallbackSmoke {
+            Locked = "locked",
+          }
 
-      - name: Check the SBOM describes something
+          export default defineFlow({
+            name: "npm-fallback-smoke",
+            startAt: "prove_typescript",
+            nodes: {
+              prove_typescript: compute({
+                run: () => NpmFallbackSmoke.Locked,
+              }),
+            },
+            edges: [],
+          });
+          FLOW
+            flow_result="$(
+              HOME="${RUNNER_TEMP}/npm-flow-home" node dist/cli.js --format json flow run "$flow_smoke"
+            )"
+            FLOW_RESULT="$flow_result" node - <<'NODE'
+          const payload = JSON.parse(process.env.FLOW_RESULT ?? "");
+          if (
+            payload.action !== "flow_run_result" ||
+            payload.status !== "completed" ||
+            payload.outputs?.prove_typescript !== "locked"
+          ) {
+            console.error("Packed npm archive failed the TypeScript flow smoke.");
+            console.error(JSON.stringify(payload, null, 2));
+            process.exit(1);
+          }
+          console.log("Packed npm archive executed a TypeScript enum flow.");
+          NODE
+          )
+
+          pnpm --filter acpx deploy \
+            --prod \
+            --legacy \
+            --ignore-scripts \
+            "$pnpm_tree"
+
+          NPM_TREE="$npm_tree" PNPM_TREE="$pnpm_tree" node - <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          function collectPackages(root) {
+            const found = new Set();
+            const visited = new Set();
+
+            function visitPackage(packageDir) {
+              let real;
+              try {
+                real = fs.realpathSync(packageDir);
+              } catch {
+                return;
+              }
+              if (visited.has(real)) return;
+              visited.add(real);
+
+              const manifestPath = path.join(real, "package.json");
+              if (!fs.existsSync(manifestPath)) return;
+              const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+              if (typeof manifest.name !== "string" || typeof manifest.version !== "string") {
+                throw new Error(`Invalid package manifest at ${manifestPath}`);
+              }
+              found.add(`${manifest.name}@${manifest.version}`);
+              visitNodeModules(path.join(real, "node_modules"));
+            }
+
+            function visitNodeModules(nodeModulesDir) {
+              if (!fs.existsSync(nodeModulesDir)) return;
+              for (const entry of fs.readdirSync(nodeModulesDir, { withFileTypes: true })) {
+                if (entry.name.startsWith(".")) continue;
+                const entryPath = path.join(nodeModulesDir, entry.name);
+                if (entry.name.startsWith("@")) {
+                  for (const scoped of fs.readdirSync(entryPath, { withFileTypes: true })) {
+                    if (scoped.isDirectory() || scoped.isSymbolicLink()) {
+                      visitPackage(path.join(entryPath, scoped.name));
+                    }
+                  }
+                } else if (entry.isDirectory() || entry.isSymbolicLink()) {
+                  visitPackage(entryPath);
+                }
+              }
+            }
+
+            visitNodeModules(path.join(root, "node_modules"));
+            const pnpmStore = path.join(root, "node_modules", ".pnpm");
+            if (fs.existsSync(pnpmStore)) {
+              for (const entry of fs.readdirSync(pnpmStore, { withFileTypes: true })) {
+                if (entry.isDirectory()) {
+                  visitNodeModules(path.join(pnpmStore, entry.name, "node_modules"));
+                }
+              }
+            }
+            return [...found].sort();
+          }
+
+          const npmPackages = collectPackages(process.env.NPM_TREE);
+          const pnpmPackages = collectPackages(process.env.PNPM_TREE);
+          const npmSet = new Set(npmPackages);
+          const pnpmSet = new Set(pnpmPackages);
+          const onlyNpm = npmPackages.filter((entry) => !pnpmSet.has(entry));
+          const onlyPnpm = pnpmPackages.filter((entry) => !npmSet.has(entry));
+          const names = new Set(npmPackages.map((entry) => entry.slice(0, entry.lastIndexOf("@"))));
+          const required = [
+            "@agentclientprotocol/claude-agent-acp",
+            "@agentclientprotocol/codex-acp",
+            "@agentclientprotocol/sdk",
+          ];
+          const forbidden = ["@stryker-mutator/core", "oxlint", "vite"];
+          const missing = required.filter((name) => !names.has(name));
+          const devOnly = forbidden.filter((name) => names.has(name));
+
+          if (
+            npmPackages.length === 0 ||
+            onlyNpm.length > 0 ||
+            onlyPnpm.length > 0 ||
+            missing.length > 0 ||
+            devOnly.length > 0
+          ) {
+            console.error("npm and pnpm production dependency closures differ.");
+            console.error(`only-npm=${onlyNpm.join(",") || "none"}`);
+            console.error(`only-pnpm=${onlyPnpm.join(",") || "none"}`);
+            console.error(`missing=${missing.join(",") || "none"}`);
+            console.error(`dev-only=${devOnly.join(",") || "none"}`);
+            process.exit(1);
+          }
+
+          function packageNameFromLockPath(lockPath) {
+            const tail = lockPath.split("node_modules/").at(-1) ?? "";
+            const parts = tail.split("/");
+            return tail.startsWith("@") ? parts.slice(0, 2).join("/") : (parts[0] ?? "");
+          }
+
+          function npmResolutions(lockPath, installed) {
+            const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+            const resolutions = new Map();
+            for (const [packagePath, record] of Object.entries(lock.packages ?? {})) {
+              if (packagePath === "") continue;
+              const name = record.name ?? packageNameFromLockPath(packagePath);
+              const identity = `${name}@${record.version ?? ""}`;
+              if (!installed.has(identity)) continue;
+              if (!record.integrity || !record.resolved) {
+                throw new Error(`Missing npm resolution metadata for ${identity}.`);
+              }
+              const registryUrl = new URL(record.resolved);
+              if (
+                registryUrl.protocol !== "https:" ||
+                registryUrl.hostname !== "registry.npmjs.org"
+              ) {
+                throw new Error(`Non-canonical npm registry URL for ${identity}: ${record.resolved}`);
+              }
+              const prior = resolutions.get(identity);
+              if (prior && prior !== record.integrity) {
+                throw new Error(`Conflicting npm integrities for ${identity}.`);
+              }
+              resolutions.set(identity, record.integrity);
+            }
+            return resolutions;
+          }
+
+          function pnpmIntegrities(lockPath) {
+            const integrities = new Map();
+            let inPackages = false;
+            let identity = "";
+            for (const line of fs.readFileSync(lockPath, "utf8").split(/\r?\n/)) {
+              if (line === "packages:") {
+                inPackages = true;
+                continue;
+              }
+              if (inPackages && line === "snapshots:") break;
+              if (!inPackages) continue;
+              const key = line.match(/^  (?:'([^']+)'|"([^"]+)"|([^:]+)):\s*$/);
+              if (key) {
+                identity = key[1] ?? key[2] ?? key[3] ?? "";
+                continue;
+              }
+              const resolution = line.match(/^    resolution: \{integrity: ([^,}]+)[^}]*\}$/);
+              if (identity && resolution?.[1]) {
+                integrities.set(identity, resolution[1]);
+              }
+            }
+            return integrities;
+          }
+
+          const npmResolution = npmResolutions(
+            path.join(process.env.NPM_TREE, "npm-shrinkwrap.json"),
+            npmSet,
+          );
+          const pnpmResolution = pnpmIntegrities(
+            path.join(process.env.PNPM_TREE, "node_modules", ".pnpm", "lock.yaml"),
+          );
+          for (const identity of npmPackages) {
+            const npmIntegrity = npmResolution.get(identity);
+            const pnpmIntegrity = pnpmResolution.get(identity);
+            if (!npmIntegrity || npmIntegrity !== pnpmIntegrity) {
+              console.error(
+                `package byte-integrity mismatch for ${identity}: ` +
+                  `npm=${npmIntegrity ?? "missing"}, pnpm=${pnpmIntegrity ?? "missing"}`,
+              );
+              process.exit(1);
+            }
+          }
+          console.log(`Locked production closure: ${npmPackages.length} package identities.`);
+          NODE
+
+      - name: Install pinned Syft
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/syft.tar.gz"
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --proto '=https' \
+            --tlsv1.2 \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$SYFT_LINUX_AMD64_SHA256" "$archive" | sha256sum --check
+          mkdir -p "${RUNNER_TEMP}/syft"
+          tar -xzf "$archive" -C "${RUNNER_TEMP}/syft" syft
+          "${RUNNER_TEMP}/syft/syft" version
+
+      - name: Generate and validate SBOM
         env:
           SBOM: ${{ steps.pack.outputs.tarball }}.cdx.json
         run: |
           set -euo pipefail
-          # An empty document would attest cleanly and tell users nothing.
-          # Syft reports zero components for inputs it cannot catalog, which is
-          # how a silently-broken scan looks.
+          "${RUNNER_TEMP}/syft/syft" \
+            "dir:${RUNNER_TEMP}/npm-tree" \
+            --output "cyclonedx-json=${SBOM}"
+
           node - <<'NODE'
-          const { readFileSync } = require("node:fs");
+          const { readFileSync, writeFileSync } = require("node:fs");
           const bom = JSON.parse(readFileSync(process.env.SBOM, "utf8"));
-          const libraries = (bom.components ?? []).filter((c) => c.type === "library");
-          if (libraries.length < 50) {
-            console.error(`SBOM lists ${libraries.length} libraries; the scan did not work.`);
+          delete bom.serialNumber;
+          if (bom.metadata) delete bom.metadata.timestamp;
+
+          const libraries = (bom.components ?? []).filter((component) => component.type === "library");
+          const names = new Set(libraries.map((component) => component.name));
+          const expected = [
+            "@agentclientprotocol/claude-agent-acp",
+            "@agentclientprotocol/codex-acp",
+            "@agentclientprotocol/sdk",
+          ];
+          const missing = expected.filter((name) => !names.has(name));
+          const forbidden = ["@stryker-mutator/core", "oxlint", "vite"].filter((name) =>
+            names.has(name),
+          );
+          if (libraries.length === 0 || missing.length > 0 || forbidden.length > 0) {
+            console.error(
+              `Invalid production SBOM: ${libraries.length} libraries; ` +
+                `missing=${missing.join(",") || "none"}; ` +
+                `dev-only=${forbidden.join(",") || "none"}.`,
+            );
             process.exit(1);
           }
-          console.log(`SBOM: ${libraries.length} libraries.`);
+          writeFileSync(process.env.SBOM, `${JSON.stringify(bom, null, 2)}\n`);
+          console.log(`SBOM: ${libraries.length} production libraries.`);
           NODE
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-release
+          path: |
+            ${{ steps.pack.outputs.tarball }}
+            ${{ steps.pack.outputs.tarball }}.cdx.json
+          if-no-files-found: error
+
+  publish:
+    name: Attest and publish npm archive
+    needs: [gate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-release
+          path: assets
+
+      - name: Resolve same-run artifact paths
+        id: paths
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          tarball="assets/acpx-${VERSION}.tgz"
+          sbom="${tarball}.cdx.json"
+          if [ ! -f "$tarball" ] || [ ! -f "$sbom" ]; then
+            echo "::error::Expected this run to provide exactly $tarball and $sbom."
+            exit 1
+          fi
+          if [ "$(find assets -type f | wc -l | tr -d ' ')" != "2" ]; then
+            echo "::error::npm-release contains unexpected files."
+            exit 1
+          fi
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "sbom=${sbom}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: true
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: ${{ steps.pack.outputs.tarball }}
+          subject-path: ${{ steps.paths.outputs.tarball }}
 
       - name: Attest SBOM
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
-          subject-path: ${{ steps.pack.outputs.tarball }}
-          sbom-path: ${{ steps.pack.outputs.tarball }}.cdx.json
+          subject-path: ${{ steps.paths.outputs.tarball }}
+          sbom-path: ${{ steps.paths.outputs.sbom }}
 
-      # `--provenance` is npm's own attestation, recorded in the registry and
-      # verifiable with `npm audit signatures`. It is separate from the GitHub
-      # attestations above, which cover the same bytes and are verifiable with
-      # `gh attestation verify`. Both are kept: they have different trust roots
-      # and different audiences.
-      - name: Publish
-        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public --provenance
+      - name: Recheck the live tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
+          TARBALL: ${{ steps.paths.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          assert_tag_matches() {
+            local object_type object_sha depth
+            read -r object_type object_sha < <(
+              gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+            depth=0
+            while [ "$object_type" = "tag" ]; do
+              depth=$((depth + 1))
+              if [ "$depth" -gt 8 ]; then
+                echo "::error::$RELEASE_TAG has an unexpectedly deep annotated-tag chain."
+                exit 1
+              fi
+              read -r object_type object_sha < <(
+                gh api "repos/${GH_REPO}/git/tags/${object_sha}" \
+                  --jq '.object | [.type, .sha] | @tsv'
+              )
+            done
+            if [ "$object_type" != "commit" ] || [ "$object_sha" != "$RELEASE_SHA" ]; then
+              echo "::error::$RELEASE_TAG moved; expected $RELEASE_SHA, resolved ${object_type}:${object_sha}."
+              exit 1
+            fi
+          }
+
+          assert_tag_matches
+          npm publish "$TARBALL" --access public --provenance --ignore-scripts

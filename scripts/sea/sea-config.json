@@ -2,6 +2,13 @@
   "main": "dist-sea/entry.cjs",
   "mainFormat": "commonjs",
   "output": "dist-sea/acpx-sea.blob",
+  "assets": {
+    "acpx-flow-cli": "dist-sea/runtime/delegated-entry.cjs",
+    "acpx-flow-runtime": "dist-sea/runtime/flows.js",
+    "acpx-flow-esbuild-package": "dist-sea/runtime/node_modules/esbuild/package.json",
+    "acpx-flow-esbuild-main": "dist-sea/runtime/node_modules/esbuild/lib/main.js",
+    "acpx-flow-esbuild-binary": "dist-sea/runtime/esbuild"
+  },
   "disableExperimentalSEAWarning": true,
   "useSnapshot": true,
   "useCodeCache": false

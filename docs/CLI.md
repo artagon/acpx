@@ -118,6 +118,7 @@ All global options:
 | `--format <fmt>`                         | Output format                                  | `text` (default), `json`, `quiet`.                                                                                                                    |
 | `--suppress-reads`                       | Suppress read file contents                    | Replaces raw read payloads with `[read output suppressed]`.                                                                                           |
 | `--json-strict`                          | Strict JSON mode                               | Requires `--format json`; suppresses non-JSON stderr output.                                                                                          |
+| `--no-fs`                                | Disable ACP filesystem capabilities            | Advertises `clientCapabilities.fs.readTextFile` and `writeTextFile` as `false` during ACP initialize for new agent clients.                           |
 | `--no-terminal`                          | Disable ACP terminal capability                | Advertises `clientCapabilities.terminal: false` during ACP initialize for new agent clients.                                                          |
 | `--non-interactive-permissions <policy>` | Non-TTY prompt policy                          | `deny` (default) or `fail` when approval prompt cannot be shown.                                                                                      |
 | `--permission-policy <json-or-file>`     | Per-tool permission policy                     | JSON object or file path with `autoApprove`, `autoDeny`, `escalate`, and optional `defaultAction` (`approve`, `deny`, `escalate`). Alias: `--policy`. |
@@ -140,6 +141,7 @@ acpx --policy '{"escalate":["execute"],"defaultAction":"deny"}' --format json co
 acpx --cwd ~/repos/api codex 'review auth middleware'
 acpx --format json codex exec 'summarize open TODO items'
 acpx --format json --json-strict codex exec 'machine-safe JSON output'
+acpx --no-fs codex exec 'use agent-native file operations'
 acpx --no-terminal codex exec 'summarize without terminal capability'
 acpx --timeout 120 codex 'investigate flaky test failures'
 acpx --ttl 30 codex 'keep queue owner warm for quick follow-up'
@@ -174,11 +176,28 @@ Built-in command mapping: `openclaw -> openclaw acp`
 
 For repo-local OpenClaw checkouts, override the built-in command in config:
 
+This launch uses the Unix `env` executable. Replace the token-file placeholder
+with an absolute path. On Windows, use a wrapper that sets the two environment
+variables and put that wrapper plus its arguments in `argv`.
+
 ```json
 {
   "agents": {
     "openclaw": {
-      "command": "env OPENCLAW_HIDE_BANNER=1 OPENCLAW_SUPPRESS_NOTES=1 node scripts/run-node.mjs acp --url ws://127.0.0.1:18789 --token-file ~/.openclaw/gateway.token --session agent:main:main"
+      "argv": [
+        "env",
+        "OPENCLAW_HIDE_BANNER=1",
+        "OPENCLAW_SUPPRESS_NOTES=1",
+        "node",
+        "scripts/run-node.mjs",
+        "acp",
+        "--url",
+        "ws://127.0.0.1:18789",
+        "--token-file",
+        "/absolute/path/to/.openclaw/gateway.token",
+        "--session",
+        "agent:main:main"
+      ]
     }
   }
 }
@@ -429,7 +448,7 @@ Supported keys:
   "timeout": null,
   "format": "text",
   "agents": {
-    "my-custom": { "command": "./bin/my-acp-server", "args": ["acp"] }
+    "my-custom": { "argv": ["./bin/my-acp-server", "acp"] }
   },
   "auth": {
     "my_auth_method_id": "credential-value"
@@ -439,6 +458,10 @@ Supported keys:
 
 CLI flags always override config values.
 
+Custom agents should use structured `agents.<name>.argv`, which is required on Windows. Legacy
+`command` plus `args` entries migrate when `command` is an unquoted executable with no whitespace.
+Raw command strings, including `--agent`, are supported only on Unix.
+
 For ACP `authenticate` handshakes, use either config `auth` entries or explicit
 `ACPX_AUTH_<METHOD_ID>` environment variables such as `ACPX_AUTH_OPENAI_API_KEY`.
 Ambient provider env vars such as `OPENAI_API_KEY` are still passed through to
@@ -446,7 +469,8 @@ child agents, but they do not trigger ACP auth-method selection on their own.
 
 ## `--agent` escape hatch
 
-`--agent <command>` sets a raw adapter command explicitly.
+`--agent <command>` sets a raw adapter command explicitly on Unix. On Windows, define a named
+agent with `agents.<name>.argv` so executable and argument boundaries remain unambiguous.
 
 Examples:
 

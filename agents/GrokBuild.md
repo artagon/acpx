@@ -22,7 +22,7 @@ If your Grok Build install exposes ACP through a different command, override the
 {
   "agents": {
     "grok-build": {
-      "command": "grok agent stdio"
+      "argv": ["grok", "agent", "stdio"]
     }
   }
 }

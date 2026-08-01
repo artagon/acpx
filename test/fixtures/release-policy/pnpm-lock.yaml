@@ -1,0 +1,15 @@
+lockfileVersion: '9.0'
+
+packages:
+
+  '@scope/old-package@1.0.0':
+    resolution: {integrity: sha512-old}
+
+  fresh-package@2.0.0:
+    resolution: {integrity: sha512-fresh}
+
+snapshots:
+
+  '@scope/old-package@1.0.0': {}
+
+  fresh-package@2.0.0: {}

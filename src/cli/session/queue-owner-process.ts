@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isSea } from "node:sea";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AuthPolicy,
@@ -22,6 +23,7 @@ export type QueueOwnerRuntimeOptions = {
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
@@ -40,6 +42,7 @@ type SessionSendLike = {
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
@@ -129,7 +132,11 @@ export function sanitizeQueueOwnerExecArgv(
 export function buildQueueOwnerArgOverride(
   entryPath: string,
   execArgv: readonly string[] = process.execArgv,
+  runningInSea: boolean = isSea(),
 ): string | null {
+  if (runningInSea) {
+    return null;
+  }
   const sanitized = sanitizeQueueOwnerExecArgv(execArgv);
   if (sanitized.length === 0) {
     return null;
@@ -137,7 +144,14 @@ export function buildQueueOwnerArgOverride(
   return JSON.stringify([...sanitized, entryPath, "__queue-owner"]);
 }
 
-export function resolveQueueOwnerSpawnArgs(argv: readonly string[] = process.argv): string[] {
+export function resolveQueueOwnerSpawnArgs(
+  argv: readonly string[] = process.argv,
+  runningInSea: boolean = isSea(),
+): string[] {
+  if (runningInSea) {
+    return ["__queue-owner"];
+  }
+
   const override = process.env.ACPX_QUEUE_OWNER_ARGS;
   if (override) {
     const parsed = JSON.parse(override) as unknown;
@@ -167,6 +181,7 @@ export function queueOwnerRuntimeOptionsFromSend(
     nonInteractivePermissions: options.nonInteractivePermissions,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    fs: options.fs,
     terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,

@@ -22,9 +22,9 @@ instead of expanding this file into a full technical spec.
 - npm: `https://www.npmjs.com/package/acpx`
 - Default branch: `main`
 - Runtime: Node.js `>=22.13.0`
-- Package manager: `pnpm@10.33.2`
+- Package manager: `pnpm@10.34.5`
 - Clean Node 22.13 setups can have stale Corepack signing keys; install pnpm
-  with `npm install -g pnpm@10.33.2` if `corepack prepare` fails.
+  with `npm install -g pnpm@10.34.5` if `corepack prepare` fails.
 
 ## Product Direction
 
@@ -293,14 +293,41 @@ CI lives in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## Release / CD
 
-Release automation lives in [`.github/workflows/release.yml`](.github/workflows/release.yml).
+Npm release automation uses
+[`.github/workflows/release-request.yml`](.github/workflows/release-request.yml)
+and [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
-- Releases run when a `vX.Y.Z` tag is pushed
-- The workflow installs dependencies with `pnpm install --frozen-lockfile`
-- It validates `package.json` release metadata before publishing
-- It validates that the tag matches `package.json` version and that the tagged commit is on `main`
-- It runs `pnpm run lint`, `pnpm run typecheck`, and `pnpm run build`
-- It publishes directly to npm with trusted publishing and provenance
+- A `vX.Y.Z` tag push runs the unprivileged `Release request` workflow.
+- Its successful completion triggers `release.yml` from the default branch via
+  `workflow_run`; do not add credentials or checkout to the tag-selected
+  request workflow.
+- Before checkout, the trusted workflow requires the request SHA, live tag SHA,
+  default-branch event SHA, and workflow SHA to match.
+- Build/package/SBOM validation runs without OIDC. A separate job receives only
+  that run's tarball and SBOM, attests them, rechecks the tag, and publishes the
+  tarball with npm trusted publishing and provenance.
+- The packed archive must contain `npm-shrinkwrap.json`; release validation runs
+  its production `npm ci` closure and compares package identities and integrity
+  hashes with the pnpm production deployment.
+
+Binary release automation lives in
+[`.github/workflows/release-binaries.yml`](.github/workflows/release-binaries.yml).
+Trigger its trusted default-branch `repository_dispatch` workflow after npm
+publication:
+
+```bash
+gh api --method POST repos/openclaw/acpx/dispatches \
+  -f event_type=release-binaries \
+  -F 'client_payload[tag]=vX.Y.Z'
+```
+
+The binary workflow refuses pre-existing releases, verifies the exact npm
+provenance before creating a draft, and requires formula versions to advance
+live `main`. Before it can build, an active ruleset applying to `main` must
+strictly require the exact `Policy invariants` status context with **GitHub
+Actions** as its expected source. Formula PRs created with `GITHUB_TOKEN`
+receive an approval-required `pull_request` workflow run; a maintainer must
+approve that run before the required policy check can pass.
 
 The release workflow currently requires these `package.json` values:
 

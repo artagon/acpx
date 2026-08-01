@@ -3,6 +3,9 @@ import { InvalidArgumentError } from "commander";
 import type { Command } from "commander";
 import {
   DEFAULT_AGENT_NAME,
+  normalizeAgentName,
+  resolveCanonicalAgentName,
+  resolveAgentArgv,
   resolveAgentCommand as resolveAgentCommandFromRegistry,
 } from "../agent-registry.js";
 import type { SystemPromptOption } from "../runtime/engine/session-options.js";
@@ -21,6 +24,7 @@ import type { ResolvedAcpxConfig } from "./config.js";
 // re-exports the ACP client, which drags the ACP SDK (and zod) into the eager
 // startup graph for the sake of one numeric constant.
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./session/contracts.js";
+import { toTimerMilliseconds } from "./timer-duration.js";
 
 export type PermissionFlags = {
   approveAll?: boolean;
@@ -39,6 +43,7 @@ export type GlobalFlags = PermissionFlags & {
   nonInteractivePermissions: NonInteractivePermissionPolicy;
   jsonStrict?: boolean;
   suppressReads?: boolean;
+  fs?: boolean;
   terminal?: boolean;
   timeout?: number;
   ttl: number;
@@ -158,7 +163,11 @@ export function parseTimeoutSeconds(value: string): number {
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new InvalidArgumentError("Timeout must be a positive number of seconds");
   }
-  return Math.round(parsed * 1000);
+  const milliseconds = toTimerMilliseconds(parsed, false);
+  if (milliseconds === undefined) {
+    throw new InvalidArgumentError("Timeout exceeds the maximum supported timer delay");
+  }
+  return milliseconds;
 }
 
 export function parseTtlSeconds(value: string): number {
@@ -166,7 +175,11 @@ export function parseTtlSeconds(value: string): number {
   if (!Number.isFinite(parsed) || parsed < 0) {
     throw new InvalidArgumentError("TTL must be a non-negative number of seconds");
   }
-  return Math.round(parsed * 1000);
+  const milliseconds = toTimerMilliseconds(parsed, true);
+  if (milliseconds === undefined) {
+    throw new InvalidArgumentError("TTL exceeds the maximum supported timer delay");
+  }
+  return milliseconds;
 }
 
 export function parseSessionName(value: string): string {
@@ -337,6 +350,7 @@ export function addGlobalFlags(command: Command): Command {
       "--json-strict",
       "Strict JSON mode: requires --format json and suppresses non-JSON stderr output",
     )
+    .option("--no-fs", "Do not advertise ACP filesystem capabilities")
     .option("--no-terminal", "Do not advertise ACP terminal capability")
     .option("--timeout <seconds>", "Maximum time to wait for agent response", parseTimeoutSeconds)
     .option(
@@ -419,6 +433,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     permissionPolicy: resolvePermissionPolicyOption(opts),
     jsonStrict,
     suppressReads: opts.suppressReads === true,
+    fs: resolveCapabilityOption(opts.fs),
     terminal: resolveTerminalOption(opts.terminal),
     timeout: resolveTimeoutOption(opts.timeout, config),
     ttl: resolveTtlOption(opts.ttl, config),
@@ -465,8 +480,12 @@ function resolvePermissionPolicyOption(opts: Record<string, unknown>): string | 
   return primary ?? alias;
 }
 
-function resolveTerminalOption(value: unknown): boolean | undefined {
+function resolveCapabilityOption(value: unknown): boolean | undefined {
   return value === false ? false : undefined;
+}
+
+function resolveTerminalOption(value: unknown): boolean | undefined {
+  return resolveCapabilityOption(value);
 }
 
 function resolveTimeoutOption(value: unknown, config: ResolvedAcpxConfig): number | undefined {
@@ -514,6 +533,7 @@ export function resolveAgentInvocation(
 ): {
   agentName: string;
   agentCommand: string;
+  agentArgv?: string[];
   cwd: string;
 } {
   const override = globalFlags.agent?.trim();
@@ -522,14 +542,35 @@ export function resolveAgentInvocation(
   }
 
   const agentName = explicitAgentName ?? config.defaultAgent ?? DEFAULT_AGENT_NAME;
-  const agentCommand =
-    override && override.length > 0
-      ? override
-      : resolveAgentCommandFromRegistry(agentName, config.agents);
+  const command = resolveInvocationCommand(agentName, override, config);
 
   return {
     agentName,
-    agentCommand,
+    ...command,
     cwd: path.resolve(globalFlags.cwd),
+  };
+}
+
+function resolveInvocationCommand(
+  agentName: string,
+  override: string | undefined,
+  config: ResolvedAcpxConfig,
+): { agentCommand: string; agentArgv?: string[] } {
+  if (override) {
+    return { agentCommand: override };
+  }
+  const normalizedAgentName = normalizeAgentName(agentName);
+  const configuredAgent =
+    config.agents[normalizedAgentName] ?? config.agents[resolveCanonicalAgentName(agentName)];
+  if (configuredAgent) {
+    return {
+      agentCommand: configuredAgent.command,
+      ...(configuredAgent.argv ? { agentArgv: [...configuredAgent.argv] } : {}),
+    };
+  }
+  const agentArgv = resolveAgentArgv(agentName);
+  return {
+    agentCommand: resolveAgentCommandFromRegistry(agentName),
+    ...(agentArgv ? { agentArgv } : {}),
   };
 }

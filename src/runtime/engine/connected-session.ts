@@ -49,6 +49,7 @@ export type WithConnectedSessionOptions<T> = {
   ) => Promise<AcpPermissionDecision | undefined>;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   resumePolicy?: SessionResumePolicy;
   timeoutMs?: number;
@@ -98,6 +99,7 @@ export async function withConnectedSession<T>(
   const client =
     options.createClient?.({
       agentCommand: record.agentCommand,
+      agentArgv: record.agentArgv,
       cwd: absolutePath(record.cwd),
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode ?? "approve-reads",
@@ -105,12 +107,14 @@ export async function withConnectedSession<T>(
       onPermissionRequest: options.onPermissionRequest,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
+      fs: options.fs,
       terminal: options.terminal,
       verbose: options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
     new AcpClient({
       agentCommand: record.agentCommand,
+      agentArgv: record.agentArgv,
       cwd: absolutePath(record.cwd),
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode ?? "approve-reads",
@@ -118,6 +122,7 @@ export async function withConnectedSession<T>(
       onPermissionRequest: options.onPermissionRequest,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
+      fs: options.fs,
       terminal: options.terminal,
       verbose: options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),

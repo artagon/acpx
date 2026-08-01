@@ -1,25 +1,51 @@
 # Verifying releases
 
-Every release publishes two independent artifacts, built and attested by separate workflows:
+The release automation can publish two independent artifacts, built and
+attested by separate workflows:
 
 - the **npm package** (`acpx`), published by `.github/workflows/release.yml`
 - the **single-executable binaries** installed by `Formula/acpx.rb`, built by `.github/workflows/release-binaries.yml`
 
-Both carry build-provenance and SBOM attestations. They describe different things, for reasons covered below.
+The npm package is published for every tag. Maintainers dispatch the binary
+workflow separately after npm publication, because its macOS runners carry an
+additional cost. Both artifact types carry build-provenance and SBOM
+attestations. They describe different things, for reasons covered below.
 
 ## Verify the npm package
 
 ```bash
-npm audit signatures                      # npm's own provenance, from the registry
-gh attestation verify "$(npm pack acpx --silent)" --repo artagon/acpx
+repo=openclaw/acpx
+version=0.13.1
+tag="v$version"
+source_digest="$(gh api "repos/$repo/commits/$tag" --jq .sha)"
+workdir="$(mktemp -d)"
+npm install --prefix "$workdir" --ignore-scripts "acpx@$version"
+npm audit signatures --prefix "$workdir"   # npm registry signatures and provenance
+tarball="$(npm pack "acpx@$version" --silent)"
+gh attestation verify "$tarball" \
+  --repo "$repo" \
+  --signer-workflow "$repo/.github/workflows/release.yml" \
+  --source-digest "$source_digest" \
+  --source-ref refs/heads/main
 ```
 
-The package is published from a tarball that was attested before it left the runner, so the bytes npm serves are the bytes that were signed.
+The package is published from a tarball that was attested before it left the
+runner. The workflow, source digest, and source ref constraints above prove that
+the bytes npm serves came from the expected release workflow at that tag's exact
+commit on `main`.
 
 ## Verify a binary
 
 ```bash
-gh attestation verify acpx-0.12.0-darwin-arm64.tar.gz --repo artagon/acpx
+repo=openclaw/acpx
+version=0.13.1
+tag="v$version"
+source_digest="$(gh api "repos/$repo/commits/$tag" --jq .sha)"
+gh attestation verify "acpx-$version-darwin-arm64.tar.gz" \
+  --repo "$repo" \
+  --signer-workflow "$repo/.github/workflows/release-binaries.yml" \
+  --source-digest "$source_digest" \
+  --source-ref refs/heads/main
 ```
 
 This checks that the exact bytes you hold were produced by this repository's release workflow, at a tagged commit contained in `main`. It fails if the file was modified, rebuilt elsewhere, or attached by hand.
@@ -36,34 +62,80 @@ To read the SBOM attestation specifically, add `--predicate-type https://cyclone
 
 `SHA256SUMS` is not itself attested — it only restates digests the attestations already bind, so verify the tarball directly rather than trusting the manifest.
 
-## Releases are immutable
+## Immutable releases are a release prerequisite
 
-The repository has [immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases) enabled. Once a release is published, its assets and its Git tag are frozen: assets cannot be replaced or deleted, and the tag cannot be moved or reused.
+Maintainers must
+[enable immutable releases](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes)
+before publishing executable assets. `release-binaries.yml` checks the
+repository setting and fails before building when it is disabled. GitHub only
+applies the setting to future releases.
 
-This is why the release workflow attaches every asset to a **draft** and publishes the draft last. A botched release cannot be quietly patched in place — it requires a new version, which is the intended cost.
+The status endpoint requires repository **Administration: read**, a permission
+that Actions cannot grant to `GITHUB_TOKEN`. Store a fine-grained token scoped
+to this repository, with only that permission, as the
+`RELEASE_SETTINGS_READER` Actions secret. The workflow fails closed when
+the secret is absent or cannot read the setting.
+
+An active ruleset applying to `main` must strictly require the exact
+`Policy invariants` status context. In repository rules, enable the required
+status check, set its expected source to **GitHub Actions**, and enable **Require
+branches to be up to date before merging**. Source binding prevents another app
+or actor from satisfying the rule with a same-named status. The binary release
+gate queries the active rules that apply to `main` and stops before checkout
+when any requirement is missing. Formula PRs created with `GITHUB_TOKEN` receive
+an approval-required `pull_request` workflow run; a maintainer must approve that
+run so `Policy invariants` can evaluate the candidate before merge.
+
+Once enabled, published assets and their Git tag cannot be replaced. This is why
+the workflow attaches every asset to a **draft** and publishes the draft last.
+A botched binary release requires a new version rather than an in-place patch.
 
 ## The two SBOMs describe different things
 
 This is the part worth reading before scanning either document.
 
-**The npm package bundles nothing.** It ships `dist/` alone, and every dependency is installed on the user's machine at install time. So its SBOM is the production dependency closure resolved from the frozen lockfile — currently around 685 packages, most pulled in by the bundled ACP adapters. It is generated by [Syft](https://github.com/anchore/syft) via `anchore/sbom-action`, scanning a production-only install built in a scratch directory so a dev-only package cannot leak in.
+**The npm package does not bundle dependency code.** It ships the compiled
+`dist/` files, package metadata, and a production `npm-shrinkwrap.json`; npm
+installs dependencies on the user's machine. The shrinkwrap makes the Homebrew
+source fallback reproducible because the formula runs `npm ci`. Ordinary global
+`npm install acpx` resolution still follows npm's consumer behavior and does not
+honor a dependency package's shrinkwrap or root-only overrides.
 
-**The binary bundles everything.** It is one rolled-up chunk inside a V8 startup snapshot, injected into a copy of Node. Neither obvious scan target describes it:
+The npm SBOM describes the production dependency closure. The workflow installs
+the shipped shrinkwrap with `npm ci`, independently creates a production-only
+pnpm deploy, and requires their package identities and registry integrity
+digests to match before scanning the npm tree with a checksum-pinned
+[Syft](https://github.com/anchore/syft) release binary. It also verifies that
+built-in adapters are present and representative dev-only packages are absent
+before attesting the document.
 
-| Scan target                | Components | Why it is wrong                                   |
-| -------------------------- | ---------- | ------------------------------------------------- |
-| Source tree (Syft)         | 751        | Every devDependency, none of which reaches a user |
-| Production closure (Syft)  | 685        | Tree-shaking drops most of it                     |
-| The finished binary (Syft) | 0          | No per-package boundaries survive bundling        |
-| **Bundler module graph**   | **19**     | Exactly the packages whose code was inlined       |
+**The binary embeds its runtime closure.** The rolled-up CLI lives in a V8
+startup snapshot injected into a copy of Node. Delegated flow runtime modules,
+the esbuild JavaScript package files, and the platform esbuild executable are
+embedded as separate SEA assets. Neither obvious scan target describes that
+layout:
 
-So the binary's SBOM is produced by [`rollup-plugin-sbom`](https://github.com/janbiasi/rollup-plugin-sbom) during the build that makes the binary, reading the bundler's own module graph. See `scripts/sea/tsdown.sea.config.ts`.
+| Scan target                | Components     | Why it is wrong                                  |
+| -------------------------- | -------------- | ------------------------------------------------ |
+| Source tree (Syft)         | hundreds       | Includes devDependencies that do not reach users |
+| Production closure (Syft)  | hundreds       | Tree-shaking drops most of it                    |
+| The finished binary (Syft) | zero observed  | No per-package boundaries survive bundling       |
+| **Bundler module graph**   | build-specific | Exactly the packages whose code was inlined      |
+
+So the binary's SBOM is produced by [`rollup-plugin-sbom`](https://github.com/janbiasi/rollup-plugin-sbom) during the build that makes the binary, reading the bundler's own module graph. The SEA build then adds the embedded platform esbuild executable as an explicit component with its artifact hash and dependency edge. See `scripts/sea/tsdown.sea.config.ts` and `scripts/sea/build.mjs`.
 
 That leaves one gap the bundler cannot see: the Node.js runtime. The executable is a copy of an official Node build, so Node — and with it V8, OpenSSL, zlib, and ICU — is the majority of the file and its largest attack surface. It is added as an explicit component with a `pkg:generic/node@<version>` purl, so scanners match Node advisories against the artifact.
 
 Consequences worth knowing:
 
-- **Build tooling is absent from the binary's SBOM, deliberately.** The bundler, type checker, and test runner never reach it. A devDependency advisory does not describe that artifact.
-- **Native sidecars are represented by their JavaScript only.** Packages that ship a platform-specific binary have their JS inlined; the native executable is not inside the SEA.
-- **No timestamps.** Both SBOMs omit the wall clock, so rebuilding a tag yields a document you can diff against the published one.
+- **Build-only tooling is absent from the binary's SBOM, deliberately.** The
+  bundler, type checker, and test runner never reach the artifact. Esbuild is
+  the exception because flow execution uses it at runtime, so both its
+  JavaScript and embedded platform executable are represented.
+- **The embedded esbuild executable is explicit.** Its platform package,
+  version, SHA-256 hash, and dependency edge are added after bundling so the
+  SBOM describes the native bytes shipped inside the SEA.
+- **No timestamps.** The binary SBOM disables them at generation time. The npm
+  workflow removes Syft's timestamp and random serial number before attestation,
+  so repeated builds do not differ solely because of wall-clock or UUID noise.
 - **CycloneDX 1.6**, not the plugin's 1.7 default — that is what current attestation tooling and downstream scanners consume.

@@ -71,16 +71,17 @@ export default defineConfig({
      * SBOM of the artifact, not of the checkout.
      *
      * The two obvious inputs both describe something else. Scanning the source
-     * tree with syft reports 751 components — every devDependency, none of
-     * which reaches a user. Scanning the finished binary reports zero: the
+     * tree with syft reports hundreds of components — every devDependency,
+     * including packages that never reach a user. Scanning the finished binary
+     * reports zero: the
      * JavaScript is one bundled chunk inside a V8 snapshot, so per-package
      * boundaries no longer exist in the file. The production dependency
-     * closure sits in between at 271, still an order of magnitude off, because
+     * closure sits in between, still substantially overcounting because
      * tree-shaking drops most of it.
      *
      * This plugin reads the bundler's own module graph, so it lists exactly
-     * the packages whose code was inlined — 18 here. It runs inside the build
-     * that produces the binary rather than inferring the contents afterwards.
+     * the packages whose code was inlined. It runs inside the build that
+     * produces the binary rather than inferring the contents afterwards.
      */
     sbom({
       outDir: ".",

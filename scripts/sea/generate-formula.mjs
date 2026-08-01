@@ -1,0 +1,252 @@
+#!/usr/bin/env node
+/**
+ * Renders Formula/acpx.rb from a release's checksum manifest.
+ *
+ * The formula serves two install paths and this script is the only writer of
+ * both, so they cannot drift apart:
+ *
+ *  - Binary: platforms with a published single-executable asset get a
+ *    url/sha256 block pointing at the immutable release tarball.
+ *  - Node: every other platform falls back to the npm registry tarball and a
+ *    Homebrew `node` dependency, installed with std_npm_args.
+ *
+ * Run by the `formula` job in .github/workflows/release-binaries.yml after the
+ * release is published. Runnable locally the same way:
+ *
+ *   node scripts/sea/generate-formula.mjs \
+ *     --version 0.13.0 --npm-sha256 <sha> --sums SHA256SUMS \
+ *     --current-formula Formula/acpx.rb
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 0; i < argv.length; i += 2) {
+    const key = argv[i];
+    const value = argv[i + 1];
+    if (!/^--[a-z0-9-]+$/.test(key) || value === undefined) {
+      throw new Error(`Malformed arguments near ${key ?? "<end>"}.`);
+    }
+    const name = key.slice(2);
+    if (Object.hasOwn(args, name)) {
+      throw new Error(`Duplicate argument --${name}.`);
+    }
+    args[name] = value;
+  }
+  return args;
+}
+
+const args = parseArgs(process.argv.slice(2));
+const version = args.version ?? "";
+const npmSha = args["npm-sha256"] ?? "";
+const sumsPath = args.sums ?? "";
+const currentFormulaPath = args["current-formula"] ?? "";
+const outPath = args.out ?? path.join(repoRoot, "Formula", "acpx.rb");
+
+if (!/^\d+\.\d+\.\d+$/.test(version)) {
+  throw new Error(`--version must be X.Y.Z; received "${version}".`);
+}
+if (!/^[0-9a-f]{64}$/.test(npmSha)) {
+  throw new Error(`--npm-sha256 must be 64 hex characters; received "${npmSha}".`);
+}
+if (sumsPath === "") {
+  throw new Error("--sums is required and must name a checksum manifest.");
+}
+if (currentFormulaPath === "") {
+  throw new Error("--current-formula is required and must name the live-main formula.");
+}
+
+if (!fs.existsSync(sumsPath)) {
+  throw new Error(
+    `--sums file does not exist: "${sumsPath}". Download or generate SHA256SUMS before rendering the formula.`,
+  );
+}
+const sumsStat = fs.statSync(sumsPath);
+if (!sumsStat.isFile()) {
+  throw new Error(`--sums must name a regular file; received "${sumsPath}".`);
+}
+
+if (!fs.existsSync(currentFormulaPath)) {
+  throw new Error(`--current-formula file does not exist: "${currentFormulaPath}".`);
+}
+if (!fs.statSync(currentFormulaPath).isFile()) {
+  throw new Error(`--current-formula must name a regular file; received "${currentFormulaPath}".`);
+}
+
+function compareVersions(left, right) {
+  const leftParts = left.split(".").map(Number);
+  const rightParts = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) {
+      return leftParts[index] - rightParts[index];
+    }
+  }
+  return 0;
+}
+
+const currentFormula = fs.readFileSync(currentFormulaPath, "utf8");
+const currentVersionMatches = [...currentFormula.matchAll(/^\s*version\s+"(\d+\.\d+\.\d+)"\s*$/gm)];
+if (currentVersionMatches.length !== 1) {
+  throw new Error(
+    `--current-formula must contain exactly one X.Y.Z version declaration: "${currentFormulaPath}".`,
+  );
+}
+const currentVersion = currentVersionMatches[0][1];
+if (compareVersions(version, currentVersion) <= 0) {
+  throw new Error(
+    `Target version ${version} must be strictly greater than current formula version ${currentVersion}.`,
+  );
+}
+
+// The four slots Homebrew can address with on_macos/on_linux × on_arm/on_intel.
+// A manifest naming any other target fails the run: silently skipping it would
+// publish a formula that pretends the platform does not exist.
+const SLOTS = new Set(["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"]);
+
+const shaByTarget = new Map();
+for (const line of fs.readFileSync(sumsPath, "utf8").split("\n")) {
+  if (line.trim() === "") {
+    continue;
+  }
+  const match = /^([0-9a-f]{64})\s+(\S+)$/.exec(line.trim());
+  if (!match) {
+    throw new Error(`Unparseable checksum line: "${line}".`);
+  }
+  const [, sha, name] = match;
+  if (!name.endsWith(".tar.gz")) {
+    continue;
+  }
+  const asset = new RegExp(`^acpx-(\\d+\\.\\d+\\.\\d+)-([a-z0-9-]+)\\.tar\\.gz$`).exec(name);
+  if (!asset) {
+    throw new Error(`Tarball "${name}" does not match acpx-<version>-<target>.tar.gz.`);
+  }
+  if (asset[1] !== version) {
+    throw new Error(`Tarball "${name}" is for version ${asset[1]}, expected ${version}.`);
+  }
+  if (!SLOTS.has(asset[2])) {
+    throw new Error(`Tarball "${name}" names unknown target "${asset[2]}".`);
+  }
+  if (shaByTarget.has(asset[2])) {
+    throw new Error(`Duplicate tarball for target "${asset[2]}"; refusing to pick one silently.`);
+  }
+  shaByTarget.set(asset[2], sha);
+}
+
+if (shaByTarget.size === 0) {
+  throw new Error(`${sumsPath} lists no acpx tarballs; refusing to emit a binary-free formula.`);
+}
+
+const releaseBase = `https://github.com/openclaw/acpx/releases/download/v${version}`;
+
+/** One platform slot with a published binary asset. */
+function slotLines(target, indent) {
+  const sha = shaByTarget.get(target);
+  if (sha === undefined) {
+    return [];
+  }
+  return [
+    `${indent}url "${releaseBase}/acpx-${version}-${target}.tar.gz"`,
+    `${indent}sha256 "${sha}"`,
+  ];
+}
+
+/** on_macos / on_linux block containing only arches with binary assets. */
+function osBlock(os, armTarget, intelTarget) {
+  const arches = [];
+  if (shaByTarget.has(armTarget)) {
+    arches.push("    on_arm do", ...slotLines(armTarget, "      "), "    end");
+  }
+  if (shaByTarget.has(intelTarget)) {
+    arches.push("    on_intel do", ...slotLines(intelTarget, "      "), "    end");
+  }
+  if (arches.length === 0) {
+    return [];
+  }
+  return [`  on_${os} do`, ...arches, "  end"];
+}
+
+const platformLines = [
+  osBlock("macos", "darwin-arm64", "darwin-x64"),
+  osBlock("linux", "linux-arm64", "linux-x64"),
+]
+  .filter((block) => block.length > 0)
+  .flatMap((block, index) => (index === 0 ? block : [""].concat(block)));
+
+const formula = [
+  "# Generated by scripts/sea/generate-formula.mjs — do not edit by hand.",
+  "# The `formula` job in .github/workflows/release-binaries.yml regenerates",
+  "# this file for every release and opens a PR with the result.",
+  "class Acpx < Formula",
+  '  desc "Headless CLI client for the Agent Client Protocol (ACP)"',
+  '  homepage "https://github.com/openclaw/acpx"',
+  "",
+  "  # Two install paths, resolved per platform:",
+  "  #",
+  "  # Platforms with a published asset get a self-contained Node",
+  "  # single-executable: the bundle and a V8 startup snapshot injected into an",
+  "  # official Node binary, with ~68ms startup versus ~121ms for the npm",
+  "  # package. The snapshot is",
+  "  # architecture-specific, so each asset is built on a native runner by",
+  "  # release-binaries.yml; Homebrew's own node has SEA support compiled out",
+  "  # and cannot build them from source.",
+  "  #",
+  "  # Every other platform installs the npm package below. Node remains a",
+  "  # dependency on binary platforms because ACP adapters run as separate",
+  "  # Node processes; the acpx executable itself does not use that runtime.",
+  "  #",
+  "  # Binary assets carry build-provenance and SBOM attestations, and releases",
+  "  # are immutable, so each sha256 pins bytes that cannot be replaced",
+  "  # upstream. The attested npm tarball ships a shrinkwrap whose integrity",
+  "  # entries bind the fallback's exact production dependency bytes.",
+  "  # See docs/verifying-releases.md.",
+  `  url "https://registry.npmjs.org/acpx/-/acpx-${version}.tgz"`,
+  `  version "${version}"`,
+  `  sha256 "${npmSha}"`,
+  '  license "MIT"',
+  '  depends_on "node"',
+  "",
+  ...platformLines,
+  "",
+  "  def install",
+  '    npm_layout = (buildpath/"package.json").file?',
+  '    binary_layout = (buildpath/"acpx").file? && (buildpath/"acpx").executable?',
+  "",
+  '    odie "Ambiguous acpx release layout" if npm_layout && binary_layout',
+  "",
+  "    if binary_layout",
+  '      bin.install "acpx"',
+  "    elsif npm_layout",
+  '      odie "npm fallback archive is missing npm-shrinkwrap.json" unless',
+  '        (buildpath/"npm-shrinkwrap.json").file?',
+  '      system "npm", "ci", "--omit=dev", "--ignore-scripts", *std_npm_args(prefix: false)',
+  '      libexec.install Dir["*"]',
+  '      bin.install_symlink libexec/"dist/cli.js" => "acpx"',
+  "    else",
+  '      odie "Unknown acpx release layout"',
+  "    end",
+  "  end",
+  "",
+  "  test do",
+  '    assert_match version.to_s, shell_output("#{bin}/acpx --version")',
+  "",
+  "    # The release build separately proves these fast-path commands answer",
+  "    # without system Node. Flow commands intentionally use the Node dependency.",
+  '    assert_match "Usage", shell_output("#{bin}/acpx --help")',
+  "  end",
+  "end",
+  "",
+].join("\n");
+
+fs.mkdirSync(path.dirname(outPath), { recursive: true });
+fs.writeFileSync(outPath, formula);
+
+const targets = [...shaByTarget.keys()]
+  .toSorted((left, right) => left.localeCompare(right))
+  .join(", ");
+process.stdout.write(
+  `Wrote ${outPath} for v${version} (binary: ${targets}; npm fallback elsewhere)\n`,
+);

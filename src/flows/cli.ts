@@ -27,6 +27,7 @@ type FlowRunFlags = {
 
 const FLOW_RUNTIME_SPECIFIER = "acpx/flows";
 const TEXT_MODULE_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]);
+const REQUIRE_FLOW_EXTENSIONS = new Set([".cjs", ".ts", ".tsx", ".cts"]);
 
 export async function handleFlowRun(
   flowFile: string,
@@ -53,6 +54,8 @@ export async function handleFlowRun(
     permissionPolicy,
     authCredentials: config.auth,
     authPolicy: globalFlags.authPolicy,
+    fs: globalFlags.fs,
+    terminal: globalFlags.terminal,
     timeoutMs: globalFlags.timeout,
     ttlMs: globalFlags.ttl,
     verbose: globalFlags.verbose,
@@ -172,7 +175,7 @@ async function prepareFlowModuleImport(
     return { flowUrl };
   }
 
-  const runtimeSpecifier = resolveFlowRuntimeImportSpecifier();
+  const runtimeSpecifier = resolveFlowRuntimeImportSpecifier(extension);
   const rewritten = source.replaceAll(
     /(["'])acpx\/flows\1/g,
     (_match, quote: string) => `${quote}${runtimeSpecifier}${quote}`,
@@ -191,18 +194,25 @@ async function prepareFlowModuleImport(
   };
 }
 
-function resolveFlowRuntimeImportSpecifier(): string {
-  const selfPath = fileURLToPath(import.meta.url);
+function resolveFlowRuntimeImportSpecifier(extension: string): string {
+  const delegatedRuntimePath = process.env.ACPX_FLOW_RUNTIME_PATH?.trim();
   let runtimePath: string;
-
-  if (selfPath.endsWith(`${path.sep}src${path.sep}flows${path.sep}cli.ts`)) {
-    runtimePath = fileURLToPath(new URL("../flows.ts", import.meta.url));
-  } else if (selfPath.endsWith(`${path.sep}src${path.sep}flows${path.sep}cli.js`)) {
-    runtimePath = fileURLToPath(new URL("../flows.js", import.meta.url));
+  if (delegatedRuntimePath) {
+    runtimePath = path.resolve(delegatedRuntimePath);
   } else {
-    runtimePath = fileURLToPath(new URL("./flows.js", import.meta.url));
+    const selfPath = fileURLToPath(import.meta.url);
+    if (selfPath.endsWith(`${path.sep}src${path.sep}flows${path.sep}cli.ts`)) {
+      runtimePath = fileURLToPath(new URL("../flows.ts", import.meta.url));
+    } else if (selfPath.endsWith(`${path.sep}src${path.sep}flows${path.sep}cli.js`)) {
+      runtimePath = fileURLToPath(new URL("../flows.js", import.meta.url));
+    } else {
+      runtimePath = fileURLToPath(new URL("./flows.js", import.meta.url));
+    }
   }
-  return runtimePath.replaceAll(path.sep, "/");
+
+  return REQUIRE_FLOW_EXTENSIONS.has(extension)
+    ? runtimePath.replaceAll(path.sep, "/")
+    : pathToFileURL(runtimePath).href;
 }
 
 async function loadFlowRuntimeModule(

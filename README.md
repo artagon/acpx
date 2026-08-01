@@ -36,6 +36,7 @@ One command surface for Pi, OpenClaw ACP, Codex, Claude, and other ACP-compatibl
 - **Session export/import**: move portable session archives between machines
 - **Local status checks**: `status` reports running/idle/dead/no-session, pid, uptime, last prompt
 - **Client methods**: stable `fs/*` and `terminal/*` handlers with permission controls and cwd sandboxing
+- **Capability opt-outs**: let adapters use their native filesystem or terminal tools with `--no-fs` and `--no-terminal`
 - **Auth handshake**: stable `authenticate` support via env/config credentials
 - **Structured output**: typed ACP messages (thinking, tool calls, diffs) instead of ANSI scraping
 - **Any ACP agent**: built-in registry + `--agent` escape hatch for custom servers
@@ -111,9 +112,32 @@ instead of spawning raw terminal sessions. For example:
 
 ## Install
 
+Install the npm package when you already manage Node.js:
+
 ```bash
 npm install -g acpx@latest
 ```
+
+Or install with Homebrew on macOS or Linux:
+
+```bash
+brew tap openclaw/acpx https://github.com/openclaw/acpx
+brew install openclaw/acpx/acpx
+```
+
+Homebrew installs a self-contained `acpx` executable when a release publishes
+one for the current platform. Other platforms use the same npm archive through
+a checked-in shrinkwrap and `npm ci`, so the fallback installs the dependency
+bytes validated during release. A normal `npm install -g` still follows npm's
+standard dependency-resolution rules; npm does not enforce a dependency
+package's shrinkwrap.
+Homebrew also installs Node.js because ACP adapters are separate processes; the
+binary does not use Node for its own startup and remains faster. `flow`
+commands use that Node runtime because startup snapshots cannot dynamically
+load user flow modules. The npm package is substantially smaller and follows
+the standard Node toolchain. See
+[Packaging](docs/packaging.md) for the measured tradeoffs and
+[Verifying releases](docs/verifying-releases.md) for SBOM and provenance checks.
 
 Or run without installing:
 
@@ -125,7 +149,11 @@ Session state lives in `~/.acpx/` either way. Global install is a little faster,
 
 ## Agent prerequisites
 
-`acpx` auto-downloads ACP adapters with `npx` on first use. You do not need to install adapter packages manually.
+The npm install includes the Codex and Claude ACP adapters so they do not need a
+registry lookup on launch. The Homebrew executable invokes package-backed
+adapters through `npx` for each new adapter process; the npm cache avoids repeat
+downloads, and a persistent acpx session reuses the live adapter process across
+prompts. You do not need to install adapter packages manually.
 
 The only prerequisite is the underlying coding agent you want to use:
 
@@ -148,7 +176,8 @@ acpx codex --file - "extra context"            # explicit stdin + appended args
 acpx codex --no-wait 'draft test migration plan' # enqueue without waiting if session is busy
 acpx codex cancel                               # cooperative cancel of in-flight prompt
 acpx codex set-mode auto                        # session/set_mode (adapter-defined mode id)
-acpx codex set model 'gpt-5.2[high]'            # adapter-advertised model control
+acpx codex set model gpt-5.6-sol                # select the advertised base model
+acpx codex set reasoning_effort max             # set the advertised reasoning effort
 acpx exec 'summarize this repo'                # default agent shortcut (codex)
 acpx codex exec 'what does this repo do?'      # one-shot, no saved session
 
@@ -218,6 +247,7 @@ acpx flow run ./my-flow.ts --input-file ./flow-input.json
 acpx --timeout 1800 flow run ./my-flow.ts
 acpx --format quiet codex 'final recommendation only'
 acpx --suppress-reads codex exec 'show tool activity without dumping file bodies'
+acpx --no-fs codex exec 'read files without ACP client filesystem delegation'
 
 acpx --timeout 90 codex 'investigate intermittent test timeout'
 acpx --ttl 30 codex 'keep queue owner alive for quick follow-ups'
@@ -282,7 +312,7 @@ Supported keys:
   "timeout": null,
   "format": "text",
   "agents": {
-    "my-custom": { "command": "./bin/my-acp-server", "args": ["acp"] }
+    "my-custom": { "argv": ["./bin/my-acp-server", "acp"] }
   },
   "auth": {
     "my_auth_method_id": "credential-value"
@@ -291,6 +321,9 @@ Supported keys:
 ```
 
 Use `acpx config show` to inspect the resolved result and `acpx config init` to create the global template.
+Use structured `agents.<name>.argv` for custom launches; it is required on Windows. Legacy
+`command` plus `args` entries migrate when `command` is an unquoted executable with no whitespace,
+while raw command strings remain Unix-only.
 
 For ACP `authenticate` handshakes, use either config `auth` entries or explicit
 `ACPX_AUTH_<METHOD_ID>` environment variables such as `ACPX_AUTH_OPENAI_API_KEY`.
@@ -361,11 +394,13 @@ Built-ins:
 | `kilocode`   | `npx -y @kilocode/cli acp`                                                  | [Kilocode](https://kilocode.ai)                                                                                 |
 | `kimi`       | native (`kimi acp`)                                                         | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli)                                                              |
 | `kiro`       | native (`kiro-cli-chat acp`)                                                | [Kiro CLI](https://kiro.dev)                                                                                    |
-| `mux`        | `npx -y mux@^0.27.0 acp`                                                    | [Mux](https://mux.coder.com)                                                                                    |
+| `mux`        | `mux acp` via an ACPX-owned npm range                                       | [Mux](https://mux.coder.com)                                                                                    |
 | `opencode`   | `npx -y opencode-ai acp`                                                    | [OpenCode](https://opencode.ai)                                                                                 |
+| `pool`       | native (`pool acp`)                                                         | [Poolside](https://poolside.ai)                                                                                 |
 | `qoder`      | native (`qodercli --acp`)                                                   | [Qoder CLI](https://docs.qoder.com/cli/acp)                                                                     |
 | `qwen`       | native (`qwen --acp`)                                                       | [Qwen Code](https://github.com/QwenLM/qwen-code)                                                                |
 | `trae`       | native (`traecli acp serve`)                                                | [Trae CLI](https://docs.trae.cn/cli)                                                                            |
+| `zeroclaw`   | native (`zeroclaw acp`)                                                     | [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw)                                                           |
 
 `factory-droid` and `factorydroid` also resolve to the built-in `droid` adapter.
 
@@ -380,11 +415,28 @@ acpx --agent ./my-custom-acp-server 'do something'
 For repo-local OpenClaw checkouts, override the built-in command in config so `acpx openclaw ...`
 spawns the ACP bridge directly without `pnpm` wrapper noise:
 
+This launch uses the Unix `env` executable. Replace the token-file placeholder
+with an absolute path. On Windows, use a wrapper that sets the two environment
+variables and put that wrapper plus its arguments in `argv`.
+
 ```json
 {
   "agents": {
     "openclaw": {
-      "command": "env OPENCLAW_HIDE_BANNER=1 OPENCLAW_SUPPRESS_NOTES=1 node scripts/run-node.mjs acp --url ws://127.0.0.1:18789 --token-file ~/.openclaw/gateway.token --session agent:main:main"
+      "argv": [
+        "env",
+        "OPENCLAW_HIDE_BANNER=1",
+        "OPENCLAW_SUPPRESS_NOTES=1",
+        "node",
+        "scripts/run-node.mjs",
+        "acp",
+        "--url",
+        "ws://127.0.0.1:18789",
+        "--token-file",
+        "/absolute/path/to/.openclaw/gateway.token",
+        "--session",
+        "agent:main:main"
+      ]
     }
   }
 }

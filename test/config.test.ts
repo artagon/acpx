@@ -3,8 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { splitCommandLine } from "../src/acp/client-process.js";
-import { initGlobalConfigFile, loadResolvedConfig } from "../src/cli/config.js";
+import { resolveAgentCommandParts, splitCommandLine } from "../src/acp/client-process.js";
+import { initGlobalConfigFile, loadResolvedConfig, toConfigDisplay } from "../src/cli/config.js";
 
 test("loadResolvedConfig merges global and project config with project priority", async () => {
   await withTempEnv(async ({ homeDir }) => {
@@ -89,8 +89,8 @@ test("loadResolvedConfig merges global and project config with project priority"
     assert.equal(config.queueMaxDepth, 5);
     assert.equal(config.format, "quiet");
     assert.deepEqual(config.agents, {
-      custom: "project-custom",
-      extra: "./bin/extra",
+      custom: { command: "project-custom" },
+      extra: { command: "./bin/extra" },
     });
     assert.deepEqual(config.auth, {
       global_method: "project-override",
@@ -107,6 +107,28 @@ test("loadResolvedConfig merges global and project config with project priority"
     ]);
     assert.equal(config.hasGlobalConfig, true);
     assert.equal(config.hasProjectConfig, true);
+  });
+});
+
+test("loadResolvedConfig normalizes timer values through the CLI timer boundary", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    const configPath = path.join(homeDir, ".acpx", "config.json");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.dirname(configPath), { recursive: true });
+
+    await fs.writeFile(configPath, `${JSON.stringify({ ttl: 0.0001, timeout: 0.0001 })}\n`);
+    const config = await loadResolvedConfig(cwd);
+    assert.equal(config.ttlMs, 1);
+    assert.equal(config.timeoutMs, 1);
+    assert.equal(toConfigDisplay(config).ttl, 0.001);
+    assert.equal(toConfigDisplay(config).timeout, 0.001);
+
+    await fs.writeFile(configPath, `${JSON.stringify({ ttl: 2_147_483.648 })}\n`);
+    await assert.rejects(loadResolvedConfig(cwd), /ttl.*maximum supported timer delay/u);
+
+    await fs.writeFile(configPath, `${JSON.stringify({ timeout: 2_147_483.648 })}\n`);
+    await assert.rejects(loadResolvedConfig(cwd), /timeout.*maximum supported timer delay/u);
   });
 });
 
@@ -316,7 +338,13 @@ test("loadResolvedConfig merges agent args into the command safely", async () =>
           agents: {
             custom: {
               command: "node",
-              args: ["/usr/local/bin/my agent", "--profile", "with spaces", 'quote"me'],
+              args: [
+                "/usr/local/bin/my agent",
+                "--profile",
+                "with spaces",
+                'quote"me',
+                "C:\\Program Files\\Agent",
+              ],
             },
           },
         },
@@ -328,11 +356,18 @@ test("loadResolvedConfig merges agent args into the command safely", async () =>
 
     const config = await loadResolvedConfig(cwd);
     assert.deepEqual(config.agents, {
-      custom: 'node "/usr/local/bin/my agent" "--profile" "with spaces" "quote\\"me"',
-    });
-    assert.deepEqual(splitCommandLine(config.agents.custom), {
-      command: "node",
-      args: ["/usr/local/bin/my agent", "--profile", "with spaces", 'quote"me'],
+      custom: {
+        command:
+          'node "/usr/local/bin/my agent" "--profile" "with spaces" "quote\\"me" "C:\\\\Program Files\\\\Agent"',
+        argv: [
+          "node",
+          "/usr/local/bin/my agent",
+          "--profile",
+          "with spaces",
+          'quote"me',
+          "C:\\Program Files\\Agent",
+        ],
+      },
     });
   });
 });
@@ -342,6 +377,70 @@ test("splitCommandLine preserves empty quoted arguments", () => {
     command: "node",
     args: ["cli.js", "", "", "--flag="],
   });
+});
+
+test("loadResolvedConfig migrates JSON-doubled legacy args to literal argv", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      '{"agents":{"custom":{"command":"C:\\\\tools\\\\bin\\\\agent.sh","args":["\\\\\\\\.\\\\pipe\\\\acpx-agent"]}}}\n',
+      "utf8",
+    );
+
+    const config = await loadResolvedConfig(cwd);
+    assert.deepEqual(config.agents.custom?.argv, [
+      "C:\\tools\\bin\\agent.sh",
+      "\\\\.\\pipe\\acpx-agent",
+    ]);
+  });
+});
+
+test("structured argv rejects the Windows .sh ENOENT repro with explicit guidance", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify({
+        agents: {
+          custom: {
+            argv: ["C:\\tools\\bin\\agent.sh", "--pipe", "\\\\.\\pipe\\acpx-agent"],
+          },
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const config = await loadResolvedConfig(cwd);
+    const custom = config.agents.custom;
+    assert.ok(custom);
+    assert.throws(
+      () => resolveAgentCommandParts(custom.command, custom.argv, "win32"),
+      /Windows cannot launch shell script executable "C:\\tools\\bin\\agent\.sh" directly.*explicit interpreter argv.*acpx does not infer interpreters/su,
+    );
+    assert.deepEqual(
+      resolveAgentCommandParts(
+        'bash "C:\\\\tools\\\\bin\\\\agent.sh"',
+        ["bash", "C:\\tools\\bin\\agent.sh", "--pipe", "\\\\.\\pipe\\acpx-agent"],
+        "win32",
+      ),
+      {
+        command: "bash",
+        args: ["C:\\tools\\bin\\agent.sh", "--pipe", "\\\\.\\pipe\\acpx-agent"],
+      },
+    );
+  });
+});
+
+test("raw Windows command strings fail with argv migration guidance", () => {
+  assert.throws(
+    () => resolveAgentCommandParts("C:\\tools\\bin\\agent.sh --profile ci", undefined, "win32"),
+    /Raw agent command strings are not supported on Windows.*argv array.*agents\.<name>\.args/su,
+  );
 });
 
 test("splitCommandLine rejects empty quoted commands", () => {
@@ -377,6 +476,26 @@ test("loadResolvedConfig rejects invalid agent args", async () => {
       () => loadResolvedConfig(cwd),
       /Invalid config agents\.custom\.args\[1\].*expected string/u,
     );
+  });
+});
+
+test("loadResolvedConfig rejects ambiguous or quoted legacy command plus args", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    for (const command of ["node ./server.js", '"C:\\Program Files\\agent.exe"', '"node"']) {
+      await fs.writeFile(
+        path.join(homeDir, ".acpx", "config.json"),
+        `${JSON.stringify({ agents: { custom: { command, args: ["acp"] } } })}\n`,
+        "utf8",
+      );
+
+      await assert.rejects(
+        () => loadResolvedConfig(cwd),
+        /command must be an unquoted executable with no whitespace when args is present; migrate the complete launch to argv/u,
+      );
+    }
   });
 });
 

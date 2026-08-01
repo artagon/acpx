@@ -3,7 +3,7 @@ name: Supply chain
 # Repo-level supply-chain checks. Release-artifact provenance lives in
 # release-binaries.yml, next to the artifacts it describes.
 #
-# This repository is a public fork, so anyone can open a pull request. Every job
+# This is a public repository, so anyone can open a pull request. Every job
 # here is written on the assumption that PR content is hostile.
 
 on:
@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 env:
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
   NODE_VERSION: 24.11.0
 
 jobs:
@@ -33,24 +33,35 @@ jobs:
 
       # Runs before anything installs. A guard that fires after the install it
       # protects is decorative.
-      - name: Release-age guard is still in force
+      - name: Verify every locked dependency is at least 48 hours old
+        run: node scripts/supply-chain/verify-release-age.mjs --minimum-age-minutes 2880
+
+      - name: Formula version never moves backward
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          node - <<'NODE'
-          const { readFileSync } = require("node:fs");
-          const workspace = readFileSync("pnpm-workspace.yaml", "utf8");
-          const match = workspace.match(/^minimumReleaseAge:\s*(\d+)/m);
-          if (!match) {
-            console.error("pnpm-workspace.yaml no longer sets minimumReleaseAge.");
-            process.exit(1);
-          }
-          const minutes = Number(match[1]);
-          if (minutes < 1440) {
-            console.error(`minimumReleaseAge is ${minutes} minutes; expected at least 1440 (24h).`);
-            process.exit(1);
-          }
-          console.log(`minimumReleaseAge = ${minutes} minutes.`);
-          NODE
+          main_formula="${RUNNER_TEMP}/main-acpx.rb"
+          gh api \
+            --header "Accept: application/vnd.github.raw+json" \
+            "repos/${GH_REPO}/contents/Formula/acpx.rb?ref=main" \
+            > "$main_formula"
+
+          candidate_version="$(
+            ruby scripts/release/formula-version.rb extract Formula/acpx.rb
+          )"
+          main_version="$(
+            ruby scripts/release/formula-version.rb extract "$main_formula"
+          )"
+          if cmp -s Formula/acpx.rb "$main_formula"; then
+            echo "Formula matches live main at ${main_version}."
+            exit 0
+          fi
+
+          ruby scripts/release/formula-version.rb \
+            assert-advance Formula/acpx.rb "$main_formula"
+          echo "Formula advancement validated: ${main_version} -> ${candidate_version}."
 
       - name: Build tools are lockfile-pinned
         run: |
@@ -138,9 +149,6 @@ jobs:
       - name: Action pins match their version comments
         run: |
           set -euo pipefail
-          # A pin that names a tag object rather than a commit fails to resolve;
-          # a pin that names an unrelated commit resolves to unintended code.
-          # Both have happened here.
           fail=0
           while IFS= read -r line; do
             ref="${line#*uses: }"
@@ -148,9 +156,25 @@ jobs:
             sha="${rest%% *}"; tag="${rest##*# }"
             [ "$sha" = "$rest" ] && continue
             repo="$(cut -d/ -f1,2 <<<"$action")"
-            actual="$(gh api "repos/${repo}/commits/${sha}" --jq .sha 2>/dev/null || true)"
-            if [ -z "$actual" ]; then
-              echo "::error::${repo}@${sha} (${tag}) is not a commit in that repository."
+
+            tag_ref="$(gh api "repos/${repo}/git/ref/tags/${tag}" --jq '.object | [.type, .sha] | @tsv' 2>/dev/null || true)"
+            if [ -z "$tag_ref" ]; then
+              echo "::error::${repo} has no tag ${tag}."
+              fail=1
+              continue
+            fi
+
+            read -r tag_type tag_sha <<<"$tag_ref"
+            for _ in 1 2 3 4 5; do
+              [ "$tag_type" != "tag" ] && break
+              tag_ref="$(gh api "repos/${repo}/git/tags/${tag_sha}" --jq '.object | [.type, .sha] | @tsv' 2>/dev/null || true)"
+              [ -z "$tag_ref" ] && break
+              read -r tag_type tag_sha <<<"$tag_ref"
+            done
+
+            resolved_sha="$tag_sha"
+            if [ "$tag_type" != "commit" ] || [ "$resolved_sha" != "$sha" ]; then
+              echo "::error::${repo}@${sha} does not match ${tag} (resolved ${tag_type}:${resolved_sha})."
               fail=1
             fi
           done < <(grep -rhoE 'uses: [^@]+@[0-9a-f]{40} # \S+' .github/workflows/)
@@ -203,8 +227,8 @@ jobs:
         # the build on one trains people to ignore this job.
         run: |
           set -uo pipefail
-          # Distinguish "found advisories" from "could not run". pnpm 10.33.2
-          # crashes on a gzipped audit response with
+          # Distinguish "found advisories" from "could not run". Some pnpm
+          # versions crash on a gzipped audit response with
           # `Unexpected token '\x1f' ... is not valid JSON`, which is a
           # transport bug, not a finding. Failing the build on it would make a
           # red audit job mean nothing, and a real advisory would be ignored
