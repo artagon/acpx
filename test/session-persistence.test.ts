@@ -719,6 +719,51 @@ test("writeSessionRecord recovers an old malformed write lock", async () => {
   });
 });
 
+test("writeSessionRecord preserves an old identity-less lock held by a live writer", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    const record = makeSessionRecord({
+      acpxRecordId: "live-unverifiable-lock",
+      acpSessionId: "live-unverifiable-lock",
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "live-lock"),
+    });
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "live-unverifiable-writer",
+        pid: process.pid,
+        createdAt: "2000-01-01T00:00:00.000Z",
+      })}\n`,
+      "utf8",
+    );
+    const oldTime = new Date(Date.now() - 180_000);
+    await fs.utimes(lockPath, oldTime, oldTime);
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?live_unverifiable=${Date.now()}-${Math.random()}`
+    );
+    let writeSettled = false;
+    const writing = repository.writeSessionRecord(record).then(() => {
+      writeSettled = true;
+    });
+
+    try {
+      await sleep(250);
+      assert.equal(writeSettled, false);
+      assert.equal(await fileExists(sessionFilePath(homeDir, record.acpxRecordId)), false);
+
+      await fs.rm(lockPath);
+      await writing;
+      assert.equal(await fileExists(sessionFilePath(homeDir, record.acpxRecordId)), true);
+    } finally {
+      await fs.rm(lockPath, { force: true });
+      await writing.catch(() => undefined);
+    }
+  });
+});
+
 test("session write locks are not visible until their complete record is published", async () => {
   await withTempHome(async (homeDir) => {
     const sessionDir = path.join(homeDir, "sessions");
@@ -840,6 +885,61 @@ test("session write locks preserve live owners without a verifiable process iden
       await writeLockModule.sessionWriteLockIsStale(lockPath, await fs.lstat(lockPath)),
       false,
     );
+  });
+});
+
+test("pruneSessions waits for a concurrent session writer before selecting records", async () => {
+  await withTempHome(async (homeDir) => {
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?prune_writer_test=${Date.now()}-${Math.random()}`
+    );
+    const session = await loadSessionModule();
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const indexPath = path.join(sessionDir, "index.json");
+    const readyPath = path.join(homeDir, "writer-holds-session-lock");
+    const releasePath = path.join(homeDir, "release-session-writer");
+    const initial = makeSessionRecord({
+      acpxRecordId: "prune-writer-session",
+      acpSessionId: "prune-writer-session",
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "prune-writer"),
+      closed: true,
+      closedAt: "2020-01-01T00:00:00.000Z",
+    });
+    await repository.writeSessionRecord(initial);
+
+    const writer = spawnSessionRecordWriter({
+      homeDir,
+      record: {
+        ...initial,
+        closed: false,
+        closedAt: undefined,
+        lastUsedAt: new Date().toISOString(),
+      },
+      pauseIndexPath: indexPath,
+      readyPath,
+      releasePath,
+    });
+    let pruneSettled = false;
+
+    try {
+      await waitForFile(readyPath);
+      const pruneResult = session.pruneSessions({ agentCommand: "agent-a" }).then((result) => {
+        pruneSettled = true;
+        return result;
+      });
+      await sleep(250);
+      assert.equal(pruneSettled, false);
+
+      await fs.writeFile(releasePath, "release\n", "utf8");
+      await waitForSuccessfulChild(writer);
+      const result = await pruneResult;
+      assert.equal(result.pruned.length, 0);
+      assert.equal(await fileExists(sessionFilePath(homeDir, initial.acpxRecordId)), true);
+    } finally {
+      await fs.writeFile(releasePath, "release\n", "utf8").catch(() => undefined);
+      stopChild(writer);
+    }
   });
 });
 
