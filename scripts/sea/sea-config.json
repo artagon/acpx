@@ -1,0 +1,8 @@
+{
+  "main": "dist-sea/entry.cjs",
+  "mainFormat": "commonjs",
+  "output": "dist-sea/acpx-sea.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": true,
+  "useCodeCache": false
+}

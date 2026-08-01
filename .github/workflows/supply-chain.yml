@@ -1,0 +1,250 @@
+name: Supply chain
+
+# Repo-level supply-chain checks. Release-artifact provenance lives in
+# release-binaries.yml, next to the artifacts it describes.
+#
+# This repository is a public fork, so anyone can open a pull request. Every job
+# here is written on the assumption that PR content is hostile.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Scorecard's findings drift with repo settings and dependencies, so it runs
+    # on a schedule rather than only on push.
+    - cron: "27 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  PNPM_VERSION: 10.33.2
+  NODE_VERSION: 24.11.0
+
+jobs:
+  policy:
+    name: Policy invariants
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Runs before anything installs. A guard that fires after the install it
+      # protects is decorative.
+      - name: Release-age guard is still in force
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const workspace = readFileSync("pnpm-workspace.yaml", "utf8");
+          const match = workspace.match(/^minimumReleaseAge:\s*(\d+)/m);
+          if (!match) {
+            console.error("pnpm-workspace.yaml no longer sets minimumReleaseAge.");
+            process.exit(1);
+          }
+          const minutes = Number(match[1]);
+          if (minutes < 1440) {
+            console.error(`minimumReleaseAge is ${minutes} minutes; expected at least 1440 (24h).`);
+            process.exit(1);
+          }
+          console.log(`minimumReleaseAge = ${minutes} minutes.`);
+          NODE
+
+      - name: Build tools are lockfile-pinned
+        run: |
+          set -euo pipefail
+          # npx / pnpm dlx resolve from the registry at run time and bypass both
+          # the lockfile and minimumReleaseAge. In scripts/** that would hand an
+          # unpinned download write access to the released binary.
+          node - <<'NODE'
+          const { readdirSync, readFileSync, statSync } = require("node:fs");
+          const { join, extname } = require("node:path");
+
+          // Match the invocation, not the word: a naive grep also flags
+          // comments explaining why npx is banned, and string literals used as
+          // test fixtures. Both exist in this repo and both failed CI.
+          const INVOCATION = /(?:execFileSync|execSync|spawnSync|spawn|exec|run)\s*\(\s*["'`](?:npx|pnpm\s+dlx)["'`]/;
+
+          const offenders = [];
+          const walk = (dir) => {
+            for (const entry of readdirSync(dir)) {
+              const full = join(dir, entry);
+              if (statSync(full).isDirectory()) { walk(full); continue; }
+              if (![".mjs", ".js", ".ts", ".cjs"].includes(extname(full))) continue;
+              readFileSync(full, "utf8").split("\n").forEach((line, i) => {
+                if (line.trim().startsWith("//")) return;
+                if (INVOCATION.test(line)) offenders.push(`${full}:${i + 1}`);
+              });
+            }
+          };
+          walk("scripts");
+
+          if (offenders.length > 0) {
+            for (const o of offenders) console.error(`::error::${o}: use 'pnpm exec' so build tooling resolves from the lockfile.`);
+            process.exit(1);
+          }
+          console.log("No unpinned tool invocations under scripts/.");
+          NODE
+          node - <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          const dev = pkg.devDependencies ?? {};
+          for (const tool of ["postject", "tsdown"]) {
+            if (!dev[tool]) {
+              console.error(`${tool} must be a pinned devDependency; it writes the released binary.`);
+              process.exit(1);
+            }
+          }
+          console.log("Build tooling is declared.");
+          NODE
+
+      - name: Every action is pinned to a commit
+        run: |
+          set -euo pipefail
+          # A tag is a movable pointer: whoever controls the action repository
+          # can repoint v7 at new code that then runs with this workflow's
+          # permissions. Only a commit SHA is immutable.
+          #
+          # This check has to exist separately from the one below, which can
+          # only validate pins that are already SHAs — an unpinned action is
+          # invisible to it.
+          node - <<'NODE'
+          const { readdirSync, readFileSync } = require("node:fs");
+
+          // Match the `uses:` key at the start of a line, not the substring:
+          // this file quotes `uses:` inside its own grep patterns, and a naive
+          // scan flags those. That failure mode has already broken this job.
+          const USES = /^\s*-?\s*uses: [a-zA-Z]/;
+          const PINNED = /uses: [^@]+@[0-9a-f]{40} # \S+/;
+
+          const offenders = [];
+          for (const file of readdirSync(".github/workflows")) {
+            readFileSync(`.github/workflows/${file}`, "utf8").split("\n").forEach((line, i) => {
+              if (USES.test(line) && !PINNED.test(line)) {
+                offenders.push(`.github/workflows/${file}:${i + 1}: ${line.trim()}`);
+              }
+            });
+          }
+
+          if (offenders.length > 0) {
+            for (const o of offenders) console.error(`::error::${o}: pin to a 40-character commit SHA with a '# vX.Y.Z' comment.`);
+            process.exit(1);
+          }
+          console.log("All action references are SHA-pinned.");
+          NODE
+
+      - name: Action pins match their version comments
+        run: |
+          set -euo pipefail
+          # A pin that names a tag object rather than a commit fails to resolve;
+          # a pin that names an unrelated commit resolves to unintended code.
+          # Both have happened here.
+          fail=0
+          while IFS= read -r line; do
+            ref="${line#*uses: }"
+            action="${ref%%@*}"; rest="${ref#*@}"
+            sha="${rest%% *}"; tag="${rest##*# }"
+            [ "$sha" = "$rest" ] && continue
+            repo="$(cut -d/ -f1,2 <<<"$action")"
+            actual="$(gh api "repos/${repo}/commits/${sha}" --jq .sha 2>/dev/null || true)"
+            if [ -z "$actual" ]; then
+              echo "::error::${repo}@${sha} (${tag}) is not a commit in that repository."
+              fail=1
+            fi
+          done < <(grep -rhoE 'uses: [^@]+@[0-9a-f]{40} # \S+' .github/workflows/)
+          exit "$fail"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  dependency-review:
+    name: Dependency review
+    # Diffs the manifest against the base, so only meaningful on a PR.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Advisory-database matching only. It will not catch a deliberately
+          # malicious package, which is the real threat to a distributed binary.
+          fail-on-severity: high
+          # Copyleft terms would change acpx's distribution terms, and the
+          # single executable ships every dependency inside one file.
+          deny-licenses: AGPL-3.0, GPL-3.0
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # --ignore-scripts is load-bearing, not hygiene. --frozen-lockfile
+      # constrains the dependency graph but not `scripts`; package.json declares
+      # a root `prepare` hook, so without this a fork PR gets code execution on
+      # a runner simply by opening the PR.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Audit production dependencies
+        # Production only: a dev-tool advisory does not reach users, and failing
+        # the build on one trains people to ignore this job.
+        run: |
+          set -uo pipefail
+          # Distinguish "found advisories" from "could not run". pnpm 10.33.2
+          # crashes on a gzipped audit response with
+          # `Unexpected token '\x1f' ... is not valid JSON`, which is a
+          # transport bug, not a finding. Failing the build on it would make a
+          # red audit job mean nothing, and a real advisory would be ignored
+          # alongside it.
+          output="$(pnpm audit --prod --audit-level high 2>&1)" && status=0 || status=$?
+          echo "$output"
+
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+
+          if grep -q "is not valid JSON" <<<"$output"; then
+            echo "::warning::pnpm audit could not parse the registry response; treating as inconclusive rather than as a finding."
+            exit 0
+          fi
+
+          echo "::error::pnpm audit reported advisories at or above high severity."
+          exit "$status"
+
+  scorecard:
+    name: OpenSSF Scorecard
+    # Never on pull_request: fork tokens are read-only so upload-sarif cannot
+    # work, and Scorecard rates repo-wide posture rather than the diff.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No id-token: that is only needed for publish_results, which is off.
+      - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false
+
+      - uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
+        with:
+          sarif_file: scorecard.sarif
