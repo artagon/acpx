@@ -18,7 +18,25 @@ function runBuildUntilPnpm(
   const tempDir = mkdtempSync(path.join(os.tmpdir(), "acpx-sea-build-test-"));
   t.after(() => rmSync(tempDir, { recursive: true, force: true }));
   const capturePath = path.join(tempDir, "sea-node-version");
+  const fakeNodePath = path.join(tempDir, "node");
   const fakePnpmPath = path.join(tempDir, "pnpm");
+  writeFileSync(
+    fakeNodePath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "-p" ] && [ "$2" = "String(process.config.variables.single_executable_application)" ]; then',
+      '  printf "true"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "-p" ] && [ "$2" = "process.versions.node" ]; then',
+      `  printf "${process.versions.node}"`,
+      "  exit 0",
+      "fi",
+      "exit 43",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(fakeNodePath, 0o755);
   writeFileSync(
     fakePnpmPath,
     [
@@ -32,7 +50,7 @@ function runBuildUntilPnpm(
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    ACPX_SEA_NODE: process.execPath,
+    ACPX_SEA_NODE: fakeNodePath,
     ACPX_TEST_VERSION_CAPTURE: capturePath,
     PATH: `${tempDir}${path.delimiter}${process.env.PATH ?? ""}`,
   };
