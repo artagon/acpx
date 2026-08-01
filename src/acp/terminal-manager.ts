@@ -463,7 +463,7 @@ export class TerminalManager {
     }
 
     try {
-      await signalProcessTree(terminal.processTree, this.isRunning(terminal), "SIGTERM");
+      await signalProcessTree(terminal.processTree, () => this.isRunning(terminal), "SIGTERM");
     } catch {
       return;
     }
@@ -474,7 +474,7 @@ export class TerminalManager {
     }
 
     try {
-      await signalProcessTree(terminal.processTree, this.isRunning(terminal), "SIGKILL");
+      await signalProcessTree(terminal.processTree, () => this.isRunning(terminal), "SIGKILL");
     } catch {
       return;
     }

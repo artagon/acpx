@@ -185,5 +185,7 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
       await terminateQueueOwnerForSession(record.acpxRecordId);
     }
   }
-  return await closePersistedSession(record.acpxRecordId);
+  const closedRecord = await closePersistedSession(record.acpxRecordId);
+  await terminateQueueOwnerForSession(record.acpxRecordId);
+  return closedRecord;
 }

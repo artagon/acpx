@@ -17,6 +17,7 @@ export type ManagedProcessTree = {
   descendantIdentities: Map<number, string>;
   rootIdentity?: string;
   rootIdentityFloor?: string;
+  rootRunning?: () => boolean;
   snapshotPromise?: Promise<void>;
 };
 
@@ -65,6 +66,7 @@ export function beginProcessTreeTracking(
   if (!tree.killProcessGroup || !tree.rootPid) {
     return;
   }
+  tree.rootRunning = rootRunning;
   queueProcessTreeTracking(tree, rootRunning);
 }
 
@@ -128,10 +130,18 @@ async function recordCurrentProcessTreePids(tree: ManagedProcessTree): Promise<v
   if (!tree.killProcessGroup || !rootPid) {
     return;
   }
+  if (tree.rootRunning && !tree.rootRunning()) {
+    return;
+  }
+  const priorRootIdentity = tree.rootIdentity;
   const processes =
     tree.platform === "win32"
       ? await listDescendantProcesses(tree)
       : await listOwnedPosixProcesses(tree);
+  if (tree.rootRunning && !tree.rootRunning()) {
+    tree.rootIdentity = priorRootIdentity;
+    return;
+  }
   recordProcessTreePids(tree, processes);
 }
 
@@ -147,7 +157,7 @@ function recordProcessTreePids(tree: ManagedProcessTree, processes: ProcessListE
 
 export async function signalProcessTree(
   tree: ManagedProcessTree,
-  rootRunning: boolean,
+  rootRunning: boolean | (() => boolean),
   signal: NodeJS.Signals,
 ): Promise<void> {
   const rootPid = tree.rootPid;
@@ -158,19 +168,25 @@ export async function signalProcessTree(
     return;
   }
 
-  if (!rootRunning) {
+  let rootIsRunning = resolveRootRunning(rootRunning);
+  if (!rootIsRunning) {
     await captureProcessTreePids(tree, false);
     await refreshExitedProcessTreePids(tree);
   } else {
     await recordCurrentProcessTreePids(tree);
   }
-  for (const target of resolveProcessTreeSignalTargets(tree, rootRunning)) {
+  rootIsRunning = resolveRootRunning(rootRunning);
+  for (const target of resolveProcessTreeSignalTargets(tree, rootIsRunning)) {
     if (target.tree) {
       await killWindowsProcessTree(target.pid, signal);
     } else {
       sendSignal(target.pid, signal);
     }
   }
+}
+
+function resolveRootRunning(rootRunning: boolean | (() => boolean)): boolean {
+  return typeof rootRunning === "function" ? rootRunning() : rootRunning;
 }
 
 export type ProcessTreeSignalTarget = {

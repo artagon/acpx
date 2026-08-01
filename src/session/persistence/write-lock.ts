@@ -112,6 +112,33 @@ async function recoverStaleSessionWriteLock(lockPath: string): Promise<boolean> 
     return false;
   }
 
+  const recoveryPath = `${lockPath}.reaper-${observedStat.dev}-${observedStat.ino}`;
+  try {
+    await fs.mkdir(recoveryPath, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  }
+
+  try {
+    return await recoverObservedStaleSessionWriteLock(lockPath, observedStat);
+  } finally {
+    await fs.rmdir(recoveryPath).catch(() => {
+      // A failed cleanup only blocks another reaper for this exact inode.
+    });
+  }
+}
+
+async function recoverObservedStaleSessionWriteLock(
+  lockPath: string,
+  observedStat: Stats,
+): Promise<boolean> {
+  if (!(await observedSessionWriteLockRemainsStale(lockPath, observedStat))) {
+    return false;
+  }
+
   const quarantinePath = `${lockPath}.reap-${process.pid}-${randomUUID()}`;
   try {
     await fs.rename(lockPath, quarantinePath);
@@ -133,6 +160,18 @@ async function recoverStaleSessionWriteLock(lockPath: string): Promise<boolean> 
   }
   await unlinkIfPresent(quarantinePath);
   return true;
+}
+
+async function observedSessionWriteLockRemainsStale(
+  lockPath: string,
+  observedStat: Stats,
+): Promise<boolean> {
+  const currentStat = await lstatIfPresent(lockPath);
+  return Boolean(
+    currentStat &&
+    sameFileIdentity(observedStat, currentStat) &&
+    (await sessionWriteLockIsStale(lockPath, currentStat)),
+  );
 }
 
 export async function sessionWriteLockIsStale(lockPath: string, stat: Stats): Promise<boolean> {

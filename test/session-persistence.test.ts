@@ -687,6 +687,10 @@ test("writeSessionRecord recovers a stale cross-process write lock", async () =>
     );
 
     assert.equal(await fileExists(lockPath), false);
+    assert.equal(
+      (await fs.readdir(sessionDir)).some((name) => name.startsWith(".write.lock.reaper-")),
+      false,
+    );
   });
 });
 

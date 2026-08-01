@@ -1564,7 +1564,7 @@ export class AcpClient {
       return true;
     }
     try {
-      await signalProcessTree(processTree, isChildProcessRunning(child), signal);
+      await signalProcessTree(processTree, () => isChildProcessRunning(child), signal);
     } catch {
       // best effort
     }

@@ -345,6 +345,40 @@ test(
   },
 );
 
+test("process tracking discards a root identity captured after the child exits", async () => {
+  const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-exited-root-identity-"));
+  const powershellPath = path.join(fixtureDir, "powershell.exe");
+  const originalPath = process.env.PATH;
+  await fs.writeFile(
+    powershellPath,
+    [
+      "#!/bin/sh",
+      "sleep 0.1",
+      'printf "500 1 1000\\n"',
+      `printf "${process.pid} 500 1100\\n"`,
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+  try {
+    let rootRunning = true;
+    const tree = createManagedProcessTree(500, true, "win32", 0);
+    beginProcessTreeTracking(tree, () => rootRunning);
+    setTimeout(() => {
+      rootRunning = false;
+    }, 20);
+
+    await tree.snapshotPromise;
+
+    assert.equal(tree.rootIdentity, undefined);
+    assert.equal(tree.descendantPids.size, 0);
+  } finally {
+    process.env.PATH = originalPath;
+    await fs.rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
 test(
   "exited POSIX trees discard remembered PIDs whose identity changed",
   { skip: process.platform === "win32" },
