@@ -170,7 +170,11 @@ export function parseBenchmarkAgentArgs(
   if (argv[0] !== "--trace-file") {
     throw new Error(`Unknown argument: ${argv[0]}`);
   }
-  if (typeof argv[1] !== "string" || argv[1].trim().length === 0) {
+  if (
+    typeof argv[1] !== "string" ||
+    argv[1].trim().length === 0 ||
+    argv[1].startsWith("--")
+  ) {
     throw new Error("--trace-file requires a path.");
   }
   if (argv.length > 2) {

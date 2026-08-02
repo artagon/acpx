@@ -65,6 +65,24 @@ function isBenchmarkTraceEventName(value: unknown): value is BenchmarkTraceEvent
   );
 }
 
+function assertOrderedScenarioTrace(
+  events: readonly BenchmarkTraceEvent["event"][],
+  workloadStart: BenchmarkTraceEvent["event"],
+  workloadEnd: BenchmarkTraceEvent["event"],
+): void {
+  const startIndex = events.indexOf(workloadStart);
+  const endIndex = events.indexOf(workloadEnd);
+  const terminalIndex = events.findIndex(
+    (event, index) =>
+      index > endIndex &&
+      (event === "agent.stdin_end" || event === "agent.sigterm" || event === "agent.exit"),
+  );
+
+  assert.ok(startIndex >= 0, `missing ${workloadStart}`);
+  assert.ok(endIndex > startIndex, `${workloadEnd} must follow ${workloadStart}`);
+  assert.ok(terminalIndex > endIndex, "terminal event must follow the workload");
+}
+
 async function runCli(args: readonly string[], homeDir: string): Promise<CliRunResult> {
   return await new Promise<CliRunResult>((resolve) => {
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
@@ -135,38 +153,41 @@ test("parseBenchmarkAgentArgs accepts only an optional trace file", () => {
   });
   assert.throws(() => parseBenchmarkAgentArgs(["--unexpected"]), /unknown argument/i);
   assert.throws(() => parseBenchmarkAgentArgs(["--trace-file"]), /requires a path/i);
+  assert.throws(() => parseBenchmarkAgentArgs(["--trace-file", "--unknown"]), /requires a path/i);
 });
 
-test("the built benchmark agent traces session list and exec workloads", async () => {
+test("the built benchmark agent traces ordered session list and exec workloads", async () => {
   await withTempDirectory(async (directory) => {
-    const traceFile = path.join(directory, "benchmark.ndjson");
     const homeDir = path.join(directory, "home");
     const workspace = path.join(directory, "workspace");
-    const agentCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(BENCHMARK_AGENT_PATH)} --trace-file ${JSON.stringify(traceFile)}`;
+    const configFile = path.join(homeDir, ".acpx", "config.json");
+    const writeBenchmarkConfig = async (traceFile: string): Promise<void> => {
+      const agentCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(BENCHMARK_AGENT_PATH)} --trace-file ${JSON.stringify(traceFile)}`;
+      await fs.writeFile(
+        configFile,
+        `${JSON.stringify({ agents: { benchmark: { command: agentCommand } } })}\n`,
+        "utf8",
+      );
+    };
 
     await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
     await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(
-      path.join(homeDir, ".acpx", "config.json"),
-      `${JSON.stringify({ agents: { benchmark: { command: agentCommand } } })}\n`,
-      "utf8",
-    );
+    const listTraceFile = path.join(directory, "list.ndjson");
+    await writeBenchmarkConfig(listTraceFile);
 
     const list = await runCli(["--cwd", workspace, "benchmark", "sessions", "list"], homeDir);
     assert.equal(list.code, 0, list.stderr);
+    const listEvents = parseTraceEvents(listTraceFile).map((event) => event.event);
+    assertOrderedScenarioTrace(listEvents, "agent.session_list.start", "agent.session_list.end");
 
+    const execTraceFile = path.join(directory, "exec.ndjson");
+    await writeBenchmarkConfig(execTraceFile);
     const exec = await runCli(["--cwd", workspace, "benchmark", "exec", "benchmark prompt"], homeDir);
     assert.equal(exec.code, 0, exec.stderr);
     assert.match(exec.stdout, /benchmark agent response/u);
 
-    const events = parseTraceEvents(traceFile).map((event) => event.event);
-    assert.ok(events.indexOf("agent.initialize.start") < events.indexOf("agent.initialize.end"));
-    assert.ok(events.includes("agent.session_list.start"));
-    assert.ok(events.includes("agent.session_list.end"));
-    assert.ok(events.includes("agent.new_session.start"));
-    assert.ok(events.includes("agent.new_session.end"));
-    assert.ok(events.includes("agent.prompt.start"));
-    assert.ok(events.includes("agent.prompt.end"));
-    assert.ok(events.some((event) => ["agent.stdin_end", "agent.sigterm", "agent.exit"].includes(event)));
+    const execEvents = parseTraceEvents(execTraceFile).map((event) => event.event);
+    assertOrderedScenarioTrace(execEvents, "agent.new_session.start", "agent.new_session.end");
+    assertOrderedScenarioTrace(execEvents, "agent.prompt.start", "agent.prompt.end");
   });
 });
