@@ -4,14 +4,18 @@
 
 **Goal:** Build a reusable, statistically paired benchmark and use it to compare current OpenClaw `main`, OpenClaw PR #478, and Artagon performance PR #2.
 
-**Architecture:** Functional TypeScript in `scripts/perf/` owns validation, ordering, statistics, eager-graph analysis, and rendering. Statistical transforms remain pure; filesystem reads and process spawning stay at explicit boundaries. A small functional ACP agent supplies one shared diagnostic fixture, while the runner spawns already-built checkouts and writes versioned JSON plus Markdown. Git fetching, worktree creation, dependency installation, and builds remain explicit controller operations outside the benchmark runner.
+**Architecture:** Functional TypeScript in `scripts/perf/` owns validation, ordering, statistics, eager-graph analysis, and rendering. Statistical transforms remain pure; filesystem reads and process spawning stay at explicit boundaries. An exact-pinned Tinybench task engine executes one ordered adjacent pair at a time, while the outer functional runner retains preflight, warmups, pair identity and order, process isolation, timeouts, diagnostics, statistics, and reporting. A small functional ACP agent supplies one shared diagnostic fixture, while the runner spawns already-built checkouts and writes versioned JSON plus Markdown. Git fetching, worktree creation, dependency installation, and builds remain explicit controller operations outside the benchmark runner.
 
-**Tech Stack:** Node.js >=22.13.0, strict TypeScript, Node test runner, `tsx`, ACP SDK, existing Oxlint/Oxfmt gates.
+**Tech Stack:** Node.js >=22.13.0, strict TypeScript, Node test runner, `tsx`, `tinybench@6.1.2`, ACP SDK, existing Oxlint/Oxfmt gates.
 
 ## Global Constraints
 
-- Follow the existing repository's modular functional TypeScript style: small exported functions, explicit immutable data types, no benchmark classes, and side effects confined to executable boundaries.
-- Do not use explicit `any`, unsafe assignment/calls/member access/returns, unchecked casts, or new dependencies.
+- Follow the existing repository's modular functional TypeScript style: small exported functions, explicit immutable data types, no application-defined benchmark classes, and side effects confined to executable boundaries. Tinybench's `Bench` class is allowed only inside `benchmark-engine.ts`.
+- Do not use explicit `any`, unsafe assignment/calls/member access/returns, unchecked casts, or new dependencies other than exact-pinned `tinybench@6.1.2`.
+- Tinybench SHALL be a thin task engine, not the experiment controller. Create one fresh non-concurrent `Bench` per adjacent pair; the outer runner SHALL retain preflight, scenario-specific warmups, pair identity and order, process isolation, timeouts, traces, statistics, and reports.
+- Every pair `Bench` SHALL use `concurrency: null`, `time: 0`, `iterations: 1`, `warmup: false`, `retainSamples: true`, and `throws: true`. Register tasks in runner-selected order and execute each task exactly once.
+- Each async Tinybench task SHALL return the finite, nonnegative externally measured spawn-to-close duration as `overriddenDuration`; Tinybench callback timing SHALL NOT replace the process measurement.
+- Ordered `PairedSample[]` SHALL remain the authoritative raw data. Do not derive pair order or report statistics from Tinybench's sorted retained samples; the core SHALL continue to own p95 and deterministic paired bootstrap confidence intervals.
 - The runner SHALL NOT fetch, check out, install, build, merge, rebase, force-push, delete worktrees, or otherwise mutate Git state.
 - OpenClaw PR #478 SHALL remain unchanged; benchmark code belongs only to `perf/consolidated-runtime` and Artagon PR #2.
 - Every measured variant SHALL use the same benchmark agent built from the benchmark-owning performance worktree.
@@ -62,6 +66,13 @@ export type SampleSummary = Readonly<{
 export type PairedDelta = Readonly<{
   geometricMeanDeltaPct: number;
   ci95Pct: readonly [number, number];
+}>;
+
+export type PairedSample = Readonly<{
+  sampleIndex: number;
+  order: "baseline-first" | "candidate-first";
+  baselineMs: number;
+  candidateMs: number;
 }>;
 
 export type EagerGraphSummary = Readonly<{
@@ -271,22 +282,39 @@ rtk git add scripts/perf/benchmark-agent.ts test/perf-benchmark-agent.test.ts
 rtk git commit -m "test: add shared benchmark ACP agent"
 ```
 
-### Task 3: Benchmark runner, diagnostics, and package entrypoint
+### Task 3: Tinybench engine, benchmark runner, diagnostics, and package entrypoint
 
 **Files:**
 
+- Create: `scripts/perf/benchmark-engine.ts`
+- Create: `test/perf-benchmark-engine.test.ts`
 - Create: `scripts/perf/benchmark-runner.ts`
 - Create: `test/perf-benchmark-runner.test.ts`
 - Modify: `package.json`
+- Modify: `pnpm-lock.yaml`
 - Modify: `test/package-scripts.test.ts`
 
 **Interfaces:**
 
-- Consumes: all Task 1 core exports and Task 2's compiled agent at
+- Consumes: exact-pinned `tinybench@6.1.2`, all Task 1 core exports, and Task 2's compiled agent at
   `dist-test/scripts/perf/benchmark-agent.js`.
 - Produces:
 
 ```ts
+export type BenchmarkEngineTask = Readonly<{
+  name: string;
+  execute: () => Promise<number>;
+}>;
+
+export type BenchmarkEngineResult = Readonly<{
+  name: string;
+  durationMs: number;
+}>;
+
+export async function runBenchmarkPair(
+  tasks: readonly [BenchmarkEngineTask, BenchmarkEngineTask],
+): Promise<readonly [BenchmarkEngineResult, BenchmarkEngineResult]>;
+
 export type BenchmarkOptions = Readonly<{
   baseline: VariantSpec;
   candidates: readonly VariantSpec[];
@@ -315,7 +343,24 @@ agent-sessions: { samples: 25, warmups: 5 }
 exec: { samples: 25, warmups: 5 }
 ```
 
-- [ ] **Step 1: Write failing runner and package tests**
+- [ ] **Step 1: Add the exact Tinybench dependency**
+
+Run:
+
+```bash
+rtk pnpm add --save-dev --save-exact tinybench@6.1.2
+```
+
+Expected: `package.json` and `pnpm-lock.yaml` pin exactly `6.1.2`; no semver
+range or second benchmark framework is added.
+
+- [ ] **Step 2: Write failing engine, runner, and package tests**
+
+In `test/perf-benchmark-engine.test.ts`, use two async tasks that append their
+names to an execution log and return distinct fixed durations. Assert the
+engine preserves registration order, invokes each task exactly once, and
+returns the exact external durations with their names. Add a task that throws a
+sentinel error and assert `runBenchmarkPair` rejects with that same failure.
 
 Assert repeated candidates/scenarios parse correctly; labels are unique;
 counts and seed are validated; worktrees must have resolvable Git HEAD and
@@ -328,7 +373,7 @@ samples. Assert package scripts contain exactly:
 "perf:benchmark": "pnpm run build:test && tsx scripts/perf/benchmark-runner.ts"
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [ ] **Step 3: Run the tests and verify RED**
 
 Run:
 
@@ -336,38 +381,64 @@ Run:
 rtk pnpm run build:test
 ```
 
-Expected: FAIL because runner exports and the package script do not exist.
+Expected: FAIL because engine and runner exports and the package script do not
+exist.
 
-- [ ] **Step 3: Implement argument and input validation**
+- [ ] **Step 4: Implement the thin Tinybench engine**
+
+For every `runBenchmarkPair` call, create a fresh `Bench` with:
+
+```ts
+{
+  concurrency: null,
+  time: 0,
+  iterations: 1,
+  warmup: false,
+  retainSamples: true,
+  throws: true,
+}
+```
+
+Register tasks in input order. Each async Tinybench callback calls `execute()`,
+rejects a non-finite or negative duration, retains the exact duration by task
+identity, and returns `{ overriddenDuration: durationMs }`. Run the bench once,
+propagate task failures, and return the two retained external durations in
+registration order. Do not expose Tinybench task/sample objects to the core or
+runner.
+
+- [ ] **Step 5: Implement argument and input validation**
 
 Use `node:util` `parseArgs`, resolve absolute paths, read Git SHAs by spawning
 `git` with `-C`, the resolved worktree path, `rev-parse`, and `HEAD` as separate
 argv entries, and validate every variant before creating output state. Do not
 invoke a shell.
 
-- [ ] **Step 4: Implement measured and diagnostic runs**
+- [ ] **Step 6: Implement measured and diagnostic runs**
 
 For every pair, create fresh per-run HOME and cwd directories before starting
 the timer. Measure with `performance.now()` immediately before `spawn` through
-the child `close` event. Ignore measured stdout, drain stderr, and reject
-nonzero exits. Use the shared agent command for ACP scenarios. Capture trace and
-internal metrics only in separate diagnostic samples and derive stage summaries
-only when required events are present.
+the child `close` event. The runner selects alternating order and delegates each
+adjacent measured pair to `runBenchmarkPair`; the task's returned duration is
+the exact external measurement supplied to Tinybench as `overriddenDuration`.
+Ignore measured stdout, drain stderr, and reject nonzero exits. Use the shared
+agent command for ACP scenarios. Capture trace and internal metrics only in
+separate diagnostic samples and derive stage summaries only when required
+events are present. Preflight and warmups stay outside Tinybench.
 
-- [ ] **Step 5: Implement reports and atomic writes**
+- [ ] **Step 7: Implement reports and atomic writes**
 
 Create the selected output directory without deleting existing data. Refuse to
 overwrite existing `results.json` or `results.md`. Write same-directory
 temporary files with exclusive creation, then rename. Print only the final JSON
 path on stdout; diagnostics go to stderr.
 
-- [ ] **Step 6: Verify GREEN**
+- [ ] **Step 8: Verify GREEN**
 
 Run:
 
 ```bash
 rtk pnpm run build:test
-rtk node --test dist-test/test/perf-benchmark-core.test.js dist-test/test/perf-benchmark-agent.test.js dist-test/test/perf-benchmark-runner.test.js dist-test/test/package-scripts.test.js
+rtk node --test dist-test/test/perf-benchmark-core.test.js dist-test/test/perf-benchmark-agent.test.js dist-test/test/perf-benchmark-engine.test.js dist-test/test/perf-benchmark-runner.test.js dist-test/test/package-scripts.test.js
 rtk pnpm run typecheck
 rtk pnpm run lint
 rtk pnpm run format:check
@@ -375,10 +446,10 @@ rtk pnpm run format:check
 
 Expected: all commands pass.
 
-- [ ] **Step 7: Commit Task 3**
+- [ ] **Step 9: Commit Task 3**
 
 ```bash
-rtk git add package.json scripts/perf/benchmark-runner.ts test/perf-benchmark-runner.test.ts test/package-scripts.test.ts
+rtk git add package.json pnpm-lock.yaml scripts/perf/benchmark-engine.ts scripts/perf/benchmark-runner.ts test/perf-benchmark-engine.test.ts test/perf-benchmark-runner.test.ts test/package-scripts.test.ts
 rtk git commit -m "feat: add reusable CLI benchmark"
 ```
 

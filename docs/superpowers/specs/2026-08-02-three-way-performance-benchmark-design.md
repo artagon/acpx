@@ -48,6 +48,44 @@ reporting contract without spawning hundreds of processes. Statistical,
 ordering, validation, and rendering functions are pure. Eager-graph analysis
 is a read-only filesystem boundary and performs no writes.
 
+The core retains ordered `PairedSample[]` values as the authoritative raw
+measurements. It also continues to calculate p95 and the deterministic paired
+bootstrap interval. Tinybench sorts its retained per-task samples and does not
+provide either the required p95 or paired confidence interval, so its result
+arrays are not used as the experiment's statistical record.
+
+### Tinybench task engine
+
+An exact-pinned `tinybench@6.1.2` development dependency supplies the narrow
+task-execution boundary. `scripts/perf/benchmark-engine.ts` creates one fresh,
+non-concurrent `Bench` for each adjacent baseline/candidate pair with:
+
+```ts
+{
+  concurrency: null,
+  time: 0,
+  iterations: 1,
+  warmup: false,
+  retainSamples: true,
+  throws: true,
+}
+```
+
+The runner selects the alternating order before calling the engine. The engine
+registers the two tasks in that exact order, executes each task once, and
+propagates failures. Each async task performs the externally timed subprocess
+run and returns a finite, nonnegative `overriddenDuration` measured from just
+before spawn through child close. The engine returns those external durations
+with task identity and registration order intact.
+
+Tinybench is therefore a task engine, not the experiment controller. It does
+not own preflight, warmups, pair identity or order, process isolation, timeouts,
+traces, statistics, or report generation. Vitest benchmark mode is not selected
+because it would add a test-runner layer around Tinybench while this repository
+uses the Node test runner. Mitata is not selected because its in-process
+microbenchmark loop does not match the one-shot, externally timed subprocess
+task boundary used here.
+
 ### Benchmark runner
 
 The executable TypeScript entrypoint under `scripts/perf/` accepts:
@@ -65,6 +103,10 @@ The executable TypeScript entrypoint under `scripts/perf/` accepts:
 Every worktree must contain `dist/cli.js` and its Git HEAD must resolve to a
 commit. Labels must be unique. The runner rejects missing builds, duplicate
 labels, invalid counts, failed preflight commands, and nonzero measured runs.
+It remains the outer functional experiment controller: it owns preflight,
+scenario-specific warmups, pair identity, alternating order, isolated process
+state, timeouts, diagnostics, and aggregation before delegating each adjacent
+measured pair to the Tinybench task engine.
 
 The package entrypoint is `pnpm run perf:benchmark -- <arguments>`. It builds
 the shared benchmark agent once, then invokes the runner. Candidate worktrees
@@ -115,6 +157,11 @@ The baseline and every candidate run in adjacent pairs. Pair order alternates
 on each sample to reduce first-run and short-term load bias. A candidate is
 compared only with the baseline observation from the same pair index.
 
+Each adjacent pair runs in its own sequential Tinybench instance. A Tinybench
+task receives the runner's exact spawn-to-close duration through
+`overriddenDuration`; Tinybench's internal callback timing is not substituted
+for that process measurement.
+
 Each report includes raw samples plus count, mean, median, p95, standard
 deviation, minimum, and maximum. Relative results include median and mean
 deltas and the geometric mean of paired ratios. A deterministic 10,000-sample
@@ -147,6 +194,8 @@ Tests are written before implementation and cover:
 - deterministic alternating order for two and three variants;
 - percentile and summary calculations on fixed samples;
 - deterministic paired bootstrap output for a fixed seed;
+- Tinybench task registration order, exactly one execution per task, preserved
+  external durations, and thrown-task failure propagation;
 - missing trace events and unsupported internal metrics;
 - eager-graph traversal with local, external, and side-effect imports;
 - JSON schema-version content and Markdown table rendering; and
