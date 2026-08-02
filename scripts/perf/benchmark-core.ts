@@ -22,8 +22,17 @@ export type SampleSummary = Readonly<{
 }>;
 
 export type PairedDelta = Readonly<{
+  meanDeltaPct: number;
+  medianDeltaPct: number;
   geometricMeanDeltaPct: number;
   ci95Pct: readonly [number, number];
+}>;
+
+export type PairedSample = Readonly<{
+  sampleIndex: number;
+  order: "baseline-first" | "candidate-first";
+  baselineMs: number;
+  candidateMs: number;
 }>;
 
 export type EagerGraphSummary = Readonly<{
@@ -35,20 +44,23 @@ export type EagerGraphSummary = Readonly<{
 }>;
 
 export type BenchmarkMethodology = Readonly<{
-  samplesPerScenario: number;
-  warmupSamples: number;
   pairing: "alternating";
   bootstrapSeed: number;
   bootstrapResamples: number;
 }>;
 
 export type BenchmarkEnvironment = Readonly<{
+  hostname: string;
+  osType: string;
+  osRelease: string;
   platform: string;
   arch: string;
+  nodeExecutable: string;
   nodeVersion: string;
   cpuModel: string;
   cpuCount: number;
   totalMemoryBytes: number;
+  loadAverage: readonly [number, number, number];
 }>;
 
 export type BenchmarkVariant = Readonly<{
@@ -62,32 +74,49 @@ export type BenchmarkEagerGraph = Readonly<{
   summary: EagerGraphSummary;
 }>;
 
-export type BenchmarkVariantSamples = Readonly<{
-  variantLabel: string;
-  samplesMs: readonly number[];
-  summary: SampleSummary;
-}>;
-
 export type CandidateComparison = Readonly<{
   baselineLabel: string;
   candidateLabel: string;
+  pairedSamples: readonly PairedSample[];
+  baselineSummary: SampleSummary;
+  candidateSummary: SampleSummary;
   pairedDelta: PairedDelta;
 }>;
 
-export type TraceSummary =
+export type StageTiming =
   | Readonly<{
-      variantLabel: string;
-      tracePath: string;
       state: "available";
-      eventCount: number;
       durationMs: number;
     }>
   | Readonly<{
-      variantLabel: string;
-      tracePath: string;
       state: "unavailable";
       unavailableReason: string;
     }>;
+
+export type TraceCapture =
+  | Readonly<{
+      state: "available";
+      tracePath: string;
+      eventCount: number;
+    }>
+  | Readonly<{
+      state: "unavailable";
+      tracePath: string | null;
+      unavailableReason: string;
+    }>;
+
+/**
+ * Lifecycle stages use one monotonic epoch. `preAgent` spans runner spawn to
+ * `agent.process_start`; `acpActive` spans process start to the scenario's
+ * workload-end event (`agent.session_list.end` or `agent.prompt.end`); and
+ * `teardown` spans that workload-end event to child close.
+ */
+export type LifecycleTraceSummary = Readonly<{
+  capture: TraceCapture;
+  preAgent: StageTiming;
+  acpActive: StageTiming;
+  teardown: StageTiming;
+}>;
 
 export type InternalMetricSummary = Readonly<{
   name: string;
@@ -96,19 +125,35 @@ export type InternalMetricSummary = Readonly<{
   maxMs: number;
 }>;
 
-export type InternalMetricsSupport = Readonly<{
-  supported: boolean;
-  unsupportedReason: string | null;
-  metrics: readonly InternalMetricSummary[];
+export type InternalMetricsSupport =
+  | Readonly<{
+      state: "available";
+      metricsPath: string;
+      metrics: readonly InternalMetricSummary[];
+    }>
+  | Readonly<{
+      state: "unavailable";
+      metricsPath: string | null;
+      unavailableReason: string;
+    }>;
+
+export type VariantDiagnostics = Readonly<{
+  variantLabel: string;
+  trace: LifecycleTraceSummary;
+  internalMetrics: InternalMetricsSupport;
+}>;
+
+export type ScenarioConfiguration = Readonly<{
+  samples: number;
+  warmups: number;
 }>;
 
 export type BenchmarkScenario = Readonly<{
   name: ScenarioName;
   command: string;
-  variants: readonly BenchmarkVariantSamples[];
-  comparison: CandidateComparison;
-  traces: readonly TraceSummary[];
-  internalMetrics: InternalMetricsSupport;
+  configuration: ScenarioConfiguration;
+  comparisons: readonly CandidateComparison[];
+  diagnostics: readonly VariantDiagnostics[];
 }>;
 
 export type BenchmarkReport = Readonly<{
@@ -137,7 +182,11 @@ export function parseVariantSpec(value: string, optionName: string): VariantSpec
   };
 }
 
-export function createPairOrder<T>(baseline: T, candidate: T, sampleIndex: number): readonly [T, T] {
+export function createPairOrder<T>(
+  baseline: T,
+  candidate: T,
+  sampleIndex: number,
+): readonly [T, T] {
   return sampleIndex % 2 === 0 ? [baseline, candidate] : [candidate, baseline];
 }
 
@@ -146,13 +195,12 @@ export function summarizeSamples(values: readonly number[]): SampleSummary {
   const sorted = values.toSorted((left, right) => left - right);
   const total = values.reduce((sum, value) => sum + value, 0);
   const meanMs = total / values.length;
-  const squaredDifferenceTotal = values.reduce(
-    (sum, value) => sum + (value - meanMs) ** 2,
-    0,
-  );
+  const squaredDifferenceTotal = values.reduce((sum, value) => sum + (value - meanMs) ** 2, 0);
   const middle = values.length / 2;
   const medianMs =
-    values.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[Math.floor(middle)];
+    values.length % 2 === 0
+      ? (sorted[middle - 1] + sorted[middle]) / 2
+      : sorted[Math.floor(middle)];
 
   return {
     n: values.length,
@@ -198,6 +246,11 @@ export function calculatePairedDelta(
 
   const sortedDeltas = bootstrappedDeltas.toSorted((left, right) => left - right);
   return {
+    meanDeltaPct: relativeDeltaPct(
+      candidate.reduce((sum, value) => sum + value, 0) / candidate.length,
+      baseline.reduce((sum, value) => sum + value, 0) / baseline.length,
+    ),
+    medianDeltaPct: relativeDeltaPct(median(candidate), median(baseline)),
     geometricMeanDeltaPct,
     ci95Pct: [nearestRank(sortedDeltas, 0.025), nearestRank(sortedDeltas, 0.975)],
   };
@@ -262,23 +315,26 @@ export function renderBenchmarkMarkdown(report: BenchmarkReport): string {
     "",
     "## Methodology",
     "",
-    `- Samples per scenario: ${methodology.samplesPerScenario}`,
-    `- Warmup samples: ${methodology.warmupSamples}`,
     `- Pairing: ${methodology.pairing}`,
     `- Bootstrap: ${methodology.bootstrapResamples} resamples with seed ${methodology.bootstrapSeed}`,
     "",
     "## Environment",
     "",
-    `- Platform: ${environment.platform} ${environment.arch}`,
-    `- Node: ${environment.nodeVersion}`,
+    `- Host: ${environment.hostname}`,
+    `- OS: ${environment.osType} ${environment.osRelease} (${environment.platform}/${environment.arch})`,
+    `- Node executable: ${environment.nodeExecutable}`,
+    `- Node version: ${environment.nodeVersion}`,
     `- CPU: ${environment.cpuModel} (${environment.cpuCount} cores)`,
     `- Memory: ${environment.totalMemoryBytes} bytes`,
+    `- Load average: ${environment.loadAverage.map((value) => value.toFixed(2)).join(", ")}`,
     "",
     "## Variants",
     "",
     "| Label | SHA | Worktree |",
     "| --- | --- | --- |",
-    ...report.variants.map((variant) => `| ${variant.label} | ${variant.gitSha} | ${variant.worktree} |`),
+    ...report.variants.map(
+      (variant) => `| ${variant.label} | ${variant.gitSha} | ${variant.worktree} |`,
+    ),
     "",
     "## Eager graphs",
     "",
@@ -291,52 +347,43 @@ export function renderBenchmarkMarkdown(report: BenchmarkReport): string {
   ];
 
   for (const scenario of report.scenarios) {
-    lines.push("", `## ${scenario.name}`, "", `Command: \`${scenario.command}\``, "");
-    lines.push("| Variant | Samples | Mean | Median | P95 | Stddev | Min | Max |", "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
-    for (const variant of scenario.variants) {
-      const summary = variant.summary;
-      lines.push(
-        `| ${variant.variantLabel} | ${summary.n} | ${formatMilliseconds(summary.meanMs)} | ${formatMilliseconds(summary.medianMs)} | ${formatMilliseconds(summary.p95Ms)} | ${formatMilliseconds(summary.stddevMs)} | ${formatMilliseconds(summary.minMs)} | ${formatMilliseconds(summary.maxMs)} |`,
-      );
-    }
-
-    const comparison = scenario.comparison;
     lines.push(
       "",
-      `Paired delta (${comparison.candidateLabel} vs ${comparison.baselineLabel}): ${formatPercent(comparison.pairedDelta.geometricMeanDeltaPct)} (95% CI ${formatPercent(comparison.pairedDelta.ci95Pct[0])} to ${formatPercent(comparison.pairedDelta.ci95Pct[1])}).`,
+      `## ${scenario.name}`,
+      "",
+      `Command: \`${scenario.command}\``,
+      "",
+      `- Samples: ${scenario.configuration.samples}`,
+      `- Warmups: ${scenario.configuration.warmups}`,
     );
-    lines.push("", "### Trace summaries", "");
-    if (scenario.traces.length === 0) {
-      lines.push("No trace summaries captured.");
-    } else {
-      lines.push("| Variant | Trace | Events | Duration |", "| --- | --- | ---: | ---: |");
-      for (const trace of scenario.traces) {
-        if (trace.state === "unavailable") {
-          lines.push(
-            `| ${trace.variantLabel} | ${trace.tracePath} | Unavailable: ${trace.unavailableReason} | Unavailable |`,
-          );
-          continue;
-        }
-        lines.push(
-          `| ${trace.variantLabel} | ${trace.tracePath} | ${trace.eventCount} | ${formatMilliseconds(trace.durationMs)} |`,
-        );
-      }
+
+    if (scenario.comparisons.length === 0) {
+      lines.push("", "No candidate comparisons.");
+    }
+    for (const comparison of scenario.comparisons) {
+      lines.push(
+        "",
+        `### ${comparison.candidateLabel} vs ${comparison.baselineLabel}`,
+        "",
+        `Paired samples: ${comparison.pairedSamples.length}`,
+        "",
+        "| Variant | N | Mean | Median | P95 | Stddev | Min | Max |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        formatSampleSummaryRow(comparison.baselineLabel, comparison.baselineSummary),
+        formatSampleSummaryRow(comparison.candidateLabel, comparison.candidateSummary),
+        "",
+        `- Mean delta: ${formatPercent(comparison.pairedDelta.meanDeltaPct)}`,
+        `- Median delta: ${formatPercent(comparison.pairedDelta.medianDeltaPct)}`,
+        `- Paired geometric delta: ${formatPercent(comparison.pairedDelta.geometricMeanDeltaPct)} (95% CI ${formatPercent(comparison.pairedDelta.ci95Pct[0])} to ${formatPercent(comparison.pairedDelta.ci95Pct[1])})`,
+      );
     }
 
-    lines.push("", "### Internal metrics", "");
-    if (!scenario.internalMetrics.supported) {
-      lines.push(`Unsupported: ${scenario.internalMetrics.unsupportedReason ?? "not reported"}`);
-      continue;
+    lines.push("", "### Diagnostics");
+    if (scenario.diagnostics.length === 0) {
+      lines.push("", "No diagnostics captured.");
     }
-    if (scenario.internalMetrics.metrics.length === 0) {
-      lines.push("No internal metrics reported.");
-      continue;
-    }
-    lines.push("| Metric | Count | Total | Max |", "| --- | ---: | ---: | ---: |");
-    for (const metric of scenario.internalMetrics.metrics) {
-      lines.push(
-        `| ${metric.name} | ${metric.count} | ${formatMilliseconds(metric.totalMs)} | ${formatMilliseconds(metric.maxMs)} |`,
-      );
+    for (const diagnostic of scenario.diagnostics) {
+      renderVariantDiagnostics(lines, diagnostic);
     }
   }
 
@@ -358,6 +405,18 @@ function nearestRank(sortedValues: readonly number[], percentile: number): numbe
 
 function deltaFromLogRatios(logRatios: readonly number[]): number {
   return (Math.exp(logRatios.reduce((sum, value) => sum + value, 0) / logRatios.length) - 1) * 100;
+}
+
+function relativeDeltaPct(candidateValue: number, baselineValue: number): number {
+  return (candidateValue / baselineValue - 1) * 100;
+}
+
+function median(values: readonly number[]): number {
+  const sorted = values.toSorted((left, right) => left - right);
+  const middle = sorted.length / 2;
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[Math.floor(middle)];
 }
 
 function createXorshift32(seed: number): () => number {
@@ -401,4 +460,63 @@ function formatMilliseconds(value: number): string {
 
 function formatPercent(value: number): string {
   return `${value.toFixed(2)}%`;
+}
+
+function formatSampleSummaryRow(label: string, summary: SampleSummary): string {
+  return `| ${label} | ${summary.n} | ${formatMilliseconds(summary.meanMs)} | ${formatMilliseconds(summary.medianMs)} | ${formatMilliseconds(summary.p95Ms)} | ${formatMilliseconds(summary.stddevMs)} | ${formatMilliseconds(summary.minMs)} | ${formatMilliseconds(summary.maxMs)} |`;
+}
+
+function renderVariantDiagnostics(lines: string[], diagnostic: VariantDiagnostics): void {
+  lines.push(
+    "",
+    `#### ${diagnostic.variantLabel}`,
+    "",
+    formatTraceCapture(diagnostic.trace.capture),
+    "",
+  );
+  lines.push(
+    "| Stage | Timing |",
+    "| --- | ---: |",
+    `| Pre-agent | ${formatStageTiming(diagnostic.trace.preAgent)} |`,
+    `| ACP-active | ${formatStageTiming(diagnostic.trace.acpActive)} |`,
+    `| Teardown | ${formatStageTiming(diagnostic.trace.teardown)} |`,
+    "",
+  );
+
+  const internalMetrics = diagnostic.internalMetrics;
+  if (internalMetrics.state === "unavailable") {
+    lines.push(
+      `Internal metrics: Unavailable: ${internalMetrics.unavailableReason} (path: ${formatOptionalPath(internalMetrics.metricsPath)})`,
+    );
+    return;
+  }
+
+  lines.push(`Internal metrics: ${internalMetrics.metricsPath}`);
+  if (internalMetrics.metrics.length === 0) {
+    lines.push("", "No internal metrics reported.");
+    return;
+  }
+  lines.push("", "| Metric | Count | Total | Max |", "| --- | ---: | ---: | ---: |");
+  for (const metric of internalMetrics.metrics) {
+    lines.push(
+      `| ${metric.name} | ${metric.count} | ${formatMilliseconds(metric.totalMs)} | ${formatMilliseconds(metric.maxMs)} |`,
+    );
+  }
+}
+
+function formatTraceCapture(capture: TraceCapture): string {
+  if (capture.state === "available") {
+    return `Trace: ${capture.tracePath} (${capture.eventCount} events)`;
+  }
+  return `Trace: Unavailable: ${capture.unavailableReason} (path: ${formatOptionalPath(capture.tracePath)})`;
+}
+
+function formatStageTiming(stage: StageTiming): string {
+  return stage.state === "available"
+    ? formatMilliseconds(stage.durationMs)
+    : `Unavailable: ${stage.unavailableReason}`;
+}
+
+function formatOptionalPath(path: string | null): string {
+  return path ?? "Not attempted";
 }

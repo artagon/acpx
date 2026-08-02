@@ -42,6 +42,8 @@ test("calculates reproducible paired deltas and rejects invalid timing samples",
   const second = calculatePairedDelta(candidate, baseline, 0xac0f2026);
 
   assert.deepEqual(first, second);
+  assert.ok(Math.abs(first.meanDeltaPct + 10) < 1e-12);
+  assert.ok(Math.abs(first.medianDeltaPct + 10) < 1e-12);
   assert.ok(first.geometricMeanDeltaPct < 0);
   assert.throws(() => calculatePairedDelta([], [], 0xac0f2026), /at least one/u);
   assert.throws(() => calculatePairedDelta([1], [1, 2], 0xac0f2026), /same length/u);
@@ -103,69 +105,183 @@ test("renders benchmark reports with comparison and trace evidence", () => {
   const report: BenchmarkReport = {
     schemaVersion: 1,
     methodology: {
-      samplesPerScenario: 2,
-      warmupSamples: 1,
       pairing: "alternating",
       bootstrapSeed: 0xac0f2026,
       bootstrapResamples: 1000,
     },
     environment: {
+      hostname: "benchmark-host",
+      osType: "Darwin",
+      osRelease: "25.6.0",
       platform: "darwin",
       arch: "arm64",
+      nodeExecutable: "/usr/local/bin/node",
       nodeVersion: "v22.13.0",
       cpuModel: "Apple M2 Pro",
       cpuCount: 10,
       totalMemoryBytes: 34_359_738_368,
+      loadAverage: [0.25, 0.5, 0.75],
     },
     variants: [
       { label: "main", worktree: "/repo/main", gitSha: "abc123" },
       { label: "pr", worktree: "/repo/pr", gitSha: "def456" },
+      { label: "artagon", worktree: "/repo/artagon", gitSha: "fed789" },
     ],
     eagerGraphs: [
       {
         variantLabel: "main",
-        summary: { chunks: 1, bytes: 100, gzipBytes: 80, externalPackages: [], files: ["entry.js"] },
+        summary: {
+          chunks: 1,
+          bytes: 100,
+          gzipBytes: 80,
+          externalPackages: [],
+          files: ["entry.js"],
+        },
       },
       {
         variantLabel: "pr",
-        summary: { chunks: 1, bytes: 120, gzipBytes: 90, externalPackages: [], files: ["entry.js"] },
+        summary: {
+          chunks: 1,
+          bytes: 120,
+          gzipBytes: 90,
+          externalPackages: [],
+          files: ["entry.js"],
+        },
+      },
+      {
+        variantLabel: "artagon",
+        summary: {
+          chunks: 1,
+          bytes: 110,
+          gzipBytes: 85,
+          externalPackages: [],
+          files: ["entry.js"],
+        },
       },
     ],
     scenarios: [
       {
         name: "version",
         command: "acpx --version",
-        variants: [
+        configuration: { samples: 2, warmups: 1 },
+        comparisons: [
+          {
+            baselineLabel: "main",
+            candidateLabel: "pr",
+            pairedSamples: [
+              { sampleIndex: 0, order: "baseline-first", baselineMs: 100, candidateMs: 90 },
+              { sampleIndex: 1, order: "candidate-first", baselineMs: 110, candidateMs: 100 },
+            ],
+            baselineSummary: {
+              n: 2,
+              meanMs: 105,
+              medianMs: 105,
+              p95Ms: 110,
+              stddevMs: 7.071,
+              minMs: 100,
+              maxMs: 110,
+            },
+            candidateSummary: {
+              n: 2,
+              meanMs: 95,
+              medianMs: 95,
+              p95Ms: 100,
+              stddevMs: 7.071,
+              minMs: 90,
+              maxMs: 100,
+            },
+            pairedDelta: {
+              meanDeltaPct: -9.524,
+              medianDeltaPct: -9.524,
+              geometricMeanDeltaPct: -9.535,
+              ci95Pct: [-10, -9.091],
+            },
+          },
+          {
+            baselineLabel: "main",
+            candidateLabel: "artagon",
+            pairedSamples: [
+              { sampleIndex: 0, order: "baseline-first", baselineMs: 200, candidateMs: 160 },
+              { sampleIndex: 1, order: "candidate-first", baselineMs: 220, candidateMs: 180 },
+            ],
+            baselineSummary: {
+              n: 2,
+              meanMs: 210,
+              medianMs: 210,
+              p95Ms: 220,
+              stddevMs: 14.142,
+              minMs: 200,
+              maxMs: 220,
+            },
+            candidateSummary: {
+              n: 2,
+              meanMs: 170,
+              medianMs: 170,
+              p95Ms: 180,
+              stddevMs: 14.142,
+              minMs: 160,
+              maxMs: 180,
+            },
+            pairedDelta: {
+              meanDeltaPct: -19.048,
+              medianDeltaPct: -19.048,
+              geometricMeanDeltaPct: -19.096,
+              ci95Pct: [-20, -18.182],
+            },
+          },
+        ],
+        diagnostics: [
           {
             variantLabel: "main",
-            samplesMs: [100, 110],
-            summary: { n: 2, meanMs: 105, medianMs: 105, p95Ms: 110, stddevMs: 7.071, minMs: 100, maxMs: 110 },
+            trace: {
+              capture: {
+                state: "unavailable",
+                tracePath: null,
+                unavailableReason: "scenario has no ACP child",
+              },
+              preAgent: { state: "unavailable", unavailableReason: "no trace capture" },
+              acpActive: { state: "unavailable", unavailableReason: "no trace capture" },
+              teardown: { state: "unavailable", unavailableReason: "no trace capture" },
+            },
+            internalMetrics: {
+              state: "unavailable",
+              metricsPath: null,
+              unavailableReason: "scenario has no ACP child",
+            },
           },
           {
             variantLabel: "pr",
-            samplesMs: [90, 100],
-            summary: { n: 2, meanMs: 95, medianMs: 95, p95Ms: 100, stddevMs: 7.071, minMs: 90, maxMs: 100 },
+            trace: {
+              capture: { state: "available", tracePath: "traces/pr-version.json", eventCount: 4 },
+              preAgent: { state: "available", durationMs: 0 },
+              acpActive: { state: "available", durationMs: 45 },
+              teardown: { state: "available", durationMs: 10 },
+            },
+            internalMetrics: {
+              state: "available",
+              metricsPath: "metrics/pr-version.json",
+              metrics: [{ name: "session.load", count: 2, totalMs: 190, maxMs: 100 }],
+            },
           },
-        ],
-        comparison: {
-          baselineLabel: "main",
-          candidateLabel: "pr",
-          pairedDelta: { geometricMeanDeltaPct: -9.307, ci95Pct: [-10, -8] },
-        },
-        traces: [
-          { variantLabel: "pr", tracePath: "traces/pr-version.json", state: "available", eventCount: 4, durationMs: 100 },
           {
-            variantLabel: "main",
-            tracePath: "traces/main-version.json",
-            state: "unavailable",
-            unavailableReason: "trace event was not emitted",
+            variantLabel: "artagon",
+            trace: {
+              capture: {
+                state: "unavailable",
+                tracePath: "/tmp/artagon-trace.json",
+                unavailableReason: "trace was truncated",
+              },
+              preAgent: { state: "unavailable", unavailableReason: "missing process start" },
+              acpActive: { state: "unavailable", unavailableReason: "missing workload end" },
+              teardown: { state: "unavailable", unavailableReason: "missing workload end" },
+            },
+            internalMetrics: {
+              state: "unavailable",
+              metricsPath: "/tmp/artagon-metrics.json",
+              unavailableReason: "build does not support internal metrics",
+            },
           },
         ],
-        internalMetrics: {
-          supported: true,
-          unsupportedReason: null,
-          metrics: [{ name: "session.load", count: 2, totalMs: 190, maxMs: 100 }],
-        },
       },
     ],
   };
@@ -175,10 +291,26 @@ test("renders benchmark reports with comparison and trace evidence", () => {
   assert.match(markdown, /Schema version: 1/u);
   assert.match(markdown, /abc123/u);
   assert.match(markdown, /def456/u);
+  assert.match(markdown, /fed789/u);
   assert.match(markdown, /## version/u);
+  assert.match(markdown, /Samples: 2/u);
+  assert.match(markdown, /Warmups: 1/u);
   assert.match(markdown, /Median/u);
   assert.match(markdown, /P95/u);
-  assert.match(markdown, /Paired delta/u);
+  assert.match(markdown, /Mean delta/u);
+  assert.match(markdown, /Median delta/u);
+  assert.match(markdown, /Paired geometric delta/u);
   assert.match(markdown, /95% CI/u);
-  assert.match(markdown, /Unavailable: trace event was not emitted/u);
+  assert.match(markdown, /105\.00 ms/u);
+  assert.match(markdown, /210\.00 ms/u);
+  assert.match(markdown, /Pre-agent/u);
+  assert.match(markdown, /0\.00 ms/u);
+  assert.match(markdown, /Unavailable: missing process start/u);
+  assert.match(markdown, /Not attempted/u);
+  assert.match(markdown, /\/tmp\/artagon-trace\.json/u);
+  assert.match(markdown, /\/tmp\/artagon-metrics\.json/u);
+  assert.match(markdown, /benchmark-host/u);
+  assert.match(markdown, /Darwin 25\.6\.0/u);
+  assert.match(markdown, /\/usr\/local\/bin\/node/u);
+  assert.match(markdown, /0\.25, 0\.50, 0\.75/u);
 });
