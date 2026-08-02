@@ -34,7 +34,7 @@ the report can record and verify the exact already-built inputs.
 
 ### Benchmark core
 
-A side-effect-free TypeScript module under `scripts/perf/` owns:
+A functional TypeScript module under `scripts/perf/` owns:
 
 - variant and scenario validation;
 - deterministic alternating order generation;
@@ -44,7 +44,9 @@ A side-effect-free TypeScript module under `scripts/perf/` owns:
 - JSON and Markdown report rendering.
 
 Keeping these functions separate lets focused tests prove the statistical and
-reporting contract without spawning hundreds of processes.
+reporting contract without spawning hundreds of processes. Statistical,
+ordering, validation, and rendering functions are pure. Eager-graph analysis
+is a read-only filesystem boundary and performs no writes.
 
 ### Benchmark runner
 
