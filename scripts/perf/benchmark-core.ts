@@ -74,12 +74,20 @@ export type CandidateComparison = Readonly<{
   pairedDelta: PairedDelta;
 }>;
 
-export type TraceSummary = Readonly<{
-  variantLabel: string;
-  tracePath: string;
-  eventCount: number;
-  durationMs: number;
-}>;
+export type TraceSummary =
+  | Readonly<{
+      variantLabel: string;
+      tracePath: string;
+      state: "available";
+      eventCount: number;
+      durationMs: number;
+    }>
+  | Readonly<{
+      variantLabel: string;
+      tracePath: string;
+      state: "unavailable";
+      unavailableReason: string;
+    }>;
 
 export type InternalMetricSummary = Readonly<{
   name: string;
@@ -115,7 +123,7 @@ export type BenchmarkReport = Readonly<{
 const DEFAULT_BOOTSTRAP_RESAMPLES = 10_000;
 const ZERO_SEED_STATE = 0x6d2b79f5;
 const STATIC_IMPORT_PATTERN =
-  /(?:^|[\n;])\s*(?:import\s+(?:[^'"\n]+\s+from\s+)?|export\s+(?:[^'"\n]+\s+from\s+)?)["']([^"']+)["']/gu;
+  /(?:^|[\n;])\s*(?:import\s+(?:[^'"]+\s+from\s+)?|export\s+(?:[^'"]+\s+from\s+)?)["']([^"']+)["']/gu;
 
 export function parseVariantSpec(value: string, optionName: string): VariantSpec {
   const separator = value.indexOf("=");
@@ -303,6 +311,12 @@ export function renderBenchmarkMarkdown(report: BenchmarkReport): string {
     } else {
       lines.push("| Variant | Trace | Events | Duration |", "| --- | --- | ---: | ---: |");
       for (const trace of scenario.traces) {
+        if (trace.state === "unavailable") {
+          lines.push(
+            `| ${trace.variantLabel} | ${trace.tracePath} | Unavailable: ${trace.unavailableReason} | Unavailable |`,
+          );
+          continue;
+        }
         lines.push(
           `| ${trace.variantLabel} | ${trace.tracePath} | ${trace.eventCount} | ${formatMilliseconds(trace.durationMs)} |`,
         );

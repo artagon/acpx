@@ -76,6 +76,29 @@ test("analyzes recursive eager imports without counting node built-ins as packag
   }
 });
 
+test("analyzes multiline static import and export clauses", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "acpx-multiline-eager-graph-"));
+  const entryPath = join(fixtureRoot, "entry.js");
+  const localPath = join(fixtureRoot, "local.js");
+  const nestedPath = join(fixtureRoot, "nested.js");
+
+  try {
+    writeFileSync(
+      entryPath,
+      'import {\n  local\n} from "./local.js";\nexport {\n  nested\n} from "./nested.js";\n',
+    );
+    writeFileSync(localPath, 'export {\n  value\n} from "@scope/pkg/subpath";\n');
+    writeFileSync(nestedPath, "export const nested = 2;\n");
+
+    const summary = analyzeEagerGraph(entryPath);
+    assert.equal(summary.chunks, 3);
+    assert.deepEqual(summary.externalPackages, ["@scope/pkg"]);
+    assert.deepEqual(summary.files, [entryPath, localPath, nestedPath]);
+  } finally {
+    rmSync(fixtureRoot, { force: true, recursive: true });
+  }
+});
+
 test("renders benchmark reports with comparison and trace evidence", () => {
   const report: BenchmarkReport = {
     schemaVersion: 1,
@@ -130,7 +153,13 @@ test("renders benchmark reports with comparison and trace evidence", () => {
           pairedDelta: { geometricMeanDeltaPct: -9.307, ci95Pct: [-10, -8] },
         },
         traces: [
-          { variantLabel: "pr", tracePath: "traces/pr-version.json", eventCount: 4, durationMs: 100 },
+          { variantLabel: "pr", tracePath: "traces/pr-version.json", state: "available", eventCount: 4, durationMs: 100 },
+          {
+            variantLabel: "main",
+            tracePath: "traces/main-version.json",
+            state: "unavailable",
+            unavailableReason: "trace event was not emitted",
+          },
         ],
         internalMetrics: {
           supported: true,
@@ -151,4 +180,5 @@ test("renders benchmark reports with comparison and trace evidence", () => {
   assert.match(markdown, /P95/u);
   assert.match(markdown, /Paired delta/u);
   assert.match(markdown, /95% CI/u);
+  assert.match(markdown, /Unavailable: trace event was not emitted/u);
 });
