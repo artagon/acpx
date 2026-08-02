@@ -64,6 +64,8 @@ export type SampleSummary = Readonly<{
 }>;
 
 export type PairedDelta = Readonly<{
+  meanDeltaPct: number;
+  medianDeltaPct: number;
   geometricMeanDeltaPct: number;
   ci95Pct: readonly [number, number];
 }>;
@@ -359,8 +361,13 @@ range or second benchmark framework is added.
 In `test/perf-benchmark-engine.test.ts`, use two async tasks that append their
 names to an execution log and return distinct fixed durations. Assert the
 engine preserves registration order, invokes each task exactly once, and
-returns the exact external durations with their names. Add a task that throws a
-sentinel error and assert `runBenchmarkPair` rejects with that same failure.
+returns the exact external durations with their names. Call `runBenchmarkPair`
+a second time with different tasks and durations; assert the second result and
+execution log contain no state from the first call, proving a fresh `Bench` and
+isolated results per pair. Assert zero is accepted and preserved exactly, while
+`NaN`, positive infinity, negative infinity, and negative durations are each
+rejected. Add a task that throws a sentinel error and assert
+`runBenchmarkPair` rejects with that same failure.
 
 Assert repeated candidates/scenarios parse correctly; labels are unique;
 counts and seed are validated; worktrees must have resolvable Git HEAD and
@@ -403,8 +410,8 @@ Register tasks in input order. Each async Tinybench callback calls `execute()`,
 rejects a non-finite or negative duration, retains the exact duration by task
 identity, and returns `{ overriddenDuration: durationMs }`. Run the bench once,
 propagate task failures, and return the two retained external durations in
-registration order. Do not expose Tinybench task/sample objects to the core or
-runner.
+registration order. Zero is a valid duration at this engine boundary. Do not
+expose Tinybench task/sample objects to the core or runner.
 
 - [ ] **Step 5: Implement argument and input validation**
 
