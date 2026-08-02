@@ -36,15 +36,18 @@ test("summarizes timings using nearest-rank percentiles and sample deviation", (
 });
 
 test("calculates reproducible paired deltas and rejects invalid timing samples", () => {
-  const baseline = [100, 120, 140, 160];
-  const candidate = [90, 108, 126, 144];
+  const baseline = [100, 100, 100, 100];
+  const candidate = [50, 80, 120, 250];
   const first = calculatePairedDelta(candidate, baseline, 0xac0f2026);
   const second = calculatePairedDelta(candidate, baseline, 0xac0f2026);
 
+  assert.deepEqual(first, {
+    meanDeltaPct: 25,
+    medianDeltaPct: 0,
+    geometricMeanDeltaPct: 4.663513939210562,
+    ci95Pct: [-37.76670227115216, 88.03015465431969],
+  });
   assert.deepEqual(first, second);
-  assert.ok(Math.abs(first.meanDeltaPct + 10) < 1e-12);
-  assert.ok(Math.abs(first.medianDeltaPct + 10) < 1e-12);
-  assert.ok(first.geometricMeanDeltaPct < 0);
   assert.throws(() => calculatePairedDelta([], [], 0xac0f2026), /at least one/u);
   assert.throws(() => calculatePairedDelta([1], [1, 2], 0xac0f2026), /same length/u);
   assert.throws(() => calculatePairedDelta([0], [1], 0xac0f2026), /positive/u);
@@ -312,5 +315,6 @@ test("renders benchmark reports with comparison and trace evidence", () => {
   assert.match(markdown, /benchmark-host/u);
   assert.match(markdown, /Darwin 25\.6\.0/u);
   assert.match(markdown, /\/usr\/local\/bin\/node/u);
+  assert.match(markdown, /10 logical CPUs/u);
   assert.match(markdown, /0\.25, 0\.50, 0\.75/u);
 });

@@ -324,7 +324,7 @@ export function renderBenchmarkMarkdown(report: BenchmarkReport): string {
     `- OS: ${environment.osType} ${environment.osRelease} (${environment.platform}/${environment.arch})`,
     `- Node executable: ${environment.nodeExecutable}`,
     `- Node version: ${environment.nodeVersion}`,
-    `- CPU: ${environment.cpuModel} (${environment.cpuCount} cores)`,
+    `- CPU: ${environment.cpuModel} (${environment.cpuCount} logical CPUs)`,
     `- Memory: ${environment.totalMemoryBytes} bytes`,
     `- Load average: ${environment.loadAverage.map((value) => value.toFixed(2)).join(", ")}`,
     "",
