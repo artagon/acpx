@@ -178,6 +178,7 @@ test("the built benchmark agent traces ordered session list and exec workloads",
     const list = await runCli(["--cwd", workspace, "benchmark", "sessions", "list"], homeDir);
     assert.equal(list.code, 0, list.stderr);
     const listEvents = parseTraceEvents(listTraceFile).map((event) => event.event);
+    assertOrderedScenarioTrace(listEvents, "agent.initialize.start", "agent.initialize.end");
     assertOrderedScenarioTrace(listEvents, "agent.session_list.start", "agent.session_list.end");
 
     const execTraceFile = path.join(directory, "exec.ndjson");
@@ -187,6 +188,7 @@ test("the built benchmark agent traces ordered session list and exec workloads",
     assert.match(exec.stdout, /benchmark agent response/u);
 
     const execEvents = parseTraceEvents(execTraceFile).map((event) => event.event);
+    assertOrderedScenarioTrace(execEvents, "agent.initialize.start", "agent.initialize.end");
     assertOrderedScenarioTrace(execEvents, "agent.new_session.start", "agent.new_session.end");
     assertOrderedScenarioTrace(execEvents, "agent.prompt.start", "agent.prompt.end");
   });
