@@ -19,7 +19,13 @@ export type ManagedProcessTree = {
   rootIdentityFloor?: string;
   rootRunning?: () => boolean;
   snapshotPromise?: Promise<void>;
+  enumerationHealthy?: boolean;
 };
+
+type OwnedProcessSnapshot = Readonly<{
+  ownershipObserved: boolean;
+  processes: ProcessListEntry[];
+}>;
 
 export type ProcessListEntry = {
   pid: number;
@@ -87,9 +93,14 @@ export async function captureProcessTreePids(
   await recordCurrentProcessTreePids(tree);
 }
 
+export async function isProcessTreeEnumerationHealthy(tree: ManagedProcessTree): Promise<boolean> {
+  await waitForPriorSnapshot(tree);
+  return tree.enumerationHealthy === true;
+}
+
 async function waitForPriorSnapshot(tree: ManagedProcessTree): Promise<void> {
   await tree.snapshotPromise?.catch(() => {
-    // Process tree snapshots are best-effort because the root may already be gone.
+    markEnumerationUnhealthy(tree);
   });
 }
 
@@ -130,19 +141,39 @@ async function recordCurrentProcessTreePids(tree: ManagedProcessTree): Promise<v
   if (!tree.killProcessGroup || !rootPid) {
     return;
   }
-  if (tree.rootRunning && !tree.rootRunning()) {
+  if (!isTrackedRootRunning(tree)) {
     return;
   }
   const priorRootIdentity = tree.rootIdentity;
-  const processes =
+  const snapshot =
     tree.platform === "win32"
       ? await listDescendantProcesses(tree)
       : await listOwnedPosixProcesses(tree);
-  if (tree.rootRunning && !tree.rootRunning()) {
+  if (snapshot === undefined) {
+    markEnumerationUnhealthy(tree);
+    return;
+  }
+  markEnumerationHealthy(tree);
+  if (!isTrackedRootRunning(tree)) {
     tree.rootIdentity = priorRootIdentity;
     return;
   }
-  recordProcessTreePids(tree, processes);
+  if (!snapshot.ownershipObserved) {
+    return;
+  }
+  recordProcessTreePids(tree, snapshot.processes);
+}
+
+function isTrackedRootRunning(tree: ManagedProcessTree): boolean {
+  return tree.rootRunning === undefined || tree.rootRunning();
+}
+
+function markEnumerationHealthy(tree: ManagedProcessTree): void {
+  tree.enumerationHealthy ??= true;
+}
+
+function markEnumerationUnhealthy(tree: ManagedProcessTree): void {
+  tree.enumerationHealthy = false;
 }
 
 function recordProcessTreePids(tree: ManagedProcessTree, processes: ProcessListEntry[]): void {
@@ -319,14 +350,16 @@ function hasLiveManagedProcessTree(tree: ManagedProcessTree, rootRunning: boolea
   return hasLivePid(tree);
 }
 
-async function listDescendantProcesses(tree: ManagedProcessTree): Promise<ProcessListEntry[]> {
+async function listDescendantProcesses(
+  tree: ManagedProcessTree,
+): Promise<OwnedProcessSnapshot | undefined> {
   const rootPid = tree.rootPid;
   if (!rootPid) {
-    return [];
+    return { ownershipObserved: false, processes: [] };
   }
   const processList = await readProcessList(tree.platform);
   if (!processList) {
-    return [];
+    return undefined;
   }
 
   const snapshot = collectWindowsDescendantProcesses(
@@ -336,10 +369,10 @@ async function listDescendantProcesses(tree: ManagedProcessTree): Promise<Proces
     tree.rootIdentityFloor,
   );
   if (!snapshot) {
-    return [];
+    return { ownershipObserved: false, processes: [] };
   }
   tree.rootIdentity = snapshot.rootIdentity;
-  return snapshot.descendants;
+  return { ownershipObserved: true, processes: snapshot.descendants };
 }
 
 export function collectWindowsDescendantProcesses(
@@ -527,18 +560,20 @@ function isNumericIdentity(value: string | undefined): value is string {
   return value !== undefined && /^\d+$/.test(value);
 }
 
-async function listOwnedPosixProcesses(tree: ManagedProcessTree): Promise<ProcessListEntry[]> {
+async function listOwnedPosixProcesses(
+  tree: ManagedProcessTree,
+): Promise<OwnedProcessSnapshot | undefined> {
   const rootPid = tree.rootPid;
   if (!rootPid) {
-    return [];
+    return { ownershipObserved: false, processes: [] };
   }
   const processList = await readProcessList(tree.platform);
   if (!processList) {
-    return [];
+    return undefined;
   }
   const root = processList.find((entry) => entry.pid === rootPid);
   if (!posixRootIdentityMatches(tree, root)) {
-    return [];
+    return { ownershipObserved: false, processes: [] };
   }
   const ownedByPid = new Map(
     processList
@@ -551,7 +586,10 @@ async function listOwnedPosixProcesses(tree: ManagedProcessTree): Promise<Proces
       ownedByPid.set(descendant.pid, descendant);
     }
   }
-  return [...ownedByPid.values()];
+  return {
+    ownershipObserved: root !== undefined || ownedByPid.size > 0,
+    processes: [...ownedByPid.values()],
+  };
 }
 
 function posixRootIdentityMatches(
@@ -572,6 +610,7 @@ async function refreshExitedProcessTreePids(tree: ManagedProcessTree): Promise<b
   }
   const processList = await readProcessList(tree.platform);
   if (!processList) {
+    markEnumerationUnhealthy(tree);
     return false;
   }
   const currentByPid = new Map(processList.map((entry) => [entry.pid, entry]));

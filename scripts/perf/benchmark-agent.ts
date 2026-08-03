@@ -98,22 +98,20 @@ function traceSynchronousOperation<Result>(
   }
 }
 
-export function createBenchmarkAgent(connection: AgentConnection, traceFile: string | undefined): Agent {
+export function createBenchmarkAgent(
+  connection: AgentConnection,
+  traceFile: string | undefined,
+): Agent {
   const initialize = (): InitializeResponse =>
-    traceSynchronousOperation(
-      traceFile,
-      "agent.initialize.start",
-      "agent.initialize.end",
-      () => ({
-        protocolVersion: PROTOCOL_VERSION,
-        authMethods: [],
-        agentCapabilities: {
-          sessionCapabilities: {
-            list: {},
-          },
+    traceSynchronousOperation(traceFile, "agent.initialize.start", "agent.initialize.end", () => ({
+      protocolVersion: PROTOCOL_VERSION,
+      authMethods: [],
+      agentCapabilities: {
+        sessionCapabilities: {
+          list: {},
         },
-      }),
-    );
+      },
+    }));
   const newSession = (): NewSessionResponse =>
     traceSynchronousOperation(
       traceFile,
@@ -161,20 +159,14 @@ export function createBenchmarkAgent(connection: AgentConnection, traceFile: str
   };
 }
 
-export function parseBenchmarkAgentArgs(
-  argv: readonly string[],
-): Readonly<{ traceFile?: string }> {
+export function parseBenchmarkAgentArgs(argv: readonly string[]): Readonly<{ traceFile?: string }> {
   if (argv.length === 0) {
     return {};
   }
   if (argv[0] !== "--trace-file") {
     throw new Error(`Unknown argument: ${argv[0]}`);
   }
-  if (
-    typeof argv[1] !== "string" ||
-    argv[1].trim().length === 0 ||
-    argv[1].startsWith("--")
-  ) {
+  if (typeof argv[1] !== "string" || argv[1].trim().length === 0 || argv[1].startsWith("--")) {
     throw new Error("--trace-file requires a path.");
   }
   if (argv.length > 2) {

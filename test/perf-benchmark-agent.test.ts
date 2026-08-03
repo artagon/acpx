@@ -183,7 +183,10 @@ test("the built benchmark agent traces ordered session list and exec workloads",
 
     const execTraceFile = path.join(directory, "exec.ndjson");
     await writeBenchmarkConfig(execTraceFile);
-    const exec = await runCli(["--cwd", workspace, "benchmark", "exec", "benchmark prompt"], homeDir);
+    const exec = await runCli(
+      ["--cwd", workspace, "benchmark", "exec", "benchmark prompt"],
+      homeDir,
+    );
     assert.equal(exec.code, 0, exec.stderr);
     assert.match(exec.stdout, /benchmark agent response/u);
 

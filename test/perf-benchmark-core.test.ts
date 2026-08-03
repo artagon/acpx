@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 import {
   analyzeEagerGraph,
   calculatePairedDelta,
@@ -59,20 +60,23 @@ test("analyzes recursive eager imports without counting node built-ins as packag
   const localPath = join(fixtureRoot, "local.js");
   const nestedPath = join(fixtureRoot, "nested.js");
   const sidePath = join(fixtureRoot, "side.js");
+  const entrySource =
+    'import "./local.js";\nimport "./side.js";\nimport "node:fs";\nimport "left-pad";\nimport "@scope/pkg";\n';
+  const localSource = 'import "./nested.js";\nexport const local = 1;\n';
+  const nestedSource = "export const nested = 2;\n";
+  const sideSource = "export {};\n";
 
   try {
-    writeFileSync(
-      entryPath,
-      'import "./local.js";\nimport "./side.js";\nimport "node:fs";\nimport "left-pad";\nimport "@scope/pkg";\n',
-    );
-    writeFileSync(localPath, 'import "./nested.js";\nexport const local = 1;\n');
-    writeFileSync(nestedPath, "export const nested = 2;\n");
-    writeFileSync(sidePath, "export {};\n");
+    writeFileSync(entryPath, entrySource);
+    writeFileSync(localPath, localSource);
+    writeFileSync(nestedPath, nestedSource);
+    writeFileSync(sidePath, sideSource);
 
     assert.deepEqual(analyzeEagerGraph(entryPath), {
       chunks: 4,
       bytes: 181,
-      gzipBytes: 117,
+      gzipBytes: gzipSync(Buffer.from(entrySource + localSource + nestedSource + sideSource))
+        .byteLength,
       externalPackages: ["@scope/pkg", "left-pad"],
       files: [entryPath, localPath, nestedPath, sidePath],
     });
@@ -106,7 +110,7 @@ test("analyzes multiline static import and export clauses", () => {
 
 test("renders benchmark reports with comparison and trace evidence", () => {
   const report: BenchmarkReport = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     methodology: {
       pairing: "alternating",
       bootstrapSeed: 0xac0f2026,
@@ -126,9 +130,27 @@ test("renders benchmark reports with comparison and trace evidence", () => {
       loadAverage: [0.25, 0.5, 0.75],
     },
     variants: [
-      { label: "main", worktree: "/repo/main", gitSha: "abc123" },
-      { label: "pr", worktree: "/repo/pr", gitSha: "def456" },
-      { label: "artagon", worktree: "/repo/artagon", gitSha: "fed789" },
+      {
+        label: "main",
+        worktree: "/repo/main",
+        gitSha: "abc123",
+        gitDirty: false,
+        cliSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      },
+      {
+        label: "pr",
+        worktree: "/repo/pr",
+        gitSha: "def456",
+        gitDirty: true,
+        cliSha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+      {
+        label: "artagon",
+        worktree: "/repo/artagon",
+        gitSha: "fed789",
+        gitDirty: false,
+        cliSha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      },
     ],
     eagerGraphs: [
       {
@@ -291,7 +313,16 @@ test("renders benchmark reports with comparison and trace evidence", () => {
 
   const markdown = renderBenchmarkMarkdown(report);
 
-  assert.match(markdown, /Schema version: 1/u);
+  assert.match(markdown, /Schema version: 2/u);
+  assert.match(markdown, /\| Label \| SHA \| Dirty \| CLI SHA-256 \| Worktree \|/u);
+  assert.match(
+    markdown,
+    /\| main \| abc123 \| no \| aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \| \/repo\/main \|/u,
+  );
+  assert.match(
+    markdown,
+    /\| pr \| def456 \| yes \| bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \| \/repo\/pr \|/u,
+  );
   assert.match(markdown, /abc123/u);
   assert.match(markdown, /def456/u);
   assert.match(markdown, /fed789/u);

@@ -9,6 +9,7 @@ Use these files for the other concerns:
 
 - [`README.md`](README.md) for user-facing install and usage
 - [`docs/CLI.md`](docs/CLI.md) for CLI reference
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for reusable benchmark guidance
 - [`VISION.md`](VISION.md) for product direction and boundaries
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) for PR expectations
 - [`skills/acpx/SKILL.md`](skills/acpx/SKILL.md) for agent-usage guidance
@@ -171,6 +172,7 @@ Harness documentation synchronization policy:
 - `pnpm run mutate` — Stryker mutation check for the configured target
 - `pnpm run check` — format, typecheck, lint, build, and coverage tests
 - `pnpm run check:docs` — docs format and markdown lint
+- `pnpm run perf:benchmark` — compare already-built worktrees with paired measurements
 - `pnpm run perf:report` — performance reporting helper
 
 ## Testing And Changelog Guidelines

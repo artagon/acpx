@@ -11,6 +11,7 @@ import {
   captureProcessTreePids,
   collectWindowsDescendantProcesses,
   createManagedProcessTree,
+  isProcessTreeEnumerationHealthy,
   readProcessIdentity,
   resolveProcessTreeSignalTargets,
   signalProcessTree,
@@ -260,6 +261,88 @@ test(
       const startedAt = Date.now();
       await captureProcessTreePids(tree, true);
       assert(Date.now() - startedAt < 3_000);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "successful process enumeration records healthy snapshot state",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-healthy-ps-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(psPath, "#!/bin/sh\nprintf '500 1 500 Wed Jul 29 12:00:00 2026\\n'\n", {
+      mode: 0o755,
+    });
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(500, true, "darwin");
+      await captureProcessTreePids(tree, true);
+
+      assert.equal(Reflect.get(tree, "enumerationHealthy"), true);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "successful enumeration remains healthy when the root exits before the snapshot",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-exited-before-snapshot-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(psPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(500, true, "darwin");
+      await captureProcessTreePids(tree, true);
+
+      assert.equal(await isProcessTreeEnumerationHealthy(tree), true);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "process enumeration failure remains unhealthy after a later successful snapshot",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-failed-ps-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const counterPath = path.join(fixtureDir, "counter");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(
+      psPath,
+      [
+        "#!/bin/sh",
+        `counter=${JSON.stringify(counterPath)}`,
+        'if [ ! -e "$counter" ]; then',
+        '  printf failed > "$counter"',
+        "  exit 1",
+        "fi",
+        'printf "500 1 500 Wed Jul 29 12:00:00 2026\\n"',
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(500, true, "darwin");
+      await captureProcessTreePids(tree, true);
+      await captureProcessTreePids(tree, true);
+
+      assert.equal(Reflect.get(tree, "enumerationHealthy"), false);
     } finally {
       process.env.PATH = originalPath;
       await fs.rm(fixtureDir, { recursive: true, force: true });

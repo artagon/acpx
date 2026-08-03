@@ -84,3 +84,12 @@ test("test scripts build packaged output before running package-bin smoke tests"
   assert.match(pkg.scripts?.test ?? "", /^pnpm run build && pnpm run build:test && /);
   assert.match(pkg.scripts?.["test:coverage"] ?? "", /^pnpm run build && pnpm run build:test && /);
 });
+
+test("benchmark script builds the shared agent before running the reusable benchmark", () => {
+  const pkg = readPackageJson();
+
+  assert.equal(
+    pkg.scripts?.["perf:benchmark"],
+    "pnpm run build:test && tsx scripts/perf/benchmark-runner.ts",
+  );
+});

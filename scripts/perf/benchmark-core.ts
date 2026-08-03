@@ -2,7 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 
-export const BENCHMARK_SCHEMA_VERSION = 1;
+export const BENCHMARK_SCHEMA_VERSION = 2;
 
 export type ScenarioName = "version" | "help" | "local-sessions" | "agent-sessions" | "exec";
 
@@ -67,6 +67,8 @@ export type BenchmarkVariant = Readonly<{
   label: string;
   worktree: string;
   gitSha: string;
+  gitDirty: boolean;
+  cliSha256: string;
 }>;
 
 export type BenchmarkEagerGraph = Readonly<{
@@ -330,10 +332,11 @@ export function renderBenchmarkMarkdown(report: BenchmarkReport): string {
     "",
     "## Variants",
     "",
-    "| Label | SHA | Worktree |",
-    "| --- | --- | --- |",
+    "| Label | SHA | Dirty | CLI SHA-256 | Worktree |",
+    "| --- | --- | --- | --- | --- |",
     ...report.variants.map(
-      (variant) => `| ${variant.label} | ${variant.gitSha} | ${variant.worktree} |`,
+      (variant) =>
+        `| ${variant.label} | ${variant.gitSha} | ${variant.gitDirty ? "yes" : "no"} | ${variant.cliSha256} | ${variant.worktree} |`,
     ),
     "",
     "## Eager graphs",
