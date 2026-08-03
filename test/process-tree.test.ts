@@ -315,6 +315,73 @@ test(
 );
 
 test(
+  "tracking retains descendants observed by an in-flight snapshot after the root exits",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-in-flight-ps-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(psPath, "#!/bin/sh\nprintf '500 1 500 Wed Jul 29 12:00:00 2026\\n'\n", {
+      mode: 0o755,
+    });
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const tree = createManagedProcessTree(500, true, "darwin");
+      await captureProcessTreePids(tree, true);
+
+      await fs.writeFile(
+        psPath,
+        "#!/bin/sh\nsleep 0.1\nprintf '500 1 500 Wed Jul 29 12:00:00 2026\\n501 500 500 Wed Jul 29 12:00:01 2026\\n'\n",
+        { mode: 0o755 },
+      );
+      let rootRunning = true;
+      beginProcessTreeTracking(tree, () => rootRunning);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      rootRunning = false;
+
+      assert.equal(await isProcessTreeEnumerationHealthy(tree), true);
+      assert.equal(tree.descendantPids.has(501), true);
+      assert.equal(tree.descendantIdentities.has(501), true);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "tracking rejects a late first snapshot after the root identity is lost",
+  { skip: process.platform === "win32" },
+  async () => {
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-unanchored-ps-"));
+    const psPath = path.join(fixtureDir, "ps");
+    const originalPath = process.env.PATH;
+    await fs.writeFile(
+      psPath,
+      "#!/bin/sh\nsleep 0.1\nprintf '500 1 500 Wed Jul 29 12:00:00 2026\\n501 500 500 Wed Jul 29 12:00:01 2026\\n'\n",
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${fixtureDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      let rootRunning = true;
+      const tree = createManagedProcessTree(500, true, "darwin");
+      beginProcessTreeTracking(tree, () => rootRunning);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      rootRunning = false;
+
+      assert.equal(await isProcessTreeEnumerationHealthy(tree), true);
+      assert.equal(tree.descendantPids.has(501), false);
+      assert.equal(tree.descendantIdentities.has(501), false);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(fixtureDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "process enumeration failure remains unhealthy after a later successful snapshot",
   { skip: process.platform === "win32" },
   async () => {

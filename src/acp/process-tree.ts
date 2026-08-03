@@ -154,14 +154,21 @@ async function recordCurrentProcessTreePids(tree: ManagedProcessTree): Promise<v
     return;
   }
   markEnumerationHealthy(tree);
-  if (!isTrackedRootRunning(tree)) {
+  retainTrustedProcessTreeSnapshot(tree, snapshot, priorRootIdentity);
+}
+
+function retainTrustedProcessTreeSnapshot(
+  tree: ManagedProcessTree,
+  snapshot: OwnedProcessSnapshot,
+  priorRootIdentity: string | undefined,
+): void {
+  const rootStillRunning = isTrackedRootRunning(tree);
+  if (snapshot.ownershipObserved && (rootStillRunning || priorRootIdentity !== undefined)) {
+    recordProcessTreePids(tree, snapshot.processes);
+  }
+  if (!rootStillRunning) {
     tree.rootIdentity = priorRootIdentity;
-    return;
   }
-  if (!snapshot.ownershipObserved) {
-    return;
-  }
-  recordProcessTreePids(tree, snapshot.processes);
 }
 
 function isTrackedRootRunning(tree: ManagedProcessTree): boolean {
