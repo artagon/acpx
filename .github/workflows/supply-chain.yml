@@ -175,6 +175,11 @@ jobs:
           # Copyleft terms would change acpx's distribution terms, and the
           # single executable ships every dependency inside one file.
           deny-licenses: AGPL-3.0, GPL-3.0
+          # Dependency Review reported EPL-2.0 OR GPL-3.0-or-later for the
+          # dev-only replay viewer dependency; acpx elects EPL-2.0.
+          # This exemption skips every license check for exactly that package version;
+          # any elkjs upgrade must be reviewed and re-pinned explicitly.
+          allow-dependencies-licenses: pkg:npm/elkjs@0.12.0
 
   audit:
     name: Dependency audit
