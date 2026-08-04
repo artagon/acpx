@@ -94,7 +94,7 @@ test(
 );
 
 test(
-  "bounded POSIX tracking captures children before an unexpected root exit",
+  "bounded POSIX tracking survives observer failures and captures children before root exit",
   { skip: process.platform === "win32" },
   async () => {
     const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-posix-tracking-"));
@@ -122,7 +122,15 @@ test(
     let running = true;
     try {
       const tree = createManagedProcessTree(500, true, "darwin");
-      beginProcessTreeTracking(tree, () => running);
+      let observations = 0;
+      beginProcessTreeTracking(
+        tree,
+        () => running,
+        () => {
+          observations += 1;
+          throw new Error("observer failure");
+        },
+      );
       for (let attempt = 0; attempt < 100 && !tree.descendantPids.has(process.pid); attempt += 1) {
         await new Promise<void>((resolve) => {
           setTimeout(resolve, 25);
@@ -132,6 +140,8 @@ test(
       await tree.snapshotPromise;
 
       assert.equal(tree.descendantPids.has(process.pid), true);
+      assert.ok(observations >= 2);
+      assert.equal(await isProcessTreeEnumerationHealthy(tree), true);
     } finally {
       running = false;
       process.env.PATH = originalPath;

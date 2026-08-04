@@ -96,6 +96,7 @@ export type BenchmarkProcessTimeouts = Readonly<{
   timeoutMs: number;
   termGraceMs: number;
   killGraceMs: number;
+  onTrackedDescendant?: () => void;
   rootCreatedAfterMs?: number;
   requireTrackedDescendant?: boolean;
 }>;
@@ -813,16 +814,38 @@ export async function waitForBenchmarkChild(
     termGraceMs: RUN_TERM_GRACE_MS,
     killGraceMs: RUN_KILL_GRACE_MS,
   },
+  platform: NodeJS.Platform = process.platform,
 ): Promise<BenchmarkChildResult> {
   const processTree = createManagedProcessTree(
     child.pid,
     true,
-    process.platform,
+    platform,
     timeouts.rootCreatedAfterMs,
   );
   let timedOut = false;
   const closeResult = observeChildClose(child, () => timedOut);
-  beginProcessTreeTracking(processTree, () => isChildRunning(child));
+  let reportedTrackedDescendant = false;
+  let trackedDescendantObserverError: Error | undefined;
+  beginProcessTreeTracking(
+    processTree,
+    () => isChildRunning(child),
+    (trackedTree) => {
+      if (
+        !reportedTrackedDescendant &&
+        trackedTree.observedOwnedDescendant &&
+        timeouts.onTrackedDescendant
+      ) {
+        reportedTrackedDescendant = true;
+        try {
+          timeouts.onTrackedDescendant();
+        } catch (error: unknown) {
+          trackedDescendantObserverError = new Error(
+            `Benchmark tracked-descendant observer failed: ${errorMessage(error)}`,
+          );
+        }
+      }
+    },
+  );
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<{ state: "timeout" }>((resolve) => {
     timeoutHandle = setTimeout(() => resolve({ state: "timeout" }), timeouts.timeoutMs);
@@ -836,12 +859,18 @@ export async function waitForBenchmarkChild(
     // Preserve the observed close timestamp for measurement, then clean up any
     // descendants that outlived a normally exited CLI root.
     await cleanupClosedBenchmarkProcessTree(child, processTree, timeouts);
+    if (trackedDescendantObserverError) {
+      throw trackedDescendantObserverError;
+    }
     return first.result;
   }
 
   timedOut = true;
   await terminateBenchmarkProcessTree(child, processTree, timeouts);
   await assertHealthyProcessEnumeration(processTree);
+  if (trackedDescendantObserverError) {
+    throw trackedDescendantObserverError;
+  }
   const finalResult = await Promise.race([
     closeResult,
     waitMilliseconds(CHILD_CLOSE_GRACE_MS).then(() => undefined),
@@ -869,9 +898,20 @@ async function cleanupClosedBenchmarkProcessTree(
     return;
   }
   await assertHealthyProcessEnumeration(processTree);
-  assertRequiredTrackedDescendant(processTree, timeouts);
-  const exited = await terminateBenchmarkProcessTree(child, processTree, timeouts);
+  let ownershipError: Error | undefined;
+  // For an exited root, the initial signal path waits for any in-flight
+  // snapshot and refreshes remembered ownership before this callback runs.
+  const exited = await terminateBenchmarkProcessTree(child, processTree, timeouts, () => {
+    try {
+      assertRequiredTrackedDescendant(processTree, timeouts);
+    } catch (error: unknown) {
+      ownershipError = error instanceof Error ? error : new Error(String(error));
+    }
+  });
   await assertHealthyProcessEnumeration(processTree);
+  if (ownershipError) {
+    throw ownershipError;
+  }
   if (!exited) {
     throw new Error("Benchmark CLI identity-tracked process tree survived bounded cleanup.");
   }
@@ -884,10 +924,8 @@ function assertRequiredTrackedDescendant(
   if (!timeouts.requireTrackedDescendant) {
     return;
   }
-  for (const pid of processTree.descendantPids) {
-    if (processTree.descendantIdentities.has(pid)) {
-      return;
-    }
+  if (processTree.observedOwnedDescendant) {
+    return;
   }
   throw new Error(
     "Benchmark agent scenario exited without an identity-tracked descendant; cleanup cannot prove ownership of the expected agent process.",
@@ -933,9 +971,11 @@ async function terminateBenchmarkProcessTree(
   child: ChildProcess,
   processTree: ManagedProcessTree,
   timeouts: BenchmarkProcessTimeouts,
+  afterInitialSignal?: () => void,
 ): Promise<boolean> {
   const rootRunning = () => isChildRunning(child);
   await signalTreeBestEffort(processTree, rootRunning, "SIGTERM");
+  afterInitialSignal?.();
   const exited = await waitForProcessTreeExit(processTree, rootRunning, timeouts.termGraceMs);
   if (exited) {
     return true;

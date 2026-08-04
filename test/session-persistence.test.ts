@@ -631,6 +631,8 @@ test("writeSessionRecord serializes cross-process record and index publication",
       readyPath: firstReadyPath,
       releasePath: releaseFirstPath,
     });
+    const firstResult = waitForSuccessfulChild(first);
+    void firstResult.catch(() => undefined);
     let second: ChildProcess | undefined;
 
     try {
@@ -640,7 +642,7 @@ test("writeSessionRecord serializes cross-process record and index publication",
 
       await Promise.race([secondResult, sleep(1_000)]);
       await fs.writeFile(releaseFirstPath, "release\n", "utf8");
-      await Promise.all([waitForSuccessfulChild(first), secondResult]);
+      await Promise.all([firstResult, secondResult]);
 
       const index = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
         entries?: Array<{ acpxRecordId?: string }>;
@@ -920,6 +922,8 @@ test("pruneSessions waits for a concurrent session writer before selecting recor
       readyPath,
       releasePath,
     });
+    const writerResult = waitForSuccessfulChild(writer);
+    void writerResult.catch(() => undefined);
     let pruneSettled = false;
 
     try {
@@ -932,7 +936,7 @@ test("pruneSessions waits for a concurrent session writer before selecting recor
       assert.equal(pruneSettled, false);
 
       await fs.writeFile(releasePath, "release\n", "utf8");
-      await waitForSuccessfulChild(writer);
+      await writerResult;
       const result = await pruneResult;
       assert.equal(result.pruned.length, 0);
       assert.equal(await fileExists(sessionFilePath(homeDir, initial.acpxRecordId)), true);

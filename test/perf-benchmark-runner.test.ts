@@ -128,11 +128,9 @@ const usesAgent =
   (invocationArgs.includes("sessions") && !invocationArgs.includes("--local"));
 if (usesAgent && spawnAgentChild) {
   const agentChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
-    detached: true,
     stdio: "ignore",
   });
   agentChild.unref();
-  await new Promise((resolve) => setTimeout(resolve, 100));
 }
 
 if (typeof logPath === "string") {
@@ -954,11 +952,12 @@ test(
         'import fs from "node:fs";',
         "const pidPath = process.argv[1];",
         "const heartbeatPath = process.argv[2];",
+        "const holdOpen = setInterval(() => {}, 1000);",
+        'process.once("SIGUSR2", () => { clearInterval(holdOpen); process.exit(0); });',
         `const grandchild = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(grandchildSource)}, heartbeatPath], { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] });`,
+        "fs.writeFileSync(pidPath, JSON.stringify({ rootPid: process.pid, grandchildPid: grandchild.pid }));",
         'grandchild.once("message", () => {',
-        "  fs.writeFileSync(pidPath, JSON.stringify({ rootPid: process.pid, grandchildPid: grandchild.pid }));",
         "  grandchild.unref();",
-        "  setTimeout(() => process.exit(0), 150);",
         "});",
       ].join("\n");
       const child = spawn(
@@ -980,6 +979,7 @@ test(
           termGraceMs: 50,
           killGraceMs: 500,
           requireTrackedDescendant: true,
+          onTrackedDescendant: () => process.kill(rootPid, "SIGUSR2"),
         });
         const fixturePids = await waitForPidFile(pidPath);
         assert.equal(fixturePids[0], rootPid);
@@ -1045,11 +1045,15 @@ test(
       let grandchildPid: number | undefined;
 
       try {
-        const resultPromise = waitForBenchmarkChild(child, {
-          timeoutMs: 2_000,
-          termGraceMs: 50,
-          killGraceMs: 500,
-        });
+        const resultPromise = waitForBenchmarkChild(
+          child,
+          {
+            timeoutMs: 2_000,
+            termGraceMs: 50,
+            killGraceMs: 500,
+          },
+          "darwin",
+        );
         const fixturePids = await waitForPidFile(pidPath);
         grandchildPid = fixturePids[1];
         await assert.rejects(resultPromise, /enumeration.*ownership|ownership.*enumeration/iu);

@@ -15,6 +15,7 @@ export type ManagedProcessTree = {
   platform: NodeJS.Platform;
   descendantPids: Set<number>;
   descendantIdentities: Map<number, string>;
+  observedOwnedDescendant: boolean;
   rootIdentity?: string;
   rootIdentityFloor?: string;
   rootRunning?: () => boolean;
@@ -54,6 +55,7 @@ export function createManagedProcessTree(
     platform,
     descendantPids: new Set(),
     descendantIdentities: new Map(),
+    observedOwnedDescendant: false,
     rootIdentityFloor:
       platform === "win32" && rootCreatedAfterMs !== undefined
         ? windowsTicksFromUnixMs(rootCreatedAfterMs)
@@ -68,12 +70,13 @@ export function rememberProcessTreePids(tree: ManagedProcessTree): void {
 export function beginProcessTreeTracking(
   tree: ManagedProcessTree,
   rootRunning: () => boolean,
+  onSnapshot?: (tree: ManagedProcessTree) => void,
 ): void {
   if (!tree.killProcessGroup || !tree.rootPid) {
     return;
   }
   tree.rootRunning = rootRunning;
-  queueProcessTreeTracking(tree, rootRunning);
+  queueProcessTreeTracking(tree, rootRunning, onSnapshot);
 }
 
 export async function captureProcessTreePids(
@@ -114,7 +117,11 @@ function queueProcessTreeSnapshot(tree: ManagedProcessTree): void {
   })();
 }
 
-function queueProcessTreeTracking(tree: ManagedProcessTree, rootRunning: () => boolean): void {
+function queueProcessTreeTracking(
+  tree: ManagedProcessTree,
+  rootRunning: () => boolean,
+  onSnapshot: ((tree: ManagedProcessTree) => void) | undefined,
+): void {
   const priorSnapshot = tree.snapshotPromise;
   tree.snapshotPromise = (async () => {
     await priorSnapshot?.catch(() => {
@@ -125,6 +132,7 @@ function queueProcessTreeTracking(tree: ManagedProcessTree, rootRunning: () => b
     while (rootRunning() && Date.now() < deadline) {
       const descendantCount = tree.descendantPids.size;
       await recordCurrentProcessTreePids(tree);
+      notifyProcessTreeSnapshot(tree, onSnapshot);
       if (rootRunning() && Date.now() < deadline) {
         await waitMs(pollMs);
         pollMs =
@@ -134,6 +142,17 @@ function queueProcessTreeTracking(tree: ManagedProcessTree, rootRunning: () => b
       }
     }
   })();
+}
+
+function notifyProcessTreeSnapshot(
+  tree: ManagedProcessTree,
+  onSnapshot: ((tree: ManagedProcessTree) => void) | undefined,
+): void {
+  try {
+    onSnapshot?.(tree);
+  } catch {
+    // Observation hooks must not interrupt ownership tracking.
+  }
 }
 
 async function recordCurrentProcessTreePids(tree: ManagedProcessTree): Promise<void> {
@@ -188,6 +207,7 @@ function recordProcessTreePids(tree: ManagedProcessTree, processes: ProcessListE
     if (processEntry.pid === tree.rootPid) {
       continue;
     }
+    tree.observedOwnedDescendant = true;
     tree.descendantPids.add(processEntry.pid);
     tree.descendantIdentities.set(processEntry.pid, processEntry.identity);
   }
