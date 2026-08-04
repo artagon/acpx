@@ -70,7 +70,9 @@ export async function connectToQueueOwner(
       if (!shouldRetryQueueConnect(error)) {
         throw error;
       }
-      await waitMs(QUEUE_CONNECT_RETRY_MS);
+      if (attempt + 1 < attempts) {
+        await waitMs(QUEUE_CONNECT_RETRY_MS);
+      }
     }
   }
 

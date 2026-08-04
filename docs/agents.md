@@ -25,11 +25,13 @@ The default agent for top-level commands like `acpx exec â€¦` and `acpx prompt â
 | `kilocode`   | `npx -y @kilocode/cli acp`                     | [Kilocode](https://kilocode.ai)                                                                                 |
 | `kimi`       | `kimi acp`                                     | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli)                                                              |
 | `kiro`       | `kiro-cli-chat acp`                            | [Kiro CLI](https://kiro.dev)                                                                                    |
-| `mux`        | `npx -y mux@^0.27.0 acp`                       | [Mux](https://mux.coder.com)                                                                                    |
+| `mux`        | `mux acp` via an ACPX-owned npm range          | [Mux](https://mux.coder.com)                                                                                    |
 | `opencode`   | `npx -y opencode-ai acp`                       | [OpenCode](https://opencode.ai)                                                                                 |
+| `pool`       | `pool acp`                                     | [Poolside](https://poolside.ai)                                                                                 |
 | `qoder`      | `qodercli --acp`                               | [Qoder CLI](https://docs.qoder.com/cli/acp)                                                                     |
 | `qwen`       | `qwen --acp`                                   | [Qwen Code](https://github.com/QwenLM/qwen-code)                                                                |
 | `trae`       | `traecli acp serve`                            | [Trae CLI](https://docs.trae.cn/cli)                                                                            |
+| `zeroclaw`   | `zeroclaw acp`                                 | [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw)                                                           |
 
 `factory-droid` and `factorydroid` also resolve to the built-in `droid` adapter.
 
@@ -179,7 +181,7 @@ Configure model/provider settings through fast-agent environment variables, fast
 ### Mux
 
 - Built-in name: `mux`
-- Default command: `npx -y mux@^0.27.0 acp`
+- Default entrypoint: `mux acp` via an ACPX-owned npm range
 - Upstream: https://mux.coder.com/integrations/acp
 
 `acpx mux` starts coder/mux through its ACP stdio bridge (`mux acp`). `mux acp` auto-starts an in-process mux server, so a separate `mux server` is not required.
@@ -192,6 +194,14 @@ Configure at least one model provider before prompting (for example `ANTHROPIC_A
 - Default command: `npx -y opencode-ai acp`
 - Upstream: [opencode.ai](https://opencode.ai)
 
+### Pool
+
+- Built-in name: `pool`
+- Default command: `pool acp`
+- Upstream: [Poolside](https://poolside.ai)
+
+`acpx pool` uses the installed `pool` CLI ACP server (`pool acp`). Install and authenticate the CLI first; `pool login` is the normal interactive path. Focused setup notes live in `agents/Pool.md`.
+
 ### Qwen
 
 - Built-in name: `qwen`
@@ -203,6 +213,15 @@ Configure at least one model provider before prompting (for example `ANTHROPIC_A
 - Built-in name: `trae`
 - Default command: `traecli acp serve`
 - Upstream: [docs.trae.cn](https://docs.trae.cn/cli)
+
+### ZeroClaw
+
+- Built-in name: `zeroclaw`
+- Default command: `zeroclaw acp`
+- Upstream: [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw)
+- `zeroclaw acp` is ZeroClaw's native JSON-RPC 2.0 stdio server for ACP v1 (`protocolVersion: 1`, no auth methods). The `channel-acp-server` feature it needs ships in ZeroClaw's default build.
+- `session/new` does not carry a ZeroClaw agent alias, so the server binds the session to `acp.default_agent` when set, otherwise to the sole `[agents.<alias>]` entry. Single-agent configs work as-is; multi-agent configs must set `acp.default_agent` or `session/new` fails.
+- Text prompts only (no image, audio, or embedded-context capability). Session resume/close is advertised when the ZeroClaw ACP session store is available. MCP tools are opt-in per agent via `[agents.<alias>].acp_enable_mcp`.
 
 ## Overriding a built-in
 

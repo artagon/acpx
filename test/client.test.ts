@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -78,6 +80,7 @@ type ClientInternals = {
     reason: "process_exit" | "process_close" | "pipe_close" | "connection_close",
     exitCode: number | null,
     signal: NodeJS.Signals | null,
+    lifecycleGeneration?: number,
   ) => void;
   filesystem?: {
     readTextFile: (params: {
@@ -138,6 +141,7 @@ type ClientInternals = {
   lastKnownPid?: number;
   agentStartedAt?: string;
   closing: boolean;
+  lifecycleGeneration: number;
   observedSessionUpdates: number;
   processedSessionUpdates: number;
   suppressSessionUpdates: boolean;
@@ -1172,6 +1176,18 @@ test("AcpClient lifecycle snapshot and cancel helpers reflect active prompt stat
   assert.deepEqual(cancelled, { stopReason: "cancelled" });
 });
 
+test("AcpClient ignores lifecycle events from an earlier agent generation", () => {
+  const client = makeClient();
+  const internals = asInternals(client);
+  internals.lifecycleGeneration = 2;
+
+  internals.recordAgentExit?.("process_exit", 1, "SIGTERM", 1);
+  assert.equal(client.getAgentLifecycleSnapshot().lastExit, undefined);
+
+  internals.recordAgentExit?.("process_exit", 0, null, 2);
+  assert.equal(client.getAgentLifecycleSnapshot().lastExit?.exitCode, 0);
+});
+
 test("AcpClient rejects rich prompt content not advertised by promptCapabilities", async () => {
   const client = makeClient();
   const internals = asInternals(client);
@@ -1276,6 +1292,133 @@ test("AcpClient start fails fast when the agent exits during initialize", async 
   assert(Date.now() - startedAt < 2_000);
 });
 
+test("AcpClient startup failure kills descendants left by an exited npx wrapper", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-startup-tree-"));
+  const packageDir = path.join(tempDir, "adapter-package");
+  const processInfoPath = path.join(tempDir, "process-info.json");
+  let descendantPid: number | undefined;
+
+  try {
+    await fs.mkdir(packageDir, { recursive: true });
+    await fs.writeFile(
+      path.join(packageDir, "package.json"),
+      `${JSON.stringify({
+        name: "acpx-startup-tree-fixture",
+        version: "1.0.0",
+        bin: { "acpx-startup-tree-fixture": "adapter.cjs" },
+      })}\n`,
+    );
+    const adapterPath = path.join(packageDir, "adapter.cjs");
+    await fs.writeFile(
+      adapterPath,
+      [
+        "#!/usr/bin/env node",
+        'const { spawn } = require("node:child_process");',
+        'const fs = require("node:fs");',
+        'const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000);"], { stdio: "ignore" });',
+        `fs.writeFileSync(${JSON.stringify(processInfoPath)}, JSON.stringify({ adapterPid: process.pid, descendantPid: child.pid }));`,
+        "setTimeout(() => process.exit(17), 100);",
+        "",
+      ].join("\n"),
+    );
+    await fs.chmod(adapterPath, 0o755);
+
+    const client = makeClient({
+      agentCommand: `npx --yes --offline --package ${JSON.stringify(packageDir)} -- acpx-startup-tree-fixture`,
+      cwd: tempDir,
+      sessionOptions: {
+        env: {
+          HOME: tempDir,
+          npm_config_cache: path.join(tempDir, "npm-cache"),
+        },
+      },
+    });
+
+    await assert.rejects(() => client.start(), AgentStartupError);
+    const processInfo = JSON.parse(await fs.readFile(processInfoPath, "utf8")) as {
+      adapterPid: number;
+      descendantPid: number;
+    };
+    descendantPid = processInfo.descendantPid;
+    assert.notEqual(
+      processInfo.adapterPid,
+      descendantPid,
+      "fixture must create a separate stubborn descendant",
+    );
+    assert.equal(
+      await waitForPidExit(descendantPid),
+      true,
+      "startup cleanup must not leave the adapter descendant alive",
+    );
+  } finally {
+    if (descendantPid) {
+      await terminateTestPid(descendantPid);
+    }
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("AcpClient close records the adapter exit while initialization is still pending", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX process-group cleanup assertion");
+    return;
+  }
+
+  const client = makeClient({
+    agentCommand: `${JSON.stringify(process.execPath)} --eval ${JSON.stringify(
+      'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);',
+    )}`,
+  });
+  const startResult = client.start().then(
+    () => ({ type: "resolved" as const }),
+    (error: unknown) => ({ type: "rejected" as const, error }),
+  );
+  let pid: number | undefined;
+
+  try {
+    pid = await waitForClientPid(client);
+    await client.close();
+
+    assert.equal(
+      await waitForPidExit(pid),
+      true,
+      "close must terminate the detached adapter before initialization finishes",
+    );
+    assert.equal(
+      typeof client.getAgentLifecycleSnapshot().lastExit?.exitedAt,
+      "string",
+      "close must retain the current adapter's exit lifecycle",
+    );
+    assert.equal((await startResult).type, "rejected");
+  } finally {
+    if (pid) {
+      await terminateTestPid(pid);
+    }
+  }
+});
+
+test("AcpClient close cancels a start request before launch preparation resumes", async () => {
+  const client = makeClient();
+  const internals = asInternals(client) as ReturnType<typeof asInternals> & {
+    resolveAgentLaunchPlan: () => Promise<never>;
+  };
+  let launchPreparationCalls = 0;
+  internals.resolveAgentLaunchPlan = async () => {
+    launchPreparationCalls += 1;
+    throw new Error("launch preparation must not run after close");
+  };
+
+  const startResult = client.start();
+  await client.close();
+
+  await assert.rejects(startResult, /closed during startup/u);
+  assert.equal(launchPreparationCalls, 0);
+});
+
 test("AcpClient close resets in-memory state and shuts down terminal manager", async () => {
   const client = makeClient();
   const internals = asInternals(client);
@@ -1352,6 +1495,46 @@ function makeClient(
     permissionMode: "approve-reads",
     ...overrides,
   });
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function terminateTestPid(pid: number): Promise<void> {
+  if (!isPidAlive(pid)) {
+    return;
+  }
+  process.kill(pid, "SIGKILL");
+  const deadline = Date.now() + 2_000;
+  while (isPidAlive(pid) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isPidAlive(pid) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  return !isPidAlive(pid);
+}
+
+async function waitForClientPid(client: AcpClient, timeoutMs = 2_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pid = client.getAgentPid();
+    if (pid) {
+      return pid;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Timed out waiting for adapter PID");
 }
 
 function asInternals(client: AcpClient): ClientInternals {

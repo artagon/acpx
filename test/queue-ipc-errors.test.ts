@@ -12,6 +12,7 @@ import {
   trySubmitToRunningOwner,
 } from "../src/cli/queue/ipc.js";
 import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
+import { getPerfMetricsSnapshot, resetPerfMetrics } from "../src/perf-metrics.js";
 import type { OutputFormatter } from "../src/types.js";
 import {
   cleanupOwnerArtifacts,
@@ -754,7 +755,7 @@ test("SessionQueueOwner rejects no-wait prompts when queue depth exceeds the lim
   });
 });
 
-test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", async () => {
+test("trySubmitToRunningOwner preserves a live owner after protocol mismatch", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "submit-stale-owner-protocol-mismatch";
     const keeper = await startKeeperProcess();
@@ -789,16 +790,180 @@ test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", asy
     await listenServer(server, socketPath);
 
     try {
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        QueueProtocolError,
+      );
+      await fs.access(lockPath);
+      assert.equal(keeper.exitCode == null && keeper.signalCode == null, true);
+    } finally {
+      await closeServer(server);
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("startup probe treats lease-before-bind as a miss without a health reconnect", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "startup-lease-before-bind";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+    });
+
+    resetPerfMetrics();
+    try {
       const outcome = await trySubmitToRunningOwner({
         sessionId,
         message: "hello",
         permissionMode: "approve-reads",
         outputFormatter: NOOP_OUTPUT_FORMATTER,
         waitForCompletion: true,
+        startupProbe: true,
       });
       assert.equal(outcome, undefined);
-      await assert.rejects(fs.access(lockPath));
+      assert.equal(getPerfMetricsSnapshot().timings["queue.connect"]?.count, 1);
     } finally {
+      resetPerfMetrics();
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("startup probe retires a fresh dead owner instead of treating it as lease-before-bind", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "startup-dead-before-bind";
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: 999_999,
+      sessionId,
+      socketPath,
+    });
+
+    const outcome = await trySubmitToRunningOwner({
+      sessionId,
+      message: "hello",
+      permissionMode: "approve-reads",
+      outputFormatter: NOOP_OUTPUT_FORMATTER,
+      waitForCompletion: true,
+      startupProbe: true,
+    });
+
+    assert.equal(outcome, undefined);
+    await assert.rejects(fs.access(lockPath));
+  });
+});
+
+test("startup probe fails closed for an older live owner without a socket", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "startup-owner-not-accepting";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      createdAt: "2000-01-01T00:00:00.000Z",
+      heartbeatAt: new Date().toISOString(),
+    });
+
+    resetPerfMetrics();
+    try {
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+            startupProbe: true,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_NOT_ACCEPTING_REQUESTS");
+          assert.equal(error.retryable, true);
+          return true;
+        },
+      );
+      assert((getPerfMetricsSnapshot().timings["queue.connect"]?.count ?? 0) > 1);
+      await fs.access(lockPath);
+      assert.equal(keeper.exitCode, null);
+      assert.equal(keeper.signalCode, null);
+    } finally {
+      resetPerfMetrics();
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("startup probe retries a transient connection failure for an established owner", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "startup-established-owner-transient-connect";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      createdAt: "2000-01-01T00:00:00.000Z",
+      heartbeatAt: new Date().toISOString(),
+    });
+
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "submit_prompt");
+      socket.write(
+        `${JSON.stringify({
+          type: "accepted",
+          requestId: request.requestId,
+        })}\n`,
+      );
+      socket.end();
+    });
+    const delayedListen = new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        void listenServer(server, socketPath).then(resolve, reject);
+      }, 75);
+    });
+
+    resetPerfMetrics();
+    try {
+      const [outcome] = await Promise.all([
+        trySubmitToRunningOwner({
+          sessionId,
+          message: "hello",
+          permissionMode: "approve-reads",
+          outputFormatter: NOOP_OUTPUT_FORMATTER,
+          waitForCompletion: false,
+          startupProbe: true,
+        }),
+        delayedListen,
+      ]);
+      assert(outcome);
+      assert.equal("queued" in outcome, true);
+      assert((getPerfMetricsSnapshot().timings["queue.connect"]?.count ?? 0) > 1);
+    } finally {
+      resetPerfMetrics();
+      await delayedListen.catch(() => {
+        // The submit failure remains the primary assertion signal.
+      });
       await closeServer(server);
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);
@@ -849,7 +1014,7 @@ test("trySubmitToRunningOwner rejects MCP config changes for a live owner", asyn
   });
 });
 
-test("trySubmitToRunningOwner recovers stale owners before MCP conflict checks", async () => {
+test("trySubmitToRunningOwner preserves stale live legacy owners", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "submit-stale-mcp-config-owner";
     const keeper = await startKeeperProcess();
@@ -865,18 +1030,67 @@ test("trySubmitToRunningOwner recovers stale owners before MCP conflict checks",
     });
 
     try {
-      const outcome = await trySubmitToRunningOwner({
-        sessionId,
-        message: "hello",
-        mcpConfigPath: "/tmp/new-mcp.json",
-        mcpConfigFingerprint: "fingerprint-v2",
-        permissionMode: "approve-reads",
-        outputFormatter: NOOP_OUTPUT_FORMATTER,
-        waitForCompletion: true,
-      });
-      assert.equal(outcome, undefined);
-      await assert.rejects(fs.access(lockPath));
-      assert.equal(keeper.exitCode == null && keeper.signalCode == null, false);
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            mcpConfigPath: "/tmp/new-mcp.json",
+            mcpConfigFingerprint: "fingerprint-v2",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_MCP_CONFIG_CONFLICT");
+          return true;
+        },
+      );
+      await fs.access(lockPath);
+      assert.equal(keeper.exitCode == null && keeper.signalCode == null, true);
+      assert.equal(await tryAcquireQueueOwnerLease(sessionId), undefined);
+    } finally {
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("trySubmitToRunningOwner fails closed for an older live owner without a socket", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "submit-owner-not-accepting";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      createdAt: "2000-01-01T00:00:00.000Z",
+      heartbeatAt: new Date().toISOString(),
+    });
+
+    try {
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_NOT_ACCEPTING_REQUESTS");
+          assert.equal(error.retryable, true);
+          return true;
+        },
+      );
+      await fs.access(lockPath);
+      assert.equal(keeper.exitCode, null);
+      assert.equal(keeper.signalCode, null);
     } finally {
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);

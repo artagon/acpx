@@ -121,12 +121,16 @@ test("flag parsers reject invalid enum values with actionable messages", () => {
 
 test("numeric flag parsers reject non-finite and out-of-range values", () => {
   assert.equal(parseTimeoutSeconds("1.5"), 1500);
+  assert.equal(parseTimeoutSeconds("0.0001"), 1);
   assert.throws(() => parseTimeoutSeconds("0"), /positive number/);
   assert.throws(() => parseTimeoutSeconds("abc"), /positive number/);
+  assert.throws(() => parseTimeoutSeconds("2147483.648"), /maximum supported timer delay/);
 
   assert.equal(parseTtlSeconds("0"), 0);
+  assert.equal(parseTtlSeconds("0.0001"), 1);
   assert.equal(parseTtlSeconds("2.25"), 2250);
   assert.throws(() => parseTtlSeconds("-1"), /non-negative/);
+  assert.throws(() => parseTtlSeconds("2147483.648"), /maximum supported timer delay/);
 
   assert.equal(parseMaxTurns("2"), 2);
   assert.throws(() => parseMaxTurns("0"), /positive integer/);
@@ -181,6 +185,7 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
       permissionPolicy: '{"defaultAction":"deny"}',
       jsonStrict: true,
       suppressReads: true,
+      fs: false,
       terminal: false,
       timeout: 12_000,
       ttl: 34_000,
@@ -204,6 +209,7 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
     permissionPolicy: '{"defaultAction":"deny"}',
     jsonStrict: true,
     suppressReads: true,
+    fs: false,
     terminal: false,
     timeout: 12_000,
     ttl: 34_000,
@@ -361,6 +367,7 @@ test("global flag registration parses each supported option", () => {
     "--prompt-retries",
     "2",
     "--json-strict",
+    "--no-fs",
     "--no-terminal",
     "--timeout",
     "1.5",
@@ -384,6 +391,7 @@ test("global flag registration parses each supported option", () => {
     systemPrompt: "be precise",
     promptRetries: 2,
     jsonStrict: true,
+    fs: false,
     terminal: false,
     timeout: 1500,
     ttl: 0,
@@ -516,5 +524,33 @@ test("resolveAgentInvocation rejects conflicting positional and override agents"
         config(),
       ),
     /Do not combine positional agent with --agent override/,
+  );
+});
+
+test("resolveAgentInvocation applies canonical config overrides through aliases", () => {
+  assert.deepEqual(
+    resolveAgentInvocation(
+      "factory-droid",
+      {
+        cwd: "/repo",
+        nonInteractivePermissions: "deny",
+        ttl: 300_000,
+        format: "text",
+      },
+      config({
+        agents: {
+          droid: {
+            command: '"C:\\\\tools\\\\droid.exe" "--acp"',
+            argv: ["C:\\tools\\droid.exe", "--acp"],
+          },
+        },
+      }),
+    ),
+    {
+      agentName: "factory-droid",
+      agentCommand: '"C:\\\\tools\\\\droid.exe" "--acp"',
+      agentArgv: ["C:\\tools\\droid.exe", "--acp"],
+      cwd: "/repo",
+    },
   );
 });

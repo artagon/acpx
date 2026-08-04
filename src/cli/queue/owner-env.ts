@@ -79,6 +79,7 @@ function assignQueueOwnerScalarOptions(
   if (record.authPolicy === "skip" || record.authPolicy === "fail") {
     options.authPolicy = record.authPolicy;
   }
+  assignBooleanOption(options, "fs", record.fs);
   assignBooleanOption(options, "terminal", record.terminal);
   assignBooleanOption(options, "suppressSdkConsoleErrors", record.suppressSdkConsoleErrors);
   assignBooleanOption(options, "verbose", record.verbose);
@@ -89,7 +90,7 @@ function assignQueueOwnerScalarOptions(
 
 function assignBooleanOption(
   options: QueueOwnerRuntimeOptions,
-  key: "terminal" | "suppressSdkConsoleErrors" | "verbose",
+  key: "fs" | "terminal" | "suppressSdkConsoleErrors" | "verbose",
   value: unknown,
 ): void {
   if (typeof value === "boolean") {

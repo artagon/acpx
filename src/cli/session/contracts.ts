@@ -40,6 +40,7 @@ export function normalizeQueueOwnerTtlMs(ttlMs: number | undefined): number {
 
 export type RunOnceOptions = {
   agentCommand: string;
+  agentArgv?: string[];
   cwd: string;
   prompt: PromptInput;
   mcpServers?: McpServer[];
@@ -48,6 +49,7 @@ export type RunOnceOptions = {
   permissionPolicy?: PermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   outputFormatter: OutputFormatter;
   errorEmissionPolicy?: OutputErrorEmissionPolicy;
@@ -63,6 +65,7 @@ export type RunOnceOptions = {
 
 export type SessionCreateOptions = {
   agentCommand: string;
+  agentArgv?: string[];
   cwd: string;
   name?: string;
   resumeSessionId?: string;
@@ -72,6 +75,7 @@ export type SessionCreateOptions = {
   permissionPolicy?: PermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   verbose?: boolean;
   sessionOptions?: SessionAgentOptions;
@@ -90,6 +94,7 @@ export type SessionSendOptions = {
   permissionPolicy?: PermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   outputFormatter: OutputFormatter;
   onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
@@ -109,6 +114,7 @@ export type SessionSendOptions = {
 
 export type SessionEnsureOptions = {
   agentCommand: string;
+  agentArgv?: string[];
   cwd: string;
   name?: string;
   resumeSessionId?: string;
@@ -118,6 +124,7 @@ export type SessionEnsureOptions = {
   permissionPolicy?: PermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   verbose?: boolean;
   walkBoundary?: string;
@@ -127,6 +134,7 @@ export type SessionEnsureOptions = {
 
 export type SessionListOptions = {
   agentCommand: string;
+  agentArgv?: string[];
   cwd: string;
   cursor?: string;
   filterCwd?: string;
@@ -136,6 +144,7 @@ export type SessionListOptions = {
   permissionPolicy?: PermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   verbose?: boolean;
 } & TimedRunOptions;
@@ -159,6 +168,7 @@ export type SessionSetModeOptions = {
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   verbose?: boolean;
 } & TimedRunOptions;
@@ -170,6 +180,7 @@ export type SessionSetModelOptions = {
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   verbose?: boolean;
 } & TimedRunOptions;
@@ -182,6 +193,7 @@ export type SessionSetConfigOptionOptions = {
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   verbose?: boolean;
 } & TimedRunOptions;

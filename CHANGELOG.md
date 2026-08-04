@@ -47,6 +47,75 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+- Runtime/agents: terminate owned adapter process groups on POSIX and
+  best-effort tracked process trees on Windows during normal and failed startup
+  cleanup so package-exec wrappers do not leave captured descendants running
+  after ACPX exits; exit-triggered snapshots are observed before cleanup
+  completes, POSIX descendants are captured before signaling so later session
+  or group changes cannot escape forced cleanup, owned POSIX group members
+  created during shutdown are discovered and re-signaled, external process-list
+  discovery is bounded, Linux process identities come from procfs, other POSIX
+  snapshots use a fixed locale, adapter wrappers are sampled with bounded
+  exponential backoff through multi-stage launches, escaped descendants are
+  extended from identity-validated parents after root exit, transient discovery
+  failures preserve and still signal captured targets, and Windows parent edges
+  plus remembered descendants are identity-checked before later signaling.
+
+- Runtime/queue: publish queue-owner leases atomically, preserve fresh malformed
+  locks during collisions, serialize cross-process refresh, release, and stale
+  cleanup through inode-qualified, crash-recoverable claims, revalidate stale
+  owners while holding cleanup claims, retry explicit cleanup across heartbeat
+  contention while making unresolved explicit cleanup fail visibly, reacquire
+  atomically with fresh timestamps after retiring a stale collision, and treat
+  only a fresh, live lease-before-bind owner as a fast startup miss while
+  retaining a retry window that covers the full startup grace period, preventing
+  premature `QUEUE_NOT_ACCEPTING_REQUESTS` errors without masking older
+  unreachable owners, letting released owners overwrite successors, or leaving
+  stale dangling-symlink locks unrecoverable.
+
+## 2026.7.27 (v0.13.0)
+
+### Highlights
+
+- Windows agent launches now use structured argv end to end. Unambiguous legacy `command` plus `args` entries migrate automatically; ambiguous/raw commands and `.sh` wrappers must move to `agents.<name>.argv`, and existing saved custom-agent sessions without argv must be recreated.
+- Built-in Pool and ZeroClaw support makes both native ACP stdio servers available without custom registry configuration.
+- The new `--no-fs` flag lets compatible agents use their native filesystem implementation instead of ACP client filesystem methods.
+- The dependency and pnpm refresh resolves all four known PostCSS, fast-uri, js-yaml, and brace-expansion advisories.
+
+### Changes
+
+- Agents/built-ins: add Pool via `pool acp`. Thanks @dan-roberts-poolside and @osolmaz.
+
+- Agents/built-ins: add ZeroClaw via `zeroclaw acp`, ZeroClaw's native ACP v1 stdio server. Thanks @JordanTheJet.
+
+- CLI/ACP: add `--no-fs` to disable advertised ACP file read/write capabilities so compatible agents can use their native filesystem implementation. Thanks @zgxkbtl.
+
+- CLI/timers: preserve tiny positive timeout and TTL values from flags or config as 1 ms instead of disabling timers, and reject delays beyond Node's supported timer range. Thanks @realmehmetali.
+
+- Dependencies/tooling: refresh the ACP SDK, runtime and development toolchain, update pnpm to 10.34.5, and resolve the PostCSS, fast-uri, js-yaml, and brace-expansion advisories.
+
+### Breaking
+
+- Windows agent launches now require structured `agents.<name>.argv`; unambiguous legacy `command` plus `args` entries migrate automatically, while raw, ambiguous, or directly executable `.sh` commands fail with explicit migration guidance instead of lossy parsing or CreateProcess ENOENT. Existing custom-agent sessions without saved argv must be recreated. Fixes #466. Thanks @MarcelCFritsche.
+
+### Fixes
+
+- Flows: swallow best-effort heartbeat write failures at the timer boundary so storage errors do not become unhandled promise rejections. Thanks @SebTardif.
+
+- Runtime/sessions: use collision-resistant temporary paths for concurrent atomic session and index writes. Thanks @henkterharmsel.
+
+- CLI/status: report a normal cold-start session as `agent starting` while preserving `needs reconnect` for an unreachable live owner. Thanks @guettli.
+
+## 2026.7.23 (v0.12.1)
+
+### Changes
+
+- Agents/built-ins: refresh the default Pi, Codex, Claude, and Mux adapter ranges. Thanks @kelvinschen and @TheAngryPit.
+
+### Breaking
+
+### Fixes
+
 - Session queue owner: capture a bounded owner stderr tail and exit status during cold start only (stop retaining at first IPC accept; keep draining the pipe so long-lived owners are not killed by EPIPE) so a dead owner reports the real failure instead of a silent timeout. Thanks @SebTardif.
 
 ## 2026.7.4 (v0.12.0)

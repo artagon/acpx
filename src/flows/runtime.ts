@@ -151,6 +151,7 @@ export class FlowRunner {
   private readonly permissionPolicy?: PermissionPolicy;
   private readonly authCredentials?;
   private readonly authPolicy?;
+  private readonly fs?;
   private readonly timeoutMs?;
   private readonly defaultNodeTimeoutMs;
   private readonly verbose?;
@@ -169,6 +170,7 @@ export class FlowRunner {
     this.permissionPolicy = options.permissionPolicy;
     this.authCredentials = options.authCredentials;
     this.authPolicy = options.authPolicy;
+    this.fs = options.fs;
     this.timeoutMs = options.timeoutMs;
     this.defaultNodeTimeoutMs =
       options.defaultNodeTimeoutMs ?? options.timeoutMs ?? DEFAULT_FLOW_STEP_TIMEOUT_MS;
@@ -1014,7 +1016,11 @@ export class FlowRunner {
 
     if (heartbeatMs > 0) {
       timer = setInterval(() => {
-        void heartbeat();
+        // Heartbeat writes are best-effort; never leave a rejected promise
+        // from setInterval (unhandledRejection noise / process flags).
+        void heartbeat().catch(() => {
+          // ignore
+        });
       }, heartbeatMs);
     }
 
@@ -1054,6 +1060,7 @@ export class FlowRunner {
     const name = createSessionName(flow.name, handle, agent.cwd, state.runId);
     const created = await createSessionWithClient({
       agentCommand: agent.agentCommand,
+      agentArgv: agent.agentArgv,
       cwd: agent.cwd,
       name,
       mcpServers: this.mcpServers,
@@ -1062,6 +1069,7 @@ export class FlowRunner {
       permissionPolicy: this.permissionPolicy,
       authCredentials: this.authCredentials,
       authPolicy: this.authPolicy,
+      fs: this.fs,
       timeoutMs,
       verbose: this.verbose,
       sessionOptions: this.sessionOptions,
@@ -1075,6 +1083,7 @@ export class FlowRunner {
       profile: node.profile,
       agentName: agent.agentName,
       agentCommand: agent.agentCommand,
+      agentArgv: agent.agentArgv,
       cwd: agent.cwd,
       acpxRecordId: created.record.acpxRecordId,
       acpSessionId: created.record.acpSessionId,
@@ -1123,6 +1132,7 @@ export class FlowRunner {
         permissionPolicy: this.permissionPolicy,
         authCredentials: this.authCredentials,
         authPolicy: this.authPolicy,
+        fs: this.fs,
         outputFormatter: capture.formatter,
         onAcpMessage: (direction, message) => {
           const pending = this.store
@@ -1206,6 +1216,7 @@ export class FlowRunner {
     const pendingEventWrites: Promise<void>[] = [];
     const result = await runOnce({
       agentCommand: agent.agentCommand,
+      agentArgv: agent.agentArgv,
       cwd: agent.cwd,
       prompt,
       mcpServers: this.mcpServers,
@@ -1214,6 +1225,7 @@ export class FlowRunner {
       permissionPolicy: this.permissionPolicy,
       authCredentials: this.authCredentials,
       authPolicy: this.authPolicy,
+      fs: this.fs,
       outputFormatter: capture.formatter,
       onAcpMessage: (direction, message) => {
         const pending = this.store

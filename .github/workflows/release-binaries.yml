@@ -36,7 +36,7 @@ permissions:
   contents: read
 
 env:
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
   # Pinned exactly. The shipped binary *is* this Node build with a blob injected,
   # so a floating version silently changes the release's largest attack surface
   # (V8, OpenSSL, zlib) and makes builds non-reproducible. The SBOM records this

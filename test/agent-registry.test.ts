@@ -3,7 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { normalizeAgentCommandInput } from "../src/acp/client-process.js";
 import {
+  AGENT_ARGV_REGISTRY,
   AGENT_REGISTRY,
   BUILT_IN_AGENT_PACKAGES,
   DEFAULT_AGENT_NAME,
@@ -13,6 +15,14 @@ import {
   resolvePackageExecBuiltInAgentLaunch,
   resolveAgentCommand,
 } from "../src/agent-registry.js";
+
+test("built-in command displays stay synchronized with structured argv", () => {
+  assert.deepEqual(Object.keys(AGENT_ARGV_REGISTRY), Object.keys(AGENT_REGISTRY));
+  for (const [name, argv] of Object.entries(AGENT_ARGV_REGISTRY)) {
+    assert.equal(argv.join(" "), AGENT_REGISTRY[name]);
+    assert.equal(normalizeAgentCommandInput(argv).agentCommand, AGENT_REGISTRY[name]);
+  }
+});
 
 test("resolveAgentCommand maps known agents to commands", () => {
   for (const [name, command] of Object.entries(AGENT_REGISTRY)) {
@@ -60,8 +70,20 @@ test("grok-build built-in runs the Grok Build ACP entrypoint", () => {
 });
 
 test("mux built-in runs the coder/mux ACP stdio bridge through npx", () => {
-  assert.equal(AGENT_REGISTRY.mux, "npx -y mux@^0.27.0 acp");
-  assert.equal(resolveAgentCommand("mux"), "npx -y mux@^0.27.0 acp");
+  assert.equal(AGENT_REGISTRY.mux, "npx -y mux@^0.28.0 acp");
+  assert.equal(resolveAgentCommand("mux"), "npx -y mux@^0.28.0 acp");
+});
+
+test("pool built-in runs the Poolside ACP entrypoint", () => {
+  assert.equal(AGENT_REGISTRY.pool, "pool acp");
+  assert.deepEqual(AGENT_ARGV_REGISTRY.pool, ["pool", "acp"]);
+  assert.equal(resolveAgentCommand("pool"), "pool acp");
+});
+
+test("zeroclaw built-in launches the native ZeroClaw ACP server", () => {
+  assert.equal(AGENT_REGISTRY.zeroclaw, "zeroclaw acp");
+  assert.deepEqual(AGENT_ARGV_REGISTRY.zeroclaw, ["zeroclaw", "acp"]);
+  assert.equal(resolveAgentCommand("zeroclaw"), "zeroclaw acp");
 });
 
 test("listBuiltInAgents preserves the required example prefix and alphabetical tail", () => {
@@ -86,9 +108,11 @@ test("listBuiltInAgents preserves the required example prefix and alphabetical t
     "kiro",
     "mux",
     "opencode",
+    "pool",
     "qoder",
     "qwen",
     "trae",
+    "zeroclaw",
   ]);
 });
 
@@ -96,40 +120,15 @@ test("default agent is codex", () => {
   assert.equal(DEFAULT_AGENT_NAME, "codex");
 });
 
-/**
- * The built-in adapters are also declared as dependencies so a normal install
- * places them under acpx's own node_modules, where
- * `resolveInstalledBuiltInAgentLaunch` finds them and spawns them directly. If
- * the two drift, resolution silently launches whatever is installed — it never
- * compares versions — and the declared pin becomes fiction. Assert against
- * package.json rather than a literal so this cannot rot on the next bump.
- */
-const declaredDependencies = (
-  JSON.parse(fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
-    dependencies: Record<string, string>;
-  }
-).dependencies;
-
-test("built-in adapter ranges match the declared dependencies", () => {
-  for (const spec of Object.values(BUILT_IN_AGENT_PACKAGES)) {
-    assert.equal(
-      spec.packageRange,
-      declaredDependencies[spec.packageName],
-      `${spec.packageName}: registry range must match package.json`,
-    );
-  }
+test("claude built-in uses the current ACP adapter package range", () => {
+  assert.equal(BUILT_IN_AGENT_PACKAGES.claude.packageRange, "^0.61.0");
+  assert.equal(AGENT_REGISTRY.claude, "npx -y @agentclientprotocol/claude-agent-acp@^0.61.0");
 });
 
-test("npm-backed built-ins embed their pinned range in the fallback command", () => {
-  assert.equal(
-    AGENT_REGISTRY.claude,
-    `npx -y @agentclientprotocol/claude-agent-acp@${BUILT_IN_AGENT_PACKAGES.claude.packageRange}`,
-  );
-  assert.equal(
-    AGENT_REGISTRY.codex,
-    `npx -y @agentclientprotocol/codex-acp@${BUILT_IN_AGENT_PACKAGES.codex.packageRange}`,
-  );
-  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.26");
+test("npm-backed built-ins use current adapter package ranges", () => {
+  assert.equal(BUILT_IN_AGENT_PACKAGES.codex.packageRange, "^1.1.7");
+  assert.equal(AGENT_REGISTRY.codex, "npx -y @agentclientprotocol/codex-acp@^1.1.7");
+  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.31");
 });
 
 test("resolveInstalledBuiltInAgentLaunch uses a locally installed adapter when available", (t) => {

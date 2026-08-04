@@ -362,6 +362,7 @@ async function runAgentForCompare(params: {
     const { runOnce } = await import("../session/session.js");
     const result = await runOnce({
       agentCommand: agent.agentCommand,
+      agentArgv: agent.agentArgv,
       cwd: agent.cwd,
       prompt: params.prompt,
       mcpServers: params.config.mcpServers,
@@ -370,6 +371,7 @@ async function runAgentForCompare(params: {
       permissionPolicy: params.permissionPolicy,
       authCredentials: params.config.auth,
       authPolicy: params.globalFlags.authPolicy,
+      fs: params.globalFlags.fs,
       terminal: params.globalFlags.terminal,
       outputFormatter: formatter,
       suppressSdkConsoleErrors: true,

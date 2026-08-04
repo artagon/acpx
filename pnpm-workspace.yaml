@@ -1,12 +1,24 @@
 minimumReleaseAge: 2880
 
 overrides:
+  # Keep the native codegen packages on the last complete ABI-compatible set.
+  # Resolving 0.8.1 under minimumReleaseAge omits its platform bindings.
+  "@yuku-toolchain/types": 0.8.0
+  # GHSA-rgw5-rvv9-x895 (high): 5.0.9 completes the resource-bound fix that
+  # 5.0.8 only applied after vulnerable intermediate arrays were allocated.
+  brace-expansion: 5.0.9
   c8>yargs: 18.0.0
-  # GHSA-v2hh-gcrm-f6hx (high), reached through
+  # GHSA-7p8r-x3mc-p8w7 (high), reached through
   # @agentclientprotocol/claude-agent-acp > @anthropic-ai/claude-agent-sdk >
   # @modelcontextprotocol/sdk > ajv. Pinned to the patched 3.x release rather
   # than latest: ajv depends on ^3, so 4.x would leave the range unsatisfied.
-  fast-uri: 3.1.4
-  js-yaml: 4.2.0
+  fast-uri: 3.1.5
+  # GHSA-mwp4-54f8-5fhr (high), reached through the same adapter chain via
+  # @modelcontextprotocol/sdk > express-rate-limit.
+  ip-address: 10.3.1
+  js-yaml: 4.3.0
   markdown-it: 14.2.0
   qs: 6.15.2
+  yuku-ast: 0.8.0
+  yuku-codegen: 0.8.0
+  yuku-parser: 0.8.0

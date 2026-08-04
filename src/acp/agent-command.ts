@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { CopilotAcpUnsupportedError } from "../errors.js";
 import {
-  buildSpawnCommandOptions,
+  buildAgentSpawnCommand,
   readWindowsEnvValue,
   resolveWindowsExecutablePath,
 } from "../spawn-command-options.js";
@@ -25,6 +25,11 @@ const CLAUDE_CODE_DEFAULT_SETTING_SOURCES = ["project", "local"] as const;
 type GeminiVersion = {
   raw: string;
   parts: [number, number, number];
+};
+
+type CommandExecutionContext = {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
 };
 
 const QODER_BENIGN_STDOUT_LINES = new Set([
@@ -202,16 +207,19 @@ async function readCommandOutput(
   command: string,
   args: readonly string[],
   timeoutMs: number,
+  context: CommandExecutionContext = {},
 ): Promise<string | undefined> {
   return await new Promise<string | undefined>((resolve) => {
-    const child = spawn(
-      command,
-      [...args],
-      buildSpawnCommandOptions(command, {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      }),
-    );
+    const env = context.env ?? process.env;
+    const cwd = context.cwd ?? process.cwd();
+    const spawnCommand = buildAgentSpawnCommand(command, args, process.platform, env, cwd);
+    const child = spawn(spawnCommand.command, spawnCommand.args, {
+      cwd,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
+    });
 
     let stdout = "";
     let stderr = "";
@@ -276,13 +284,16 @@ export function buildClaudeAcpSessionCreateTimeoutMessage(): string {
   ].join(" ");
 }
 
-async function buildCopilotAcpUnsupportedMessage(command: string): Promise<string> {
+async function buildCopilotAcpUnsupportedMessage(
+  command: string,
+  context: CommandExecutionContext,
+): Promise<string> {
   const parts = [
     "GitHub Copilot CLI ACP stdio mode is not available in the installed copilot binary.",
     "acpx copilot expects a Copilot CLI release that supports --acp --stdio.",
   ];
 
-  const helpOutput = await readCommandOutput(command, ["--help"], COPILOT_HELP_TIMEOUT_MS);
+  const helpOutput = await readCommandOutput(command, ["--help"], COPILOT_HELP_TIMEOUT_MS, context);
   if (typeof helpOutput === "string" && !helpOutput.includes("--acp")) {
     parts.push("Detected copilot --help output without --acp support.");
   }
@@ -295,18 +306,26 @@ async function buildCopilotAcpUnsupportedMessage(command: string): Promise<strin
 
 const COPILOT_ACP_CAPABILITY_KEY = "copilot.acp-stdio";
 
-export async function ensureCopilotAcpSupport(command: string): Promise<void> {
+export async function ensureCopilotAcpSupport(
+  command: string,
+  context: CommandExecutionContext = {},
+): Promise<void> {
   // `copilot --help` costs a whole extra process (~380ms measured) for an
   // answer that only changes when the binary does, so it is cached against a
   // fingerprint of that binary.
-  const fingerprint = await fingerprintExecutable(command);
+  const fingerprint = await fingerprintExecutable(command, context);
   const cached = await readCachedCapability(COPILOT_ACP_CAPABILITY_KEY, fingerprint);
   if (cached === true) {
     return;
   }
 
   if (cached === undefined) {
-    const helpOutput = await readCommandOutput(command, ["--help"], COPILOT_HELP_TIMEOUT_MS);
+    const helpOutput = await readCommandOutput(
+      command,
+      ["--help"],
+      COPILOT_HELP_TIMEOUT_MS,
+      context,
+    );
     // Only a definite answer is cacheable: a timeout or spawn failure yields a
     // non-string result, which must not be recorded as "supported".
     if (typeof helpOutput === "string") {
@@ -323,7 +342,7 @@ export async function ensureCopilotAcpSupport(command: string): Promise<void> {
     }
   }
 
-  throw new CopilotAcpUnsupportedError(await buildCopilotAcpUnsupportedMessage(command), {
+  throw new CopilotAcpUnsupportedError(await buildCopilotAcpUnsupportedMessage(command, context), {
     retryable: false,
   });
 }
@@ -403,6 +422,7 @@ function isAppendSystemPrompt(
 export function resolveClaudeCodeExecutable(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
 ): string | undefined {
   if (platform !== "win32") {
     return undefined;
@@ -410,5 +430,5 @@ export function resolveClaudeCodeExecutable(
   if (readWindowsEnvValue(env, "CLAUDE_CODE_EXECUTABLE")) {
     return undefined;
   }
-  return resolveWindowsExecutablePath("claude", env);
+  return resolveWindowsExecutablePath("claude", env, cwd);
 }

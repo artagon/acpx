@@ -17,6 +17,7 @@ import {
 import type { SessionSendOutcome } from "../../types.js";
 import {
   QUEUE_CONNECT_RETRY_MS,
+  QUEUE_OWNER_STARTUP_GRACE_MS,
   SessionQueueOwner,
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
@@ -48,7 +49,8 @@ import {
 } from "./queue-owner-process.js";
 import { runQueuedTask } from "./runtime.js";
 
-const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS = 120;
+const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS =
+  Math.ceil(QUEUE_OWNER_STARTUP_GRACE_MS / QUEUE_CONNECT_RETRY_MS) + 1;
 const QUEUE_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const QUEUE_OWNER_ACTIVE_TURN_CANCEL_GRACE_MS = 750;
 
@@ -74,6 +76,7 @@ async function submitToRunningOwner(
     waitForCompletion,
     verbose: options.verbose,
     sessionOptions: options.sessionOptions,
+    startupProbe: true,
     onQueueAccepted: extras?.onQueueAccepted,
   });
 }
@@ -84,12 +87,14 @@ function createQueueOwnerSharedClient(
 ): AcpClient {
   return new AcpClient({
     agentCommand: sessionRecord.agentCommand,
+    agentArgv: sessionRecord.agentArgv,
     cwd: absolutePath(sessionRecord.cwd),
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    fs: options.fs,
     terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
@@ -113,6 +118,7 @@ function createQueueOwnerTurnController(
         nonInteractivePermissions: options.nonInteractivePermissions,
         authCredentials: options.authCredentials,
         authPolicy: options.authPolicy,
+        fs: options.fs,
         terminal: options.terminal,
         timeoutMs,
         verbose: options.verbose,
@@ -126,6 +132,7 @@ function createQueueOwnerTurnController(
         nonInteractivePermissions: options.nonInteractivePermissions,
         authCredentials: options.authCredentials,
         authPolicy: options.authPolicy,
+        fs: options.fs,
         terminal: options.terminal,
         timeoutMs,
         verbose: options.verbose,
@@ -141,6 +148,7 @@ function createQueueOwnerTurnController(
         nonInteractivePermissions: options.nonInteractivePermissions,
         authCredentials: options.authCredentials,
         authPolicy: options.authPolicy,
+        fs: options.fs,
         terminal: options.terminal,
         timeoutMs,
         verbose: options.verbose,
@@ -436,7 +444,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           await applyPendingCancel();
           return true;
         },
-        closeSession: async (timeoutMs?: number) => await closeActiveBackendSession(timeoutMs),
+        closeSession: async (timeoutMs?: number) => {
+          const closed = await closeActiveBackendSession(timeoutMs);
+          setImmediate(() => {
+            shutdown.request();
+          });
+          return closed;
+        },
         setSessionMode: async (modeId: string, timeoutMs?: number) => {
           await turnController.setSessionMode(modeId, timeoutMs);
         },
@@ -567,4 +581,9 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
 
 export type { QueueOwnerRuntimeOptions };
 export { DEFAULT_QUEUE_OWNER_TTL_MS };
-export const queueOwnerRuntimeTestInternals = { queueOwnerExitIsFatal };
+export const queueOwnerRuntimeTestInternals = {
+  queueOwnerExitIsFatal,
+  queueOwnerStartupGraceMs: QUEUE_OWNER_STARTUP_GRACE_MS,
+  queueOwnerStartupMaxAttempts: QUEUE_OWNER_STARTUP_MAX_ATTEMPTS,
+  queueConnectRetryMs: QUEUE_CONNECT_RETRY_MS,
+};

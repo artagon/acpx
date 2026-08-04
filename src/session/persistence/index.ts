@@ -1,9 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { SessionRecord } from "../../types.js";
+import { createAtomicWriteTempPath } from "./atomic-write.js";
 import { parseSessionRecord } from "./parse.js";
+import { withSessionWriteLock } from "./write-lock.js";
 
 const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
+const SESSION_INDEX_DIRTY_FILE = ".index.dirty";
 
 export type SessionIndexEntry = {
   file: string;
@@ -75,6 +78,37 @@ export function sessionIndexPath(sessionDir: string): string {
   return path.join(sessionDir, "index.json");
 }
 
+function sessionIndexDirtyPath(sessionDir: string): string {
+  return path.join(sessionDir, SESSION_INDEX_DIRTY_FILE);
+}
+
+export async function markSessionIndexDirty(sessionDir: string): Promise<void> {
+  await fs.writeFile(sessionIndexDirtyPath(sessionDir), `${process.pid}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+}
+
+export async function clearSessionIndexDirty(sessionDir: string): Promise<void> {
+  await fs.unlink(sessionIndexDirtyPath(sessionDir)).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  });
+}
+
+async function sessionIndexIsDirty(sessionDir: string): Promise<boolean> {
+  try {
+    await fs.access(sessionIndexDirtyPath(sessionDir));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
 export function toSessionIndexEntry(record: SessionRecord, fileName: string): SessionIndexEntry {
   return {
     file: fileName,
@@ -124,51 +158,56 @@ export async function writeSessionIndex(
     entries: SessionIndexEntry[];
   },
 ): Promise<void> {
-  const filePath = sessionIndexPath(sessionDir);
-  const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  const payload = JSON.stringify(
-    {
-      schema: SESSION_INDEX_SCHEMA,
-      files: [...index.files].toSorted(),
-      entries: [...index.entries].toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt)),
-    },
-    null,
-    2,
-  );
-  await fs.writeFile(tempFile, `${payload}\n`, "utf8");
-  await fs.rename(tempFile, filePath);
+  await withSessionWriteLock(sessionDir, async () => {
+    const filePath = sessionIndexPath(sessionDir);
+    const tempFile = createAtomicWriteTempPath(filePath);
+    const payload = JSON.stringify(
+      {
+        schema: SESSION_INDEX_SCHEMA,
+        files: [...index.files].toSorted(),
+        entries: [...index.entries].toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt)),
+      },
+      null,
+      2,
+    );
+    await fs.writeFile(tempFile, `${payload}\n`, "utf8");
+    await fs.rename(tempFile, filePath);
+  });
 }
 
 export async function rebuildSessionIndex(sessionDir: string): Promise<SessionIndex> {
-  const entries = await fs.readdir(sessionDir, { withFileTypes: true });
-  const files = entries
-    .filter(
-      (entry) => entry.isFile() && entry.name.endsWith(".json") && entry.name !== "index.json",
-    )
-    .map((entry) => entry.name)
-    .toSorted();
+  return await withSessionWriteLock(sessionDir, async () => {
+    const entries = await fs.readdir(sessionDir, { withFileTypes: true });
+    const files = entries
+      .filter(
+        (entry) => entry.isFile() && entry.name.endsWith(".json") && entry.name !== "index.json",
+      )
+      .map((entry) => entry.name)
+      .toSorted();
 
-  const indexEntries: SessionIndexEntry[] = [];
-  for (const file of files) {
-    try {
-      const payload = await fs.readFile(path.join(sessionDir, file), "utf8");
-      const parsed = parseSessionRecord(JSON.parse(payload));
-      if (!parsed) {
-        continue;
+    const indexEntries: SessionIndexEntry[] = [];
+    for (const file of files) {
+      try {
+        const payload = await fs.readFile(path.join(sessionDir, file), "utf8");
+        const parsed = parseSessionRecord(JSON.parse(payload));
+        if (!parsed) {
+          continue;
+        }
+        indexEntries.push(toSessionIndexEntry(parsed, file));
+      } catch {
+        // ignore corrupt session files while rebuilding the cache index
       }
-      indexEntries.push(toSessionIndexEntry(parsed, file));
-    } catch {
-      // ignore corrupt session files while rebuilding the cache index
     }
-  }
 
-  const index: SessionIndex = {
-    schema: SESSION_INDEX_SCHEMA,
-    files,
-    entries: indexEntries,
-  };
-  await writeSessionIndex(sessionDir, index);
-  return index;
+    const index: SessionIndex = {
+      schema: SESSION_INDEX_SCHEMA,
+      files,
+      entries: indexEntries,
+    };
+    await writeSessionIndex(sessionDir, index);
+    await clearSessionIndexDirty(sessionDir);
+    return index;
+  });
 }
 
 export async function loadOrRebuildSessionIndex(sessionDir: string): Promise<SessionIndex> {
@@ -180,6 +219,7 @@ export async function loadOrRebuildSessionIndex(sessionDir: string): Promise<Ses
     .toSorted();
   const existing = await readSessionIndex(sessionDir);
   if (
+    !(await sessionIndexIsDirty(sessionDir)) &&
     existing &&
     existing.files.length === files.length &&
     existing.files.every((file, index) => file === files[index])

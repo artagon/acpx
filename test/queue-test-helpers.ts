@@ -55,6 +55,7 @@ export async function writeQueueOwnerLock(options: {
   sessionId: string;
   socketPath: string;
   ownerGeneration?: number;
+  processIdentity?: string;
   queueDepth?: number;
   mcpConfigPath?: string;
   mcpConfigFingerprint?: string;
@@ -75,6 +76,7 @@ export async function writeQueueOwnerLock(options: {
       heartbeatAt,
       ownerGeneration:
         options.ownerGeneration ?? Date.now() * 1_000 + Math.floor(Math.random() * 1_000),
+      ...(options.processIdentity ? { processIdentity: options.processIdentity } : {}),
       queueDepth: options.queueDepth ?? 0,
       ...(options.mcpConfigPath ? { mcpConfigPath: options.mcpConfigPath } : {}),
       ...(options.mcpConfigFingerprint

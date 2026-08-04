@@ -38,6 +38,14 @@ async function waitForCondition(
   }
 }
 
+it("queue owner startup retries cover the full lease-before-bind grace period", () => {
+  const { queueOwnerStartupGraceMs, queueOwnerStartupMaxAttempts, queueConnectRetryMs } =
+    queueOwnerRuntimeTestInternals;
+  const retryWindowMs = (queueOwnerStartupMaxAttempts - 1) * queueConnectRetryMs;
+
+  assert(retryWindowMs >= queueOwnerStartupGraceMs);
+});
+
 describe("resolveQueueOwnerSpawnArgs", () => {
   it("prefers ACPX_QUEUE_OWNER_ARGS when provided", () => {
     const previous = process.env.ACPX_QUEUE_OWNER_ARGS;
@@ -148,13 +156,15 @@ describe("writeQueueOwnerPayloadFile", () => {
 });
 
 describe("queueOwnerRuntimeOptionsFromSend", () => {
-  it("preserves terminal capability preference", () => {
+  it("preserves client capability preferences", () => {
     const options = queueOwnerRuntimeOptionsFromSend({
       sessionId: "session-1",
       permissionMode: "approve-reads",
+      fs: false,
       terminal: false,
     });
 
+    assert.equal(options.fs, false);
     assert.equal(options.terminal, false);
   });
 });
@@ -272,6 +282,7 @@ describe("spawnQueueOwnerProcess startup capture lifecycle", () => {
     `;
     const ownerArgs = JSON.stringify(["--input-type=module", "-e", ownerCode]);
     const probe = `
+      import { writeSync } from "node:fs";
       import { spawnQueueOwnerProcess } from ${JSON.stringify(moduleUrl)};
       process.env.ACPX_QUEUE_OWNER_ARGS = ${JSON.stringify(ownerArgs)};
       const handle = spawnQueueOwnerProcess({
@@ -279,7 +290,7 @@ describe("spawnQueueOwnerProcess startup capture lifecycle", () => {
         permissionMode: "approve-reads",
       });
       handle.stopStartupCapture();
-      console.log(handle.pid);
+      writeSync(1, String(handle.pid));
     `;
 
     const result = spawnSync(process.execPath, ["--input-type=module", "--eval", probe], {
@@ -293,7 +304,10 @@ describe("spawnQueueOwnerProcess startup capture lifecycle", () => {
         0,
         `submitter did not exit independently: ${result.stderr || String(result.signal)}`,
       );
-      assert.ok(Number.isInteger(ownerPid) && ownerPid > 0, "expected detached owner pid");
+      assert.ok(
+        Number.isInteger(ownerPid) && ownerPid > 0,
+        `expected detached owner pid; stdout=${JSON.stringify(result.stdout)} stderr=${JSON.stringify(result.stderr)}`,
+      );
       assert.doesNotThrow(() => process.kill(ownerPid, 0), "owner should still be running");
     } finally {
       if (Number.isInteger(ownerPid) && ownerPid > 0) {

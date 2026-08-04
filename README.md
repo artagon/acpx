@@ -36,6 +36,7 @@ One command surface for Pi, OpenClaw ACP, Codex, Claude, and other ACP-compatibl
 - **Session export/import**: move portable session archives between machines
 - **Local status checks**: `status` reports running/idle/dead/no-session, pid, uptime, last prompt
 - **Client methods**: stable `fs/*` and `terminal/*` handlers with permission controls and cwd sandboxing
+- **Capability opt-outs**: let adapters use their native filesystem or terminal tools with `--no-fs` and `--no-terminal`
 - **Auth handshake**: stable `authenticate` support via env/config credentials
 - **Structured output**: typed ACP messages (thinking, tool calls, diffs) instead of ANSI scraping
 - **Any ACP agent**: built-in registry + `--agent` escape hatch for custom servers
@@ -148,7 +149,8 @@ acpx codex --file - "extra context"            # explicit stdin + appended args
 acpx codex --no-wait 'draft test migration plan' # enqueue without waiting if session is busy
 acpx codex cancel                               # cooperative cancel of in-flight prompt
 acpx codex set-mode auto                        # session/set_mode (adapter-defined mode id)
-acpx codex set model 'gpt-5.2[high]'            # adapter-advertised model control
+acpx codex set model gpt-5.6-sol                # select the advertised base model
+acpx codex set reasoning_effort max             # set the advertised reasoning effort
 acpx exec 'summarize this repo'                # default agent shortcut (codex)
 acpx codex exec 'what does this repo do?'      # one-shot, no saved session
 
@@ -218,6 +220,7 @@ acpx flow run ./my-flow.ts --input-file ./flow-input.json
 acpx --timeout 1800 flow run ./my-flow.ts
 acpx --format quiet codex 'final recommendation only'
 acpx --suppress-reads codex exec 'show tool activity without dumping file bodies'
+acpx --no-fs codex exec 'read files without ACP client filesystem delegation'
 
 acpx --timeout 90 codex 'investigate intermittent test timeout'
 acpx --ttl 30 codex 'keep queue owner alive for quick follow-ups'
@@ -282,7 +285,7 @@ Supported keys:
   "timeout": null,
   "format": "text",
   "agents": {
-    "my-custom": { "command": "./bin/my-acp-server", "args": ["acp"] }
+    "my-custom": { "argv": ["./bin/my-acp-server", "acp"] }
   },
   "auth": {
     "my_auth_method_id": "credential-value"
@@ -291,6 +294,9 @@ Supported keys:
 ```
 
 Use `acpx config show` to inspect the resolved result and `acpx config init` to create the global template.
+Use structured `agents.<name>.argv` for custom launches; it is required on Windows. Legacy
+`command` plus `args` entries migrate when `command` is an unquoted executable with no whitespace,
+while raw command strings remain Unix-only.
 
 For ACP `authenticate` handshakes, use either config `auth` entries or explicit
 `ACPX_AUTH_<METHOD_ID>` environment variables such as `ACPX_AUTH_OPENAI_API_KEY`.
@@ -361,11 +367,13 @@ Built-ins:
 | `kilocode`   | `npx -y @kilocode/cli acp`                                                  | [Kilocode](https://kilocode.ai)                                                                                 |
 | `kimi`       | native (`kimi acp`)                                                         | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli)                                                              |
 | `kiro`       | native (`kiro-cli-chat acp`)                                                | [Kiro CLI](https://kiro.dev)                                                                                    |
-| `mux`        | `npx -y mux@^0.27.0 acp`                                                    | [Mux](https://mux.coder.com)                                                                                    |
+| `mux`        | `mux acp` via an ACPX-owned npm range                                       | [Mux](https://mux.coder.com)                                                                                    |
 | `opencode`   | `npx -y opencode-ai acp`                                                    | [OpenCode](https://opencode.ai)                                                                                 |
+| `pool`       | native (`pool acp`)                                                         | [Poolside](https://poolside.ai)                                                                                 |
 | `qoder`      | native (`qodercli --acp`)                                                   | [Qoder CLI](https://docs.qoder.com/cli/acp)                                                                     |
 | `qwen`       | native (`qwen --acp`)                                                       | [Qwen Code](https://github.com/QwenLM/qwen-code)                                                                |
 | `trae`       | native (`traecli acp serve`)                                                | [Trae CLI](https://docs.trae.cn/cli)                                                                            |
+| `zeroclaw`   | native (`zeroclaw acp`)                                                     | [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw)                                                           |
 
 `factory-droid` and `factorydroid` also resolve to the built-in `droid` adapter.
 

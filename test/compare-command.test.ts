@@ -171,8 +171,10 @@ class CompareAgent {
       return { stopReason: "end_turn" };
     }
 
-    const delay = mode === "slow" ? 1200 : 10;
-    await sleep(delay);
+    const delay = mode === "timeout-slow" ? 60_000 : mode === "slow" ? 1200 : 10;
+    if (mode !== "timeout-fast") {
+      await sleep(delay);
+    }
     await this.connection.sessionUpdate({
       sessionId: params.sessionId,
       update: {
@@ -221,6 +223,8 @@ async function writeCompareConfig(homeDir: string, agentPath: string): Promise<v
         agents: {
           fast: { command: process.execPath, args: [agentPath, "fast"] },
           slow: { command: process.execPath, args: [agentPath, "slow"] },
+          "timeout-fast": { command: process.execPath, args: [agentPath, "timeout-fast"] },
+          "timeout-slow": { command: process.execPath, args: [agentPath, "timeout-slow"] },
           error: { command: process.execPath, args: [agentPath, "error"] },
           permission: { command: process.execPath, args: [agentPath, "permission"] },
           "permission-mixed": { command: process.execPath, args: [agentPath, "permission-mixed"] },
@@ -335,15 +339,15 @@ test("compare timeout marks slow agents as cancelled", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await setupCompareFixture(homeDir);
     const result = await runCli(
-      ["compare", "fast", "slow", "--timeout", "0.5", "--json", "summarize"],
+      ["compare", "timeout-fast", "timeout-slow", "--timeout", "2", "--json", "summarize"],
       homeDir,
       cwd,
     );
 
     assert.equal(result.code, 3, result.stderr);
     const rows = JSON.parse(result.stdout) as CompareRow[];
-    assert.equal(rows.find((row) => row.agent === "fast")?.status, "ok");
-    assert.equal(rows.find((row) => row.agent === "slow")?.status, "cancelled");
+    assert.equal(rows.find((row) => row.agent === "timeout-fast")?.status, "ok");
+    assert.equal(rows.find((row) => row.agent === "timeout-slow")?.status, "cancelled");
   });
 });
 

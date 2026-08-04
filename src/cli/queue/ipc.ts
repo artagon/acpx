@@ -18,6 +18,7 @@ import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   ensureOwnerIsUsable,
+  isProcessAlive,
   type QueueOwnerRecord,
   readQueueOwnerRecord,
   terminateQueueOwnerForSession,
@@ -43,18 +44,26 @@ export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
 export {
   isProcessAlive,
+  readQueueOwnerRecord,
   releaseQueueOwnerLease,
   terminateProcess,
   terminateQueueOwnerForSession,
   tryAcquireQueueOwnerLease,
+  waitForQueueOwnerGenerationRelease,
   waitMs,
 } from "./lease-store.js";
 export type { QueueOwnerLease } from "./lease-store.js";
 
+export const QUEUE_OWNER_STARTUP_GRACE_MS = 10_000;
 const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
 ]);
+
+function queueOwnerIsWithinStartupGrace(owner: QueueOwnerRecord): boolean {
+  const createdAt = Date.parse(owner.createdAt);
+  return Number.isFinite(createdAt) && Date.now() - createdAt < QUEUE_OWNER_STARTUP_GRACE_MS;
+}
 
 async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
   sessionId: string;
@@ -71,9 +80,14 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
     return false;
   }
 
-  await terminateQueueOwnerForSession(params.sessionId).catch(() => {
-    // Preserve existing behavior if cleanup fails.
-  });
+  if (await ensureOwnerIsUsable(params.sessionId, params.owner)) {
+    return false;
+  }
+  try {
+    await terminateQueueOwnerForSession(params.sessionId);
+  } catch {
+    return false;
+  }
   incrementPerfCounter("queue.owner.stale_recovered");
 
   if (params.verbose) {
@@ -201,11 +215,12 @@ function parseQueueOwnerResponseLine(
 async function runQueueOwnerRequest<TResult>(options: {
   owner: QueueOwnerRecord;
   request: QueueRequest;
+  connectAttempts?: number;
   onAccepted?: (controls: QueueOwnerRequestControls<TResult>) => void;
   onMessage: (message: QueueOwnerMessage, controls: QueueOwnerRequestControls<TResult>) => void;
   onClose: (controls: QueueOwnerRequestControls<TResult>) => void;
 }): Promise<TResult | undefined> {
-  const socket = await connectToQueueOwner(options.owner);
+  const socket = await connectToQueueOwner(options.owner, options.connectAttempts);
   if (!socket) {
     return undefined;
   }
@@ -322,6 +337,8 @@ export type SubmitToQueueOwnerOptions = {
   waitForCompletion: boolean;
   verbose?: boolean;
   sessionOptions?: NonNullable<AcpClientOptions["sessionOptions"]>;
+  /** Use a single connection probe and treat lease-before-bind as a startup miss. */
+  startupProbe?: boolean;
   /** Fires when the queue owner acknowledges the request (IPC accept), before completion. */
   onQueueAccepted?: () => void;
 };
@@ -415,6 +432,7 @@ async function submitToQueueOwner(
   return await runQueueOwnerRequest<SessionSendOutcome>({
     owner,
     request,
+    connectAttempts: options.startupProbe && queueOwnerIsWithinStartupGrace(owner) ? 1 : undefined,
     onAccepted: ({ resolve }) => {
       options.onQueueAccepted?.();
       options.outputFormatter.setContext({
@@ -707,6 +725,23 @@ function assertQueueOwnerMcpConfigMatches(
   );
 }
 
+async function unavailableOwnerCountsAsMissing(
+  sessionId: string,
+  owner: QueueOwnerRecord,
+  startupProbe: boolean | undefined,
+): Promise<boolean> {
+  if (startupProbe) {
+    const latestOwner = await readQueueOwnerRecord(sessionId);
+    return (
+      !latestOwner ||
+      latestOwner.ownerGeneration !== owner.ownerGeneration ||
+      (queueOwnerIsWithinStartupGrace(latestOwner) && isProcessAlive(latestOwner.pid))
+    );
+  }
+  const health = await probeQueueOwnerHealth(sessionId);
+  return !health.hasLease;
+}
+
 export async function trySubmitToRunningOwner(
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
@@ -743,8 +778,7 @@ export async function trySubmitToRunningOwner(
     return submitted;
   }
 
-  const health = await probeQueueOwnerHealth(options.sessionId);
-  if (!health.hasLease) {
+  if (await unavailableOwnerCountsAsMissing(options.sessionId, owner, options.startupProbe)) {
     return undefined;
   }
 

@@ -9,6 +9,7 @@ Use these files for the other concerns:
 
 - [`README.md`](README.md) for user-facing install and usage
 - [`docs/CLI.md`](docs/CLI.md) for CLI reference
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for reusable benchmark guidance
 - [`VISION.md`](VISION.md) for product direction and boundaries
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) for PR expectations
 - [`skills/acpx/SKILL.md`](skills/acpx/SKILL.md) for agent-usage guidance
@@ -22,9 +23,9 @@ instead of expanding this file into a full technical spec.
 - npm: `https://www.npmjs.com/package/acpx`
 - Default branch: `main`
 - Runtime: Node.js `>=22.13.0`
-- Package manager: `pnpm@10.33.2`
+- Package manager: `pnpm@10.34.5`
 - Clean Node 22.13 setups can have stale Corepack signing keys; install pnpm
-  with `npm install -g pnpm@10.33.2` if `corepack prepare` fails.
+  with `npm install -g pnpm@10.34.5` if `corepack prepare` fails.
 
 ## Product Direction
 
@@ -171,6 +172,7 @@ Harness documentation synchronization policy:
 - `pnpm run mutate` — Stryker mutation check for the configured target
 - `pnpm run check` — format, typecheck, lint, build, and coverage tests
 - `pnpm run check:docs` — docs format and markdown lint
+- `pnpm run perf:benchmark` — compare already-built worktrees with paired measurements
 - `pnpm run perf:report` — performance reporting helper
 
 ## Testing And Changelog Guidelines

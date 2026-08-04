@@ -5,9 +5,14 @@ import path from "node:path";
 import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
+import { isLikelyMatchingProcess } from "../../process-command-match.js";
+import { terminateProcess } from "../../process-termination.js";
 import type { SessionRecord } from "../../types.js";
+import { createAtomicWriteTempPath } from "./atomic-write.js";
 import {
+  clearSessionIndexDirty,
   loadOrRebuildSessionIndex,
+  markSessionIndexDirty,
   rebuildSessionIndex,
   toSessionIndexEntry,
   writeSessionIndex,
@@ -15,6 +20,7 @@ import {
 } from "./index.js";
 import { parseSessionRecord } from "./parse.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
+import { withSessionWriteLock } from "./write-lock.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
 
@@ -85,23 +91,26 @@ function matchesSessionEntry(
 export async function writeSessionRecord(record: SessionRecord): Promise<void> {
   await measurePerf("session.write_record", async () => {
     await ensureSessionDir();
-
-    const persisted = serializeSessionRecordForDisk(record);
-    assertPersistedKeyPolicy(persisted);
-
-    const file = sessionFilePath(record.acpxRecordId);
-    const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
-    const payload = JSON.stringify(persisted, null, 2);
-    await fs.writeFile(tempFile, `${payload}\n`, "utf8");
-    await fs.rename(tempFile, file);
-
     const sessionDir = sessionBaseDir();
-    const index = await loadOrRebuildSessionIndex(sessionDir);
-    const fileName = path.basename(file);
-    const entries = index.entries.filter((entry) => entry.file !== fileName);
-    entries.push(toSessionIndexEntry(record, fileName));
-    const files = [...new Set([...index.files.filter((entry) => entry !== fileName), fileName])];
-    await writeSessionIndex(sessionDir, { files, entries });
+    await withSessionWriteLock(sessionDir, async () => {
+      const persisted = serializeSessionRecordForDisk(record);
+      assertPersistedKeyPolicy(persisted);
+
+      const file = sessionFilePath(record.acpxRecordId);
+      const tempFile = createAtomicWriteTempPath(file);
+      const payload = JSON.stringify(persisted, null, 2);
+      const index = await loadOrRebuildSessionIndex(sessionDir);
+      await markSessionIndexDirty(sessionDir);
+      await fs.writeFile(tempFile, `${payload}\n`, "utf8");
+      await fs.rename(tempFile, file);
+
+      const fileName = path.basename(file);
+      const entries = index.entries.filter((entry) => entry.file !== fileName);
+      entries.push(toSessionIndexEntry(record, fileName));
+      const files = [...new Set([...index.files.filter((entry) => entry !== fileName), fileName])];
+      await writeSessionIndex(sessionDir, { files, entries });
+      await clearSessionIndexDirty(sessionDir);
+    });
   });
 }
 
@@ -292,19 +301,6 @@ function nextWalkParent(
   return parent;
 }
 
-function killSignalCandidates(signal: NodeJS.Signals | undefined): NodeJS.Signals[] {
-  if (!signal) {
-    return ["SIGTERM", "SIGKILL"];
-  }
-
-  const normalized = signal.toUpperCase() as NodeJS.Signals;
-  if (normalized === "SIGKILL") {
-    return ["SIGKILL"];
-  }
-
-  return [normalized, "SIGKILL"];
-}
-
 export type PruneOptions = {
   agentCommand?: string;
   before?: Date;
@@ -333,6 +329,16 @@ function isSessionStreamFile(fileName: string, safeId: string): boolean {
 
 export async function pruneSessions(options: PruneOptions = {}): Promise<PruneResult> {
   await ensureSessionDir();
+  const sessionDir = sessionBaseDir();
+  return await withSessionWriteLock(sessionDir, async () => {
+    return await pruneSessionsWhileLocked(options, sessionDir);
+  });
+}
+
+async function pruneSessionsWhileLocked(
+  options: PruneOptions,
+  sessionDir: string,
+): Promise<PruneResult> {
   const entries = await loadSessionIndexEntries();
 
   const eligible = filterPruneCandidates(entries, options.agentCommand);
@@ -347,7 +353,6 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     return { pruned: records, bytesFreed: 0, dryRun: true };
   }
 
-  const sessionDir = sessionBaseDir();
   let bytesFreed = 0;
 
   // Read the directory once upfront so stream-file matching doesn't re-read
@@ -434,28 +439,26 @@ async function unlinkCountingBytes(filePath: string): Promise<number> {
 }
 
 export async function closeSession(id: string): Promise<SessionRecord> {
-  const record = await resolveSessionRecord(id);
-  const now = isoNow();
+  await ensureSessionDir();
+  const { record, pid, agentCommand } = await withSessionWriteLock(sessionBaseDir(), async () => {
+    const record = await resolveSessionRecord(id);
+    const pid = record.pid;
+    const agentCommand = record.agentCommand;
+    const now = isoNow();
 
-  if (record.pid) {
-    for (const signal of killSignalCandidates(record.lastAgentExitSignal ?? undefined)) {
-      try {
-        process.kill(record.pid, signal);
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  record.closed = true;
-  record.closedAt = now;
-  record.pid = undefined;
-  record.lastUsedAt = now;
-  record.lastPromptAt = record.lastPromptAt ?? now;
-
-  await writeSessionRecord(record);
-  await rebuildSessionIndex(sessionBaseDir()).catch(() => {
-    // best effort cache rebuild
+    record.closed = true;
+    record.closedAt = now;
+    record.pid = undefined;
+    record.lastUsedAt = now;
+    record.lastPromptAt = record.lastPromptAt ?? now;
+    await writeSessionRecord(record);
+    return { record, pid, agentCommand };
   });
+
+  if (pid) {
+    await terminateProcess(pid, undefined, async () => {
+      return await isLikelyMatchingProcess(pid, agentCommand);
+    });
+  }
   return record;
 }

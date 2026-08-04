@@ -1,23 +1,25 @@
-import { randomInt } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import fs from "node:fs/promises";
+import path from "node:path";
+import { readProcessIdentity } from "../../acp/process-tree.js";
 import { isProcessAlive } from "../../process-liveness.js";
+import { terminateProcess } from "../../process-termination.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir, queueSocketPath } from "./paths.js";
 
 export { isProcessAlive } from "../../process-liveness.js";
+export { terminateProcess } from "../../process-termination.js";
 
-// Budget for graceful SIGTERM shutdown of a queue-owner process.
-// The owner runs AcpClient.close() during shutdown:
-//   stdin-close grace (100 ms) + SIGTERM wait (1 500 ms) + SIGKILL wait (1 000 ms) = 2 600 ms worst case.
-// We add ~1 400 ms of headroom for event-loop latency and process startup overhead → 4 000 ms.
-// If the owner does not exit within this window we escalate to SIGKILL.
-const PROCESS_SIGTERM_GRACE_MS = 4_000;
-// After SIGKILL the OS terminates the process almost immediately; 1 500 ms is generous.
-const PROCESS_SIGKILL_GRACE_MS = 1_500;
-const PROCESS_POLL_MS = 50;
+const QUEUE_OWNER_CLEANUP_CLAIM_WAIT_MS = 1_000;
+const QUEUE_OWNER_CLEANUP_CLAIM_POLL_MS = 10;
 const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
+const QUEUE_OWNER_MALFORMED_LOCK_STALE_MS = QUEUE_OWNER_STALE_HEARTBEAT_MS;
+const QUEUE_OWNER_RELEASE_WAIT_MS = 6_500;
+const QUEUE_OWNER_RELEASE_POLL_MS = 50;
 
 export type QueueOwnerRecord = {
   pid: number;
+  processIdentity?: string;
   sessionId: string;
   socketPath: string;
   createdAt: string;
@@ -34,9 +36,18 @@ export type QueueOwnerLease = {
   socketPath: string;
   createdAt: string;
   ownerGeneration: number;
+  processIdentity?: string;
   mcpConfigPath?: string;
   mcpConfigFingerprint?: string;
 };
+
+type QueueOwnerLeaseState = {
+  pendingRefresh: Promise<void>;
+  released: boolean;
+  releasePromise?: Promise<void>;
+};
+
+const queueOwnerLeaseStates = new WeakMap<QueueOwnerLease, QueueOwnerLeaseState>();
 
 export type QueueOwnerStatus = {
   pid: number;
@@ -60,6 +71,9 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
 
   return {
     pid: record.pid,
+    ...(typeof record.processIdentity === "string"
+      ? { processIdentity: record.processIdentity }
+      : {}),
     sessionId: record.sessionId,
     socketPath: record.socketPath,
     createdAt: record.createdAt,
@@ -87,13 +101,22 @@ function hasValidQueueOwnerRecordFields(record: Record<string, unknown>): record
 } {
   return (
     isPositiveInteger(record.pid) &&
-    typeof record.sessionId === "string" &&
-    typeof record.socketPath === "string" &&
+    isOptionalNonEmptyString(record.processIdentity) &&
+    hasValidQueueOwnerSocket(record) &&
     typeof record.createdAt === "string" &&
     typeof record.heartbeatAt === "string" &&
     isPositiveInteger(record.ownerGeneration) &&
     isNonNegativeInteger(record.queueDepth)
   );
+}
+
+function hasValidQueueOwnerSocket(
+  record: Record<string, unknown>,
+): record is Record<string, unknown> & { sessionId: string; socketPath: string } {
+  if (typeof record.sessionId !== "string" || typeof record.socketPath !== "string") {
+    return false;
+  }
+  return record.socketPath === queueSocketPath(record.sessionId);
 }
 
 function isPositiveInteger(value: unknown): value is number {
@@ -102,6 +125,10 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isNonNegativeInteger(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) >= 0;
+}
+
+function isOptionalNonEmptyString(value: unknown): value is string | undefined {
+  return value === undefined || isNonEmptyString(value);
 }
 
 function createOwnerGeneration(): number {
@@ -159,51 +186,459 @@ async function removeSocketFile(socketPath: string): Promise<void> {
   }
 }
 
-async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + Math.max(0, timeoutMs);
-  while (Date.now() <= deadline) {
-    if (!isProcessAlive(pid)) {
-      return true;
-    }
-    await waitMs(PROCESS_POLL_MS);
-  }
-
-  return !isProcessAlive(pid);
-}
-
 async function cleanupStaleQueueOwner(
   sessionId: string,
   owner: QueueOwnerRecord | undefined,
-): Promise<void> {
+  expectedLockStat?: Stats,
+  revalidateStaleness = false,
+): Promise<boolean> {
   const lockPath = queueLockFilePath(sessionId);
-  const socketPath = owner?.socketPath ?? queueSocketPath(sessionId);
+  const claim = await claimQueueOwnerLockForCleanup(
+    lockPath,
+    owner?.ownerGeneration,
+    expectedLockStat,
+  );
+  if (!claim) {
+    return false;
+  }
 
+  try {
+    const claimedOwner = await resolveQueueOwnerForCleanup(lockPath, owner, revalidateStaleness);
+    if (claimedOwner === false) {
+      return false;
+    }
+    const socketPath = claimedOwner?.socketPath ?? queueSocketPath(sessionId);
+    if (!(await terminateClaimedQueueOwner(claimedOwner))) {
+      return false;
+    }
+    await removeClaimedQueueOwnerFiles(claim, socketPath, lockPath);
+    return true;
+  } finally {
+    await claim.release();
+  }
+}
+
+async function terminateClaimedQueueOwner(owner: QueueOwnerRecord | undefined): Promise<boolean> {
+  if (!owner || owner.pid === process.pid) {
+    return true;
+  }
+  const processState = await queueOwnerProcessState(owner);
+  if (processState === "dead" || processState === "mismatch" || processState === "legacy") {
+    return true;
+  }
+  if (processState === "unverified" || !owner.processIdentity) {
+    return false;
+  }
+  return await terminateProcess(owner.pid, owner.processIdentity);
+}
+
+async function resolveQueueOwnerForCleanup(
+  lockPath: string,
+  owner: QueueOwnerRecord | undefined,
+  revalidateStaleness: boolean,
+): Promise<QueueOwnerRecord | false | undefined> {
+  if (!revalidateStaleness || !owner) {
+    return owner;
+  }
+  const currentOwner = await readQueueOwnerRecordAtPath(lockPath);
+  if (currentOwner?.ownerGeneration !== owner.ownerGeneration) {
+    return false;
+  }
+  const processState = await queueOwnerProcessState(currentOwner);
+  return ownerShouldBePreserved(processState) ? false : currentOwner;
+}
+
+async function claimQueueOwnerLockForCleanup(
+  lockPath: string,
+  expectedGeneration?: number,
+  expectedStat?: Stats,
+): Promise<QueueOwnerLockClaim | undefined> {
+  const deadline = Date.now() + QUEUE_OWNER_CLEANUP_CLAIM_WAIT_MS;
+  do {
+    const claim = await claimQueueOwnerLock(lockPath, expectedGeneration, expectedStat);
+    if (claim) {
+      return claim;
+    }
+    await waitMs(QUEUE_OWNER_CLEANUP_CLAIM_POLL_MS);
+  } while (Date.now() < deadline);
+  return undefined;
+}
+
+async function removeClaimedQueueOwnerFiles(
+  claim: QueueOwnerLockClaim,
+  socketPath: string,
+  lockPath: string,
+): Promise<void> {
+  if (!(await claim.isHeld())) {
+    return;
+  }
   await removeSocketFile(socketPath).catch(() => {
     // ignore stale socket cleanup failures
   });
+  if (await claim.isHeld()) {
+    await unlinkIfPresent(lockPath);
+  }
+}
 
-  await fs.unlink(lockPath).catch((error) => {
+function queueOwnerLockTempPath(lockPath: string): string {
+  return `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+}
+
+async function writeQueueOwnerFileAtomically(
+  lockPath: string,
+  payload: string,
+  operation: "create" | "replace",
+): Promise<void> {
+  const tempPath = queueOwnerLockTempPath(lockPath);
+  try {
+    await fs.writeFile(tempPath, payload, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    if (operation === "create") {
+      await fs.link(tempPath, lockPath);
+    } else {
+      await fs.rename(tempPath, lockPath);
+    }
+  } finally {
+    await fs.rm(tempPath, { force: true }).catch(() => {
+      // best-effort cleanup after publication or a failed collision
+    });
+  }
+}
+
+async function staleMalformedQueueOwnerLockStat(lockPath: string): Promise<Stats | undefined> {
+  try {
+    const stat = await fs.lstat(lockPath);
+    return Date.now() - stat.mtimeMs > QUEUE_OWNER_MALFORMED_LOCK_STALE_MS ? stat : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function retireStaleQueueOwner(
+  sessionId: string,
+  owner: QueueOwnerRecord | undefined,
+): Promise<boolean> {
+  return await cleanupStaleQueueOwner(sessionId, owner, undefined, true);
+}
+
+export type QueueOwnerLockClaim = {
+  isHeld: () => Promise<boolean>;
+  release: () => Promise<void>;
+};
+
+type QueueOwnerLockClaimRecord = {
+  claimId: string;
+  pid: number;
+  processIdentity?: string;
+};
+
+let currentProcessIdentityPromise: Promise<string | undefined> | undefined;
+
+function queueOwnerLockClaimPath(lockPath: string, stat: Stats): string {
+  return `${lockPath}.claim-${stat.dev}-${stat.ino}`;
+}
+
+export async function claimQueueOwnerLock(
+  lockPath: string,
+  expectedGeneration?: number,
+  expectedStat?: Stats,
+): Promise<QueueOwnerLockClaim | undefined> {
+  const observedStat = expectedStat ?? (await lstatIfPresent(lockPath));
+  if (!observedStat) {
+    return undefined;
+  }
+  const claimPath = queueOwnerLockClaimPath(lockPath, observedStat);
+  const claimRecord = await currentQueueOwnerLockClaimRecord();
+  if (!(await createOrRecoverQueueOwnerLockClaim(claimPath, claimRecord))) {
+    return undefined;
+  }
+  const claim = {
+    isHeld: async (): Promise<boolean> => {
+      const current = await readQueueOwnerLockClaimRecord(claimPath);
+      return current?.claimId === claimRecord.claimId;
+    },
+    release: async (): Promise<void> => {
+      await releaseQueueOwnerLockClaim(claimPath, claimRecord.claimId);
+    },
+  };
+  if (!(await validateQueueOwnerLockClaim(lockPath, observedStat, expectedGeneration, claim))) {
+    return undefined;
+  }
+  return claim;
+}
+
+async function releaseQueueOwnerLockClaim(claimPath: string, claimId: string): Promise<void> {
+  if (await releaseQueueOwnerLockClaimAtPath(claimPath, claimId)) {
+    return;
+  }
+
+  const directory = path.dirname(claimPath);
+  const displacedPrefix = `${path.basename(claimPath)}.reap-`;
+  for (const entry of await readDirectoryIfPresent(directory)) {
+    if (entry.startsWith(displacedPrefix)) {
+      await releaseQueueOwnerLockClaimAtPath(path.join(directory, entry), claimId);
+    }
+  }
+
+  await releaseQueueOwnerLockClaimAtPath(claimPath, claimId);
+}
+
+async function releaseQueueOwnerLockClaimAtPath(
+  candidatePath: string,
+  claimId: string,
+): Promise<boolean> {
+  if ((await readQueueOwnerLockClaimRecord(candidatePath))?.claimId !== claimId) {
+    return false;
+  }
+  await unlinkIfPresent(candidatePath);
+  return true;
+}
+
+async function readDirectoryIfPresent(directory: string): Promise<string[]> {
+  return await fs.readdir(directory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  });
+}
+
+async function currentQueueOwnerLockClaimRecord(): Promise<QueueOwnerLockClaimRecord> {
+  currentProcessIdentityPromise ??= readProcessIdentity(process.pid);
+  return {
+    claimId: randomUUID(),
+    pid: process.pid,
+    processIdentity: await currentProcessIdentityPromise,
+  };
+}
+
+async function readCurrentProcessIdentity(): Promise<string | undefined> {
+  currentProcessIdentityPromise ??= readProcessIdentity(process.pid);
+  return await currentProcessIdentityPromise;
+}
+
+async function createOrRecoverQueueOwnerLockClaim(
+  claimPath: string,
+  claimRecord: QueueOwnerLockClaimRecord,
+): Promise<boolean> {
+  if (await tryCreateQueueOwnerLockClaim(claimPath, claimRecord)) {
+    return true;
+  }
+  if (!(await recoverStaleQueueOwnerLockClaim(claimPath))) {
+    return false;
+  }
+  return await tryCreateQueueOwnerLockClaim(claimPath, claimRecord);
+}
+
+async function tryCreateQueueOwnerLockClaim(
+  claimPath: string,
+  claimRecord: QueueOwnerLockClaimRecord,
+): Promise<boolean> {
+  try {
+    await fs.writeFile(claimPath, `${JSON.stringify(claimRecord)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST" || code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+  return true;
+}
+
+async function recoverStaleQueueOwnerLockClaim(claimPath: string): Promise<boolean> {
+  const observedStat = await lstatIfPresent(claimPath);
+  if (!observedStat || !(await queueOwnerLockClaimIsStale(claimPath, observedStat))) {
+    return false;
+  }
+
+  const quarantinePath = `${claimPath}.reap-${process.pid}-${randomUUID()}`;
+  try {
+    await fs.rename(claimPath, quarantinePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return true;
+    }
+    throw error;
+  }
+
+  const movedStat = await lstatIfPresent(quarantinePath);
+  if (!movedStat || !sameFileIdentity(observedStat, movedStat)) {
+    await restoreDisplacedQueueOwnerLockClaim(quarantinePath, claimPath);
+    return false;
+  }
+  if (!(await queueOwnerLockClaimIsStale(quarantinePath, movedStat))) {
+    await restoreDisplacedQueueOwnerLockClaim(quarantinePath, claimPath);
+    return false;
+  }
+  await unlinkIfPresent(quarantinePath);
+  return true;
+}
+
+async function restoreDisplacedQueueOwnerLockClaim(
+  quarantinePath: string,
+  claimPath: string,
+): Promise<void> {
+  try {
+    await fs.link(quarantinePath, claimPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return;
+    }
+    if (code !== "EEXIST") {
+      throw error;
+    }
+  }
+  await unlinkIfPresent(quarantinePath);
+}
+
+async function queueOwnerLockClaimIsStale(claimPath: string, stat: Stats): Promise<boolean> {
+  const claimRecord = await readQueueOwnerLockClaimRecord(claimPath);
+  if (!claimRecord) {
+    return Date.now() - stat.mtimeMs > QUEUE_OWNER_MALFORMED_LOCK_STALE_MS;
+  }
+  if (!claimantProcessIsAlive(claimRecord.pid)) {
+    return true;
+  }
+  if (!claimRecord.processIdentity) {
+    return Date.now() - stat.mtimeMs > QUEUE_OWNER_MALFORMED_LOCK_STALE_MS;
+  }
+  const currentIdentity = await readProcessIdentity(claimRecord.pid);
+  return currentIdentity !== undefined && currentIdentity !== claimRecord.processIdentity;
+}
+
+function claimantProcessIsAlive(pid: number): boolean {
+  return pid === process.pid || isProcessAlive(pid);
+}
+
+type QueueOwnerProcessState = "matching" | "legacy" | "dead" | "mismatch" | "unverified";
+
+async function queueOwnerProcessState(owner: QueueOwnerRecord): Promise<QueueOwnerProcessState> {
+  if (!claimantProcessIsAlive(owner.pid)) {
+    return "dead";
+  }
+  if (!owner.processIdentity) {
+    return "legacy";
+  }
+  const currentIdentity = await readProcessIdentity(owner.pid);
+  if (!currentIdentity) {
+    return "unverified";
+  }
+  return currentIdentity === owner.processIdentity ? "matching" : "mismatch";
+}
+
+function ownerMayStillBeUsable(processState: QueueOwnerProcessState): boolean {
+  // A live owner must remain available for its generation-checked socket
+  // handshake. Heartbeat age alone cannot make replacing its lease safe.
+  return processState === "matching" || processState === "legacy" || processState === "unverified";
+}
+
+function ownerShouldBePreserved(processState: QueueOwnerProcessState): boolean {
+  return ownerMayStillBeUsable(processState);
+}
+
+async function readQueueOwnerLockClaimRecord(
+  claimPath: string,
+): Promise<QueueOwnerLockClaimRecord | undefined> {
+  try {
+    const parsed: unknown = JSON.parse(await fs.readFile(claimPath, "utf8"));
+    return parseQueueOwnerLockClaimRecord(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseQueueOwnerLockClaimRecord(value: unknown): QueueOwnerLockClaimRecord | undefined {
+  if (!isQueueOwnerLockClaimRecord(value)) {
+    return undefined;
+  }
+  return {
+    claimId: value.claimId,
+    pid: value.pid,
+    processIdentity: value.processIdentity,
+  };
+}
+
+function isQueueOwnerLockClaimRecord(value: unknown): value is QueueOwnerLockClaimRecord {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    isNonEmptyString(candidate.claimId) &&
+    isPositiveInteger(candidate.pid) &&
+    isOptionalString(candidate.processIdentity)
+  );
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === "string";
+}
+
+async function validateQueueOwnerLockClaim(
+  lockPath: string,
+  observedStat: Stats,
+  expectedGeneration: number | undefined,
+  claim: QueueOwnerLockClaim,
+): Promise<boolean> {
+  let valid = false;
+  try {
+    const currentStat = await lstatIfPresent(lockPath);
+    valid = Boolean(currentStat && sameFileIdentity(observedStat, currentStat));
+    if (valid && expectedGeneration !== undefined) {
+      const claimedOwner = await readQueueOwnerRecordAtPath(lockPath);
+      valid = claimedOwner?.ownerGeneration === expectedGeneration;
+    }
+    return valid;
+  } finally {
+    if (!valid) {
+      await claim.release();
+    }
+  }
+}
+
+async function lstatIfPresent(filePath: string): Promise<Stats | undefined> {
+  try {
+    return await fs.lstat(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function sameFileIdentity(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function unlinkIfPresent(filePath: string): Promise<void> {
+  await fs.unlink(filePath).catch((error) => {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       throw error;
     }
   });
 }
 
-async function retireStaleQueueOwner(
-  sessionId: string,
-  owner: QueueOwnerRecord | undefined,
-): Promise<void> {
-  if (owner && isProcessAlive(owner.pid)) {
-    await terminateProcess(owner.pid);
-  }
-
-  await cleanupStaleQueueOwner(sessionId, owner);
-}
-
 export async function readQueueOwnerRecord(
   sessionId: string,
 ): Promise<QueueOwnerRecord | undefined> {
-  const lockPath = queueLockFilePath(sessionId);
+  return await readQueueOwnerRecordAtPath(queueLockFilePath(sessionId));
+}
+
+async function readQueueOwnerRecordAtPath(lockPath: string): Promise<QueueOwnerRecord | undefined> {
   try {
     const payload = await fs.readFile(lockPath, "utf8");
     const parsed = parseQueueOwnerRecord(JSON.parse(payload));
@@ -213,39 +648,16 @@ export async function readQueueOwnerRecord(
   }
 }
 
-export async function terminateProcess(pid: number): Promise<boolean> {
-  if (!isProcessAlive(pid)) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    return false;
-  }
-
-  if (await waitForProcessExit(pid, PROCESS_SIGTERM_GRACE_MS)) {
-    return true;
-  }
-
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    return false;
-  }
-
-  await waitForProcessExit(pid, PROCESS_SIGKILL_GRACE_MS);
-  return true;
-}
-
 export async function ensureOwnerIsUsable(
   sessionId: string,
   owner: QueueOwnerRecord,
 ): Promise<boolean> {
-  const alive = isProcessAlive(owner.pid);
-  const stale = isQueueOwnerHeartbeatStale(owner);
-  if (alive && !stale) {
+  const processState = await queueOwnerProcessState(owner);
+  if (ownerMayStillBeUsable(processState)) {
     return true;
+  }
+  if (ownerShouldBePreserved(processState)) {
+    return false;
   }
 
   await retireStaleQueueOwner(sessionId, owner);
@@ -291,44 +703,67 @@ export async function tryAcquireQueueOwnerLease(
   const mcpConfigFingerprint = readMcpConfigFingerprint(mcpConfigOrNowIsoFactory);
   const mcpConfigMetadata = createMcpConfigMetadata(mcpConfigPath, mcpConfigFingerprint);
   await ensureQueueDir();
+  const processIdentity = await readCurrentProcessIdentity();
   const lockPath = queueLockFilePath(sessionId);
   const socketPath = queueSocketPath(sessionId);
-  const createdAt = clock();
+  let createdAt = clock();
   const ownerGeneration = createOwnerGeneration();
-  const payload = JSON.stringify(
-    {
-      pid: process.pid,
-      sessionId,
-      socketPath,
-      createdAt,
-      heartbeatAt: createdAt,
-      ownerGeneration,
-      queueDepth: 0,
-      ...mcpConfigMetadata,
-    },
-    null,
-    2,
-  );
+  const buildPayload = () =>
+    JSON.stringify(
+      {
+        pid: process.pid,
+        ...(processIdentity ? { processIdentity } : {}),
+        sessionId,
+        socketPath,
+        createdAt,
+        heartbeatAt: createdAt,
+        ownerGeneration,
+        queueDepth: 0,
+        ...mcpConfigMetadata,
+      },
+      null,
+      2,
+    );
+  let payload = buildPayload();
 
+  let acquired = false;
   try {
-    await fs.writeFile(lockPath, `${payload}\n`, {
-      encoding: "utf8",
-      flag: "wx",
-    });
-    await removeSocketFile(socketPath).catch(() => {
-      // best-effort stale socket cleanup after ownership is acquired
-    });
-    return {
-      sessionId,
-      lockPath,
-      socketPath,
-      createdAt,
-      ownerGeneration,
-      ...mcpConfigMetadata,
-    };
+    await writeQueueOwnerFileAtomically(lockPath, `${payload}\n`, "create");
+    acquired = true;
   } catch (error) {
-    return await handleLeaseCollision(sessionId, error);
+    if (!(await handleLeaseCollision(sessionId, error))) {
+      return undefined;
+    }
   }
+  if (!acquired) {
+    createdAt = clock();
+    payload = buildPayload();
+    try {
+      await writeQueueOwnerFileAtomically(lockPath, `${payload}\n`, "create");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+  await removeSocketFile(socketPath).catch(() => {
+    // best-effort stale socket cleanup after ownership is acquired
+  });
+  const lease = {
+    sessionId,
+    lockPath,
+    socketPath,
+    createdAt,
+    ownerGeneration,
+    ...(processIdentity ? { processIdentity } : {}),
+    ...mcpConfigMetadata,
+  };
+  queueOwnerLeaseStates.set(lease, {
+    pendingRefresh: Promise.resolve(),
+    released: false,
+  });
+  return lease;
 }
 
 function readMcpConfigFingerprint(
@@ -356,21 +791,25 @@ function createMcpConfigMetadata(
   };
 }
 
-async function handleLeaseCollision(sessionId: string, error: unknown): Promise<undefined> {
+async function handleLeaseCollision(sessionId: string, error: unknown): Promise<boolean> {
   if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
     throw error;
   }
 
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
-    await cleanupStaleQueueOwner(sessionId, owner);
-    return undefined;
+    const lockPath = queueLockFilePath(sessionId);
+    const staleLockStat = await staleMalformedQueueOwnerLockStat(lockPath);
+    if (staleLockStat) {
+      return await cleanupStaleQueueOwner(sessionId, owner, staleLockStat);
+    }
+    return false;
   }
 
-  if (!isProcessAlive(owner.pid) || isQueueOwnerHeartbeatStale(owner)) {
-    await retireStaleQueueOwner(sessionId, owner);
+  if (ownerShouldBePreserved(await queueOwnerProcessState(owner))) {
+    return false;
   }
-  return undefined;
+  return await retireStaleQueueOwner(sessionId, owner);
 }
 
 function resolveLeaseArguments(
@@ -403,36 +842,124 @@ export async function refreshQueueOwnerLease(
   },
   nowIsoFactory: () => string = nowIso,
 ): Promise<void> {
-  const payload = JSON.stringify(
-    {
-      pid: process.pid,
-      sessionId: lease.sessionId,
-      socketPath: lease.socketPath,
-      createdAt: lease.createdAt,
-      heartbeatAt: nowIsoFactory(),
-      ownerGeneration: lease.ownerGeneration,
-      queueDepth: Math.max(0, Math.round(options.queueDepth)),
-      ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
-      ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
-    },
-    null,
-    2,
-  );
-  await fs.writeFile(lease.lockPath, `${payload}\n`, {
-    encoding: "utf8",
+  const state = queueOwnerLeaseState(lease);
+  if (state.released) {
+    return;
+  }
+  const refresh = state.pendingRefresh.then(async () => {
+    if (state.released) {
+      return;
+    }
+    const claim = await claimQueueOwnerLock(lease.lockPath, lease.ownerGeneration);
+    if (!claim) {
+      return;
+    }
+    const payload = JSON.stringify(
+      {
+        pid: process.pid,
+        ...(lease.processIdentity ? { processIdentity: lease.processIdentity } : {}),
+        sessionId: lease.sessionId,
+        socketPath: lease.socketPath,
+        createdAt: lease.createdAt,
+        heartbeatAt: nowIsoFactory(),
+        ownerGeneration: lease.ownerGeneration,
+        queueDepth: Math.max(0, Math.round(options.queueDepth)),
+        ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
+        ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
+      },
+      null,
+      2,
+    );
+    try {
+      if (!(await claim.isHeld())) {
+        return;
+      }
+      await writeQueueOwnerFileAtomically(lease.lockPath, `${payload}\n`, "replace");
+    } finally {
+      await claim.release();
+    }
   });
+  state.pendingRefresh = refresh.catch(() => {
+    // Keep the serialization chain usable after a best-effort refresh failure.
+  });
+  await refresh;
 }
 
 export async function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<void> {
-  await removeSocketFile(lease.socketPath).catch(() => {
-    // ignore best-effort cleanup failures
-  });
-
-  await fs.unlink(lease.lockPath).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
+  const state = queueOwnerLeaseState(lease);
+  if (!state.releasePromise) {
+    state.released = true;
+    state.releasePromise = (async () => {
+      await state.pendingRefresh;
+      const claim = await claimQueueOwnerLockForCleanup(lease.lockPath, lease.ownerGeneration);
+      if (!claim) {
+        const currentOwner = await readQueueOwnerRecordAtPath(lease.lockPath);
+        if (!currentOwner || currentOwner.ownerGeneration !== lease.ownerGeneration) {
+          return;
+        }
+        if (await queueOwnerLockHasLiveExternalClaimant(lease.lockPath)) {
+          return;
+        }
+        throw new Error(
+          `Queue owner lease release is busy for session ${lease.sessionId}; retry cleanup`,
+        );
+      }
+      try {
+        if (!(await claim.isHeld())) {
+          return;
+        }
+        await removeSocketFile(lease.socketPath).catch(() => {
+          // ignore best-effort cleanup failures
+        });
+        if (!(await claim.isHeld())) {
+          return;
+        }
+        await unlinkIfPresent(lease.lockPath);
+      } finally {
+        await claim.release();
+      }
+    })();
+  }
+  const releasePromise = state.releasePromise;
+  try {
+    await releasePromise;
+  } catch (error) {
+    if (state.releasePromise === releasePromise) {
+      state.releasePromise = undefined;
+      state.released = false;
     }
-  });
+    throw error;
+  }
+}
+
+async function queueOwnerLockHasLiveExternalClaimant(lockPath: string): Promise<boolean> {
+  const lockStat = await lstatIfPresent(lockPath);
+  if (!lockStat) {
+    return false;
+  }
+  const claimPath = queueOwnerLockClaimPath(lockPath, lockStat);
+  const claimStat = await lstatIfPresent(claimPath);
+  if (!claimStat) {
+    return false;
+  }
+  const claimRecord = await readQueueOwnerLockClaimRecord(claimPath);
+  return Boolean(
+    claimRecord &&
+    claimRecord.pid !== process.pid &&
+    !(await queueOwnerLockClaimIsStale(claimPath, claimStat)),
+  );
+}
+
+function queueOwnerLeaseState(lease: QueueOwnerLease): QueueOwnerLeaseState {
+  let state = queueOwnerLeaseStates.get(lease);
+  if (!state) {
+    state = {
+      pendingRefresh: Promise.resolve(),
+      released: false,
+    };
+    queueOwnerLeaseStates.set(lease, state);
+  }
+  return state;
 }
 
 export async function terminateQueueOwnerForSession(sessionId: string): Promise<void> {
@@ -441,11 +968,29 @@ export async function terminateQueueOwnerForSession(sessionId: string): Promise<
     return;
   }
 
-  if (isProcessAlive(owner.pid)) {
-    await terminateProcess(owner.pid);
+  if (!(await cleanupStaleQueueOwner(sessionId, owner))) {
+    if (!(await readQueueOwnerRecord(sessionId))) {
+      return;
+    }
+    throw new Error(`Queue owner cleanup is busy for session ${sessionId}; retry the operation`);
   }
+}
 
-  await cleanupStaleQueueOwner(sessionId, owner);
+export async function waitForQueueOwnerGenerationRelease(
+  sessionId: string,
+  ownerGeneration: number,
+  timeoutMs = QUEUE_OWNER_RELEASE_WAIT_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() <= deadline) {
+    const owner = await readQueueOwnerRecord(sessionId);
+    if (!owner || owner.ownerGeneration !== ownerGeneration) {
+      return true;
+    }
+    await waitMs(QUEUE_OWNER_RELEASE_POLL_MS);
+  }
+  const owner = await readQueueOwnerRecord(sessionId);
+  return !owner || owner.ownerGeneration !== ownerGeneration;
 }
 
 export async function waitMs(ms: number): Promise<void> {

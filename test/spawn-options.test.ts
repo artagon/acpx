@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,8 +11,10 @@ import { buildAgentSpawnOptions, buildSpawnCommandOptions } from "../src/acp/cli
 import { buildTerminalSpawnOptions } from "../src/acp/terminal-manager.js";
 import { buildQueueOwnerSpawnOptions } from "../src/cli/session/queue-owner-process.js";
 import {
+  buildAgentSpawnCommand,
   buildTerminalShellSpawnCommand,
   buildTerminalSpawnCommand,
+  resolveWindowsCommand,
   resolveWindowsExecutablePath,
 } from "../src/spawn-command-options.js";
 
@@ -111,6 +114,11 @@ test("buildAgentSpawnOptions hides Windows console windows and preserves auth en
   });
 
   assert.equal(options.cwd, "/tmp/acpx-agent");
+  assert.equal(
+    (options as { detached?: boolean }).detached,
+    true,
+    "agent wrappers must lead an owned process group/tree for descendant cleanup",
+  );
   assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe"]);
   assert.equal(options.windowsHide, true);
   assert.equal(options.env.ACPX_AUTH_TOKEN, "secret-token");
@@ -260,6 +268,211 @@ test("buildSpawnCommandOptions enables shell for .cmd/.bat on Windows", () => {
   assert.equal(cmdOptions.windowsHide, true);
 });
 
+test("buildAgentSpawnCommand preserves argv boundaries through cmd.exe", () => {
+  const command = buildAgentSpawnCommand(
+    "C:\\Program Files\\agent.cmd",
+    ["with spaces", "a&b", "C:\\trailing\\"],
+    "win32",
+    { COMSPEC: "C:\\Windows\\System32\\cmd.exe" },
+  );
+
+  assert.deepEqual(command, {
+    command: "C:\\Windows\\System32\\cmd.exe",
+    args: [
+      "/d",
+      "/s",
+      "/c",
+      '"C:\\Program^ Files\\agent.cmd ^"with^ spaces^" ^"a^&b^" ^"C:\\trailing\\\\^""',
+    ],
+    windowsVerbatimArguments: true,
+  });
+});
+
+test("buildAgentSpawnCommand normalizes forward-slash batch paths for cmd.exe", () => {
+  const command = buildAgentSpawnCommand(
+    "C:/tools/agent.cmd",
+    ["--profile", "with spaces"],
+    "win32",
+    {},
+  );
+
+  assert.deepEqual(command, {
+    command: "cmd.exe",
+    args: ["/d", "/s", "/c", '"C:\\tools\\agent.cmd ^"--profile^" ^"with^ spaces^""'],
+    windowsVerbatimArguments: true,
+  });
+});
+
+test("buildAgentSpawnCommand pins PATH executables instead of task-directory shims", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-windows-agent-spawn-"));
+  const cwd = path.join(root, "cwd");
+  const bin = path.join(root, "bin");
+  try {
+    await fs.mkdir(cwd);
+    await fs.mkdir(bin);
+    await fs.writeFile(path.join(cwd, "copilot.cmd"), "@echo off\r\n");
+    const executable = path.join(bin, "copilot.exe");
+    await fs.writeFile(executable, "");
+    const command = buildAgentSpawnCommand(
+      "copilot",
+      ["--acp", "--stdio"],
+      "win32",
+      { PATH: bin, PATHEXT: ".EXE;.CMD" },
+      cwd,
+    );
+
+    assert.deepEqual(command, {
+      command: executable,
+      args: ["--acp", "--stdio"],
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("buildAgentSpawnCommand matches Node's Windows env-key collision ordering", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-windows-agent-spawn-"));
+  const inheritedBin = path.join(root, "inherited");
+  const overrideBin = path.join(root, "override");
+  try {
+    await fs.mkdir(inheritedBin);
+    await fs.mkdir(overrideBin);
+    await fs.writeFile(path.join(inheritedBin, "copilot.exe"), "");
+    const overrideExecutable = path.join(overrideBin, "copilot.exe");
+    await fs.writeFile(overrideExecutable, "");
+    const command = buildAgentSpawnCommand(
+      "copilot",
+      ["--acp", "--stdio"],
+      "win32",
+      { Path: inheritedBin, PATH: overrideBin, PATHEXT: ".EXE" },
+      root,
+    );
+
+    assert.deepEqual(command, {
+      command: overrideExecutable,
+      args: ["--acp", "--stdio"],
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("buildAgentSpawnCommand skips unsupported implicit PATHEXT scripts", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-windows-agent-spawn-"));
+  const scripts = path.join(root, "scripts");
+  const bin = path.join(root, "bin");
+  try {
+    await fs.mkdir(scripts);
+    await fs.mkdir(bin);
+    await fs.writeFile(path.join(scripts, "copilot.ps1"), "exit 0\n");
+    const executable = path.join(bin, "copilot.exe");
+    await fs.writeFile(executable, "");
+    const command = buildAgentSpawnCommand(
+      "copilot",
+      ["--acp", "--stdio"],
+      "win32",
+      { PATH: `${scripts};${bin}`, PATHEXT: ".PS1;.EXE" },
+      root,
+    );
+
+    assert.deepEqual(command, {
+      command: executable,
+      args: ["--acp", "--stdio"],
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows root-relative PATH entries inherit the child cwd drive", (t) => {
+  const expected = "D:\\tools\\copilot.exe";
+  t.mock.method(path, "isAbsolute", path.win32.isAbsolute);
+  t.mock.method(path, "resolve", path.win32.resolve);
+  t.mock.method(path, "join", path.win32.join);
+  t.mock.method(fsSync, "statSync", (candidate: Parameters<typeof fsSync.statSync>[0]) => {
+    return {
+      isFile: () => String(candidate).toLowerCase() === expected.toLowerCase(),
+    } as never;
+  });
+
+  assert.equal(
+    resolveWindowsCommand("copilot", { PATH: "\\tools", PATHEXT: ".EXE" }, "D:\\workspace", false),
+    expected,
+  );
+});
+
+test("Windows PATH parsing preserves semicolons inside quoted entries", (t) => {
+  const expected = "C:\\SDK;v2\\bin\\copilot.exe";
+  const visited: string[] = [];
+  t.mock.method(path, "isAbsolute", path.win32.isAbsolute);
+  t.mock.method(path, "resolve", path.win32.resolve);
+  t.mock.method(path, "join", path.win32.join);
+  t.mock.method(fsSync, "statSync", (candidate: Parameters<typeof fsSync.statSync>[0]) => {
+    visited.push(String(candidate));
+    return {
+      isFile: () => String(candidate).toLowerCase() === expected.toLowerCase(),
+    } as never;
+  });
+
+  assert.equal(
+    resolveWindowsCommand(
+      "copilot",
+      { PATH: '"C:\\SDK;v2\\bin";C:\\fallback', PATHEXT: ".EXE" },
+      "C:\\workspace",
+      false,
+    ),
+    expected,
+  );
+  assert.equal(visited[0], expected);
+});
+
+test("Windows PATH parsing supports single-quoted entries", (t) => {
+  const expected = "C:\\SDK;v2\\bin\\copilot.exe";
+  t.mock.method(path, "isAbsolute", path.win32.isAbsolute);
+  t.mock.method(path, "resolve", path.win32.resolve);
+  t.mock.method(path, "join", path.win32.join);
+  t.mock.method(fsSync, "statSync", (candidate: Parameters<typeof fsSync.statSync>[0]) => {
+    return {
+      isFile: () => String(candidate).toLowerCase() === expected.toLowerCase(),
+    } as never;
+  });
+
+  assert.equal(
+    resolveWindowsCommand(
+      "copilot",
+      { PATH: "'C:\\SDK;v2\\bin';C:\\fallback", PATHEXT: ".EXE" },
+      "C:\\workspace",
+      false,
+    ),
+    expected,
+  );
+});
+
+test("Windows PATH parsing preserves whitespace in unquoted entries", (t) => {
+  const incorrectlyTrimmed = "C:\\first\\copilot.exe";
+  const expected = "C:\\second\\copilot.exe";
+  t.mock.method(path, "isAbsolute", path.win32.isAbsolute);
+  t.mock.method(path, "resolve", path.win32.resolve);
+  t.mock.method(path, "join", path.win32.join);
+  t.mock.method(fsSync, "statSync", (candidate: Parameters<typeof fsSync.statSync>[0]) => {
+    const normalized = String(candidate).toLowerCase();
+    return {
+      isFile: () =>
+        normalized === incorrectlyTrimmed.toLowerCase() || normalized === expected.toLowerCase(),
+    } as never;
+  });
+
+  assert.equal(
+    resolveWindowsCommand(
+      "copilot",
+      { PATH: " C:\\first;C:\\second", PATHEXT: ".EXE" },
+      "C:\\workspace",
+      false,
+    ),
+    expected,
+  );
+});
+
 test("buildSpawnCommandOptions enables shell for PATH-resolved .cmd wrappers on Windows", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-windows-spawn-"));
   const env = {
@@ -311,17 +524,17 @@ test("buildTerminalSpawnCommand preserves explicit argv", () => {
   assert.deepEqual(buildTerminalSpawnCommand("node", ["-e", "console.log('ok')"]), {
     command: "node",
     args: ["-e", "console.log('ok')"],
-    killProcessGroup: false,
+    killProcessGroup: true,
   });
   assert.deepEqual(buildTerminalSpawnCommand("/tmp/tool with space", []), {
     command: "/tmp/tool with space",
     args: [],
-    killProcessGroup: false,
+    killProcessGroup: true,
   });
   assert.deepEqual(buildTerminalSpawnCommand("/tmp/tool with space", undefined), {
     command: "/tmp/tool with space",
     args: [],
-    killProcessGroup: false,
+    killProcessGroup: true,
   });
 });
 
@@ -469,6 +682,58 @@ test("buildTerminalSpawnOptions enables shell for PATH-resolved .cmd wrappers on
   }
 });
 
+test("buildSpawnCommandOptions resolves batch wrappers from the child working directory", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-windows-spawn-cwd-"));
+  try {
+    await fs.writeFile(path.join(cwd, "copilot.cmd"), "@echo off\r\n");
+    const env = { PATH: "", PATHEXT: ".EXE;.CMD" } as NodeJS.ProcessEnv;
+    const options = buildSpawnCommandOptions("copilot", { cwd, env, stdio: "pipe" }, "win32", env);
+
+    assert.equal(options.shell, true);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("buildSpawnCommandOptions honors the Windows current-directory search opt-out", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-windows-spawn-cwd-"));
+  const cwd = path.join(root, "cwd");
+  const bin = path.join(root, "bin");
+  try {
+    await fs.mkdir(cwd);
+    await fs.mkdir(bin);
+    await fs.writeFile(path.join(cwd, "copilot.cmd"), "@echo off\r\n");
+    await fs.writeFile(path.join(bin, "copilot.exe"), "");
+    const env = {
+      PATH: bin,
+      PATHEXT: ".EXE;.CMD",
+      NoDefaultCurrentDirectoryInExePath: "1",
+    } as NodeJS.ProcessEnv;
+    const options = buildSpawnCommandOptions("copilot", { cwd, env, stdio: "pipe" }, "win32", env);
+
+    assert.equal(options.shell, undefined);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("buildSpawnCommandOptions ignores undefined Windows current-directory opt-outs", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-windows-spawn-cwd-"));
+  try {
+    await fs.writeFile(path.join(cwd, "copilot.cmd"), "@echo off\r\n");
+    const env = {
+      PATH: "",
+      PATHEXT: ".EXE;.CMD",
+      NoDefaultCurrentDirectoryInExePath: undefined,
+    } as NodeJS.ProcessEnv;
+    const options = buildSpawnCommandOptions("copilot", { cwd, env, stdio: "pipe" }, "win32", env);
+
+    assert.equal(options.shell, true);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("buildTerminalSpawnOptions keeps shell disabled for non-batch commands", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-windows-spawn-"));
 
@@ -536,6 +801,68 @@ test("resolveClaudeCodeExecutable prefers a native sibling when PATH ordering fi
   }
 });
 
+test("resolveWindowsExecutablePath preserves PATHEXT precedence for native .com files", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-claude-native-"));
+  try {
+    const comExecutable = path.join(tempDir, "claude.com");
+    await fs.writeFile(comExecutable, "");
+    await fs.writeFile(path.join(tempDir, "claude.exe"), "");
+    const env = {
+      PATH: tempDir,
+      PATHEXT: ".COM;.EXE",
+    } as NodeJS.ProcessEnv;
+
+    assert.equal(resolveWindowsExecutablePath("claude", env), comExecutable);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveWindowsExecutablePath stops after the first native executable", (t) => {
+  const expected = "C:\\fast\\claude.exe";
+  const visited: string[] = [];
+  t.mock.method(path, "isAbsolute", path.win32.isAbsolute);
+  t.mock.method(path, "resolve", path.win32.resolve);
+  t.mock.method(path, "join", path.win32.join);
+  t.mock.method(fsSync, "statSync", (candidate: Parameters<typeof fsSync.statSync>[0]) => {
+    visited.push(String(candidate));
+    return { isFile: () => true } as never;
+  });
+
+  assert.equal(
+    resolveWindowsExecutablePath(
+      "claude",
+      { PATH: "C:\\fast;\\\\slow\\share", PATHEXT: ".EXE" },
+      "C:\\workspace",
+    ),
+    expected,
+  );
+  assert.deepEqual(visited, [expected]);
+});
+
+test("resolveWindowsExecutablePath does not cross installs after an unresolved first shim", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-claude-install-order-"));
+  const first = path.join(root, "first");
+  const second = path.join(root, "second");
+  try {
+    await fs.mkdir(first);
+    await fs.mkdir(second);
+    await fs.writeFile(path.join(first, "claude.cmd"), '@echo off\r\nnode "%~dp0cli.js" %*\r\n');
+    await fs.writeFile(path.join(second, "claude.exe"), "");
+
+    assert.equal(
+      resolveWindowsExecutablePath(
+        "claude",
+        { PATH: `${first};${second}`, PATHEXT: ".CMD;.EXE" },
+        root,
+      ),
+      undefined,
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("resolveWindowsExecutablePath follows a wrapper to a native entrypoint", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-claude-shim-"));
   try {
@@ -550,6 +877,23 @@ test("resolveWindowsExecutablePath follows a wrapper to a native entrypoint", as
     const env = {
       PATH: tempDir,
       PATHEXT: ".CMD;.EXE;.BAT;.PS1",
+    } as NodeJS.ProcessEnv;
+
+    assert.equal(resolveWindowsExecutablePath("claude", env), executable);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveWindowsExecutablePath preserves PowerShell shims with native siblings", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-claude-shim-"));
+  try {
+    await fs.writeFile(path.join(tempDir, "claude.ps1"), "exit 0\n");
+    const executable = path.join(tempDir, "claude.exe");
+    await fs.writeFile(executable, "");
+    const env = {
+      PATH: tempDir,
+      PATHEXT: ".PS1",
     } as NodeJS.ProcessEnv;
 
     assert.equal(resolveWindowsExecutablePath("claude", env), executable);

@@ -759,6 +759,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     options.client ??
     new AcpClient({
       agentCommand: record.agentCommand,
+      agentArgv: record.agentArgv,
       cwd: absolutePath(record.cwd),
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode,
@@ -766,6 +767,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       permissionPolicy: options.permissionPolicy,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
+      fs: options.fs,
       terminal: options.terminal,
       suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
       verbose: options.verbose,
@@ -775,6 +777,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,
     permissionPolicy: options.permissionPolicy,
+    fs: options.fs,
     terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
@@ -1104,6 +1107,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
   const acpErrors = new AcpErrorTracker();
   const client = new AcpClient({
     agentCommand: options.agentCommand,
+    agentArgv: options.agentArgv,
     cwd: absolutePath(options.cwd),
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
@@ -1111,6 +1115,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
     permissionPolicy: options.permissionPolicy,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    fs: options.fs,
     terminal: options.terminal,
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
@@ -1223,6 +1228,7 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
     permissionPolicy: options.permissionPolicy,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    fs: options.fs,
     terminal: options.terminal,
     outputFormatter: options.outputFormatter,
     errorEmissionPolicy: options.errorEmissionPolicy,

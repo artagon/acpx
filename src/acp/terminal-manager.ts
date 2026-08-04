@@ -24,15 +24,23 @@ import {
   type TerminalSpawnCommand,
 } from "../spawn-command-options.js";
 import type { ClientOperation, NonInteractivePermissionPolicy, PermissionMode } from "../types.js";
+import {
+  beginProcessTreeTracking,
+  captureProcessTreePids,
+  createManagedProcessTree,
+  rememberProcessTreePids,
+  signalProcessTree,
+  waitForProcessTreeExit,
+  type ManagedProcessTree,
+} from "./process-tree.js";
 
 const DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_KILL_GRACE_MS = 1_500;
+const TERMINAL_OUTPUT_DRAIN_GRACE_MS = 50;
 
 type ManagedTerminal = {
   process: ChildProcessByStdio<null, Readable, Readable>;
-  killProcessGroup: boolean;
-  descendantPids: Set<number>;
-  processGroupSnapshotPromise?: Promise<void>;
+  processTree: ManagedProcessTree;
   output: Buffer;
   truncated: boolean;
   outputByteLimit: number;
@@ -147,12 +155,6 @@ function canPromptForPermission(): boolean {
   return process.stdin.isTTY && process.stderr.isTTY;
 }
 
-function waitMs(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, Math.max(0, ms));
-  });
-}
-
 export class TerminalManager {
   private readonly cwd: string;
   private permissionMode: PermissionMode;
@@ -201,6 +203,7 @@ export class TerminalManager {
         0,
         Math.round(params.outputByteLimit ?? DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES),
       );
+      const rootCreatedAfterMs = Date.now();
       const { proc, spawnCommand } = await spawnTerminalProcess(params, this.cwd);
 
       let resolveExit: (response: WaitForTerminalExitResponse) => void = () => {};
@@ -210,8 +213,12 @@ export class TerminalManager {
 
       const terminal: ManagedTerminal = {
         process: proc,
-        killProcessGroup: spawnCommand.killProcessGroup,
-        descendantPids: new Set(),
+        processTree: createManagedProcessTree(
+          proc.pid,
+          spawnCommand.killProcessGroup,
+          process.platform,
+          rootCreatedAfterMs,
+        ),
         output: Buffer.alloc(0),
         truncated: false,
         outputByteLimit,
@@ -220,6 +227,10 @@ export class TerminalManager {
         exitPromise,
         resolveExit,
       };
+      beginProcessTreeTracking(
+        terminal.processTree,
+        () => proc.exitCode === null && proc.signalCode === null,
+      );
 
       const appendOutput = (chunk: Buffer | string): void => {
         const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -236,12 +247,19 @@ export class TerminalManager {
 
       proc.stdout.on("data", appendOutput);
       proc.stderr.on("data", appendOutput);
+      const outputDrained = Promise.all([
+        waitForReadableCompletion(proc.stdout),
+        waitForReadableCompletion(proc.stderr),
+      ]).then(() => {});
       proc.once("exit", (exitCode, signal) => {
         terminal.exitCode = exitCode;
         terminal.signal = signal;
-        terminal.processGroupSnapshotPromise = rememberProcessGroupPids(terminal);
+        rememberProcessTreePids(terminal.processTree);
         void (async () => {
-          await terminal.processGroupSnapshotPromise;
+          await Promise.all([
+            captureProcessTreePids(terminal.processTree, false),
+            waitForTerminalOutputDrain(outputDrained),
+          ]);
           terminal.resolveExit({
             exitCode: exitCode ?? null,
             signal: signal ?? null,
@@ -440,100 +458,66 @@ export class TerminalManager {
   }
 
   private async killProcess(terminal: ManagedTerminal): Promise<void> {
-    if (!this.isRunning(terminal) && !terminal.killProcessGroup) {
+    if (!this.isRunning(terminal) && !terminal.processTree.killProcessGroup) {
       return;
     }
 
     try {
-      await this.signalProcess(terminal, "SIGTERM");
+      await signalProcessTree(terminal.processTree, () => this.isRunning(terminal), "SIGTERM");
     } catch {
       return;
     }
 
     const exitedAfterTerm = await this.waitForCleanupAfterSignal(terminal);
-    if (exitedAfterTerm && !terminal.killProcessGroup) {
+    if (exitedAfterTerm) {
       return;
     }
 
     try {
-      await this.signalProcess(terminal, "SIGKILL");
+      await signalProcessTree(terminal.processTree, () => this.isRunning(terminal), "SIGKILL");
     } catch {
       return;
     }
 
-    await this.waitForCleanupAfterSignal(terminal);
+    await this.waitForCleanupAfterSignal(terminal, "SIGKILL");
   }
 
-  private async signalProcess(terminal: ManagedTerminal, signal: NodeJS.Signals): Promise<void> {
-    const pid = terminal.process.pid;
-    if (terminal.killProcessGroup && pid && process.platform === "win32") {
-      await this.signalWindowsProcessGroup(terminal, pid, signal);
-      return;
-    }
-    if (terminal.killProcessGroup && pid) {
-      await this.signalPosixProcessGroup(terminal, pid, signal);
-      return;
-    }
-    terminal.process.kill(signal);
-  }
-
-  private async signalWindowsProcessGroup(
+  private async waitForCleanupAfterSignal(
     terminal: ManagedTerminal,
-    pid: number,
-    signal: NodeJS.Signals,
-  ): Promise<void> {
-    await this.captureDescendantPids(terminal, pid);
-    if (this.isRunning(terminal)) {
-      await killWindowsProcessTree(pid, signal);
-      return;
-    }
-    for (const descendantPid of terminal.descendantPids) {
-      await killWindowsProcessTree(descendantPid, signal);
-    }
+    finalSignal?: NodeJS.Signals,
+  ): Promise<boolean> {
+    return await waitForProcessTreeExit(
+      terminal.processTree,
+      () => this.isRunning(terminal),
+      this.killGraceMs,
+      finalSignal,
+    );
   }
+}
 
-  private async signalPosixProcessGroup(
-    terminal: ManagedTerminal,
-    pid: number,
-    signal: NodeJS.Signals,
-  ): Promise<void> {
-    await this.captureDescendantPids(terminal, pid);
-    if (hasLiveProcessGroup(pid)) {
-      sendSignal(-pid, signal);
-      return;
-    }
-    for (const descendantPid of terminal.descendantPids) {
-      sendSignal(descendantPid, signal);
-    }
+function waitForReadableCompletion(stream: Readable): Promise<void> {
+  if (stream.readableEnded || stream.closed) {
+    return Promise.resolve();
   }
+  return new Promise<void>((resolve) => {
+    const finish = (): void => {
+      stream.off("end", finish);
+      stream.off("close", finish);
+      resolve();
+    };
+    stream.once("end", finish);
+    stream.once("close", finish);
+  });
+}
 
-  private async captureDescendantPids(terminal: ManagedTerminal, pid: number): Promise<void> {
-    if (!this.isRunning(terminal)) {
-      await terminal.processGroupSnapshotPromise?.catch(() => {
-        // ignore best-effort process group snapshot failures
-      });
-    }
-    for (const descendantPid of await listDescendantPids(pid)) {
-      terminal.descendantPids.add(descendantPid);
-    }
-  }
-
-  private async waitForCleanupAfterSignal(terminal: ManagedTerminal): Promise<boolean> {
-    return await Promise.race([
-      this.waitForTerminalAndTrackedDescendants(terminal).then(() => true),
-      waitMs(this.killGraceMs).then(() => false),
-    ]);
-  }
-
-  private async waitForTerminalAndTrackedDescendants(terminal: ManagedTerminal): Promise<void> {
-    await terminal.exitPromise;
-    while (hasLiveTerminalProcessGroup(terminal)) {
-      await waitMs(25);
-    }
-    while (hasLivePid(terminal.descendantPids)) {
-      await waitMs(25);
-    }
-  }
+async function waitForTerminalOutputDrain(outputDrained: Promise<void>): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, TERMINAL_OUTPUT_DRAIN_GRACE_MS);
+    void outputDrained.then(() => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
 }
 
 async function spawnTerminalProcess(
@@ -626,259 +610,4 @@ function commandPathExists(command: string, cwd: string): boolean {
   }
   const resolvedPath = path.isAbsolute(command) ? command : path.resolve(cwd, command);
   return fs.existsSync(resolvedPath);
-}
-
-async function listDescendantPids(rootPid: number): Promise<number[]> {
-  let output: string;
-  try {
-    output = await runProcessListCommand();
-  } catch {
-    return [];
-  }
-
-  const childrenByParent = new Map<number, number[]>();
-  for (const line of output.split("\n")) {
-    addProcessListLine(childrenByParent, line);
-  }
-
-  const descendants: number[] = [];
-  const queue = [...(childrenByParent.get(rootPid) ?? [])];
-  for (let index = 0; index < queue.length; index += 1) {
-    const pid = queue[index];
-    descendants.push(pid);
-    queue.push(...(childrenByParent.get(pid) ?? []));
-  }
-  return descendants;
-}
-
-function addProcessListLine(childrenByParent: Map<number, number[]>, line: string): void {
-  const parsed = parseProcessListLine(line);
-  if (!parsed) {
-    return;
-  }
-
-  const children = childrenByParent.get(parsed.parentPid);
-  if (children) {
-    children.push(parsed.pid);
-  } else {
-    childrenByParent.set(parsed.parentPid, [parsed.pid]);
-  }
-}
-
-function parseProcessListLine(line: string): { pid: number; parentPid: number } | undefined {
-  const match = line.trim().match(/^(\d+)\s+(\d+)$/);
-  if (!match) {
-    return undefined;
-  }
-
-  const pid = Number(match[1]);
-  const parentPid = Number(match[2]);
-  if (!Number.isInteger(pid) || !Number.isInteger(parentPid) || pid <= 0 || parentPid <= 0) {
-    return undefined;
-  }
-  return { pid, parentPid };
-}
-
-async function runProcessListCommand(): Promise<string> {
-  if (process.platform === "win32") {
-    return await runWindowsProcessListCommand();
-  }
-
-  return await new Promise<string>((resolve, reject) => {
-    const child = spawn("ps", ["-eo", "pid=,ppid="], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      if (code === 0) {
-        resolve(stdout);
-        return;
-      }
-      reject(
-        new Error(`ps exited with code ${code ?? "null"} signal ${signal ?? "null"}: ${stderr}`),
-      );
-    });
-  });
-}
-
-async function rememberProcessGroupPids(terminal: ManagedTerminal): Promise<void> {
-  const processGroupId = terminal.process.pid;
-  if (!terminal.killProcessGroup || !processGroupId) {
-    return;
-  }
-
-  if (process.platform === "win32") {
-    for (const pid of await listDescendantPids(processGroupId)) {
-      terminal.descendantPids.add(pid);
-    }
-    return;
-  }
-
-  for (const pid of await listProcessGroupPids(processGroupId)) {
-    if (pid !== processGroupId) {
-      terminal.descendantPids.add(pid);
-    }
-  }
-}
-
-async function listProcessGroupPids(processGroupId: number): Promise<number[]> {
-  let output: string;
-  try {
-    output = await runProcessGroupListCommand();
-  } catch {
-    return [];
-  }
-
-  const pids: number[] = [];
-  for (const line of output.split("\n")) {
-    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
-    if (!match) {
-      continue;
-    }
-
-    const pid = Number(match[1]);
-    const pgid = Number(match[2]);
-    if (Number.isInteger(pid) && Number.isInteger(pgid) && pid > 0 && pgid === processGroupId) {
-      pids.push(pid);
-    }
-  }
-  return pids;
-}
-
-async function runProcessGroupListCommand(): Promise<string> {
-  return await new Promise<string>((resolve, reject) => {
-    const child = spawn("ps", ["-eo", "pid=,pgid="], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      if (code === 0) {
-        resolve(stdout);
-        return;
-      }
-      reject(
-        new Error(`ps exited with code ${code ?? "null"} signal ${signal ?? "null"}: ${stderr}`),
-      );
-    });
-  });
-}
-
-async function runWindowsProcessListCommand(): Promise<string> {
-  return await new Promise<string>((resolve, reject) => {
-    const command = [
-      "Get-CimInstance Win32_Process |",
-      'ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }',
-    ].join(" ");
-    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      if (code === 0) {
-        resolve(stdout);
-        return;
-      }
-      reject(
-        new Error(
-          `powershell process list exited with code ${code ?? "null"} signal ${
-            signal ?? "null"
-          }: ${stderr}`,
-        ),
-      );
-    });
-  });
-}
-
-async function killWindowsProcessTree(pid: number, signal: NodeJS.Signals): Promise<void> {
-  const args = ["/pid", String(pid), "/t"];
-  if (signal === "SIGKILL") {
-    args.push("/f");
-  }
-  await new Promise<void>((resolve) => {
-    const child = spawn("taskkill", args, {
-      stdio: ["ignore", "ignore", "ignore"],
-      windowsHide: true,
-    });
-    child.once("error", () => resolve());
-    child.once("close", () => resolve());
-  });
-}
-
-function sendSignal(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(pid, signal);
-  } catch {
-    // Process tree cleanup is best-effort because descendants can exit between ps and kill.
-  }
-}
-
-function hasLiveProcessGroup(processGroupId: number): boolean {
-  try {
-    process.kill(-processGroupId, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function hasLiveTerminalProcessGroup(terminal: ManagedTerminal): boolean {
-  const pid = terminal.process.pid;
-  return Boolean(
-    terminal.killProcessGroup && pid && process.platform !== "win32" && hasLiveProcessGroup(pid),
-  );
-}
-
-function hasLivePid(pids: Set<number>): boolean {
-  for (const pid of pids) {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      pids.delete(pid);
-    }
-  }
-  return false;
 }

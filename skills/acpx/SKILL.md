@@ -35,7 +35,7 @@ Core capabilities:
 - Structured streaming output (`text`, `json`, `quiet`) with optional `--suppress-reads`
 - Built-in agent registry plus raw `--agent` escape hatch
 - Claude system prompt override via `--system-prompt` / `--append-system-prompt`
-- Optional terminal capability disable via `--no-terminal` for review-only flows
+- Optional ACP filesystem and terminal capability opt-outs via `--no-fs` and `--no-terminal`
 - Tool whitelist (`--allowed-tools`), turn cap (`--max-turns`), retry on transient failures (`--prompt-retries`)
 - Multi-agent flows via `acpx flow run` and the `acpx/flows` authoring API (`defineFlow`, `decision`, `decisionEdge`, `acp`, `action`, `compute`, `checkpoint`)
 
@@ -83,7 +83,7 @@ Friendly agent names resolve to commands:
 
 - `pi` -> `npx pi-acp`
 - `openclaw` -> `openclaw acp`
-- `codex` -> `npx -y @agentclientprotocol/codex-acp`
+- `codex` -> `npx -y @agentclientprotocol/codex-acp` (ACPX-owned package range)
 - `claude` -> `npx -y @agentclientprotocol/claude-agent-acp` (ACPX-owned package range)
 - `gemini` -> `gemini --acp`
 - `cursor` -> `cursor-agent acp`
@@ -95,12 +95,14 @@ Friendly agent names resolve to commands:
 - `kilocode` -> `npx -y @kilocode/cli acp`
 - `kimi` -> `kimi acp`
 - `kiro` -> `kiro-cli-chat acp`
-- `mux` -> `npx -y mux@^0.27.0 acp`
+- `mux` -> `mux acp` via an ACPX-owned npm range
 - `opencode` -> `npx -y opencode-ai acp`
+- `pool` -> `pool acp`
 - `qoder` -> `qodercli --acp`
   Forwards Qoder-native `--allowed-tools` and `--max-turns` startup flags from `acpx` session options.
 - `qwen` -> `qwen --acp`
 - `trae` -> `traecli acp serve`
+- `zeroclaw` -> `zeroclaw acp`
 
 Rules:
 
@@ -174,8 +176,8 @@ Behavior:
 ```bash
 acpx codex cancel
 acpx codex set-mode auto
-acpx codex set model gpt-5.2[high]
-acpx codex set model gpt-5.4
+acpx codex set model gpt-5.6-sol
+acpx codex set reasoning_effort max
 ```
 
 Behavior:
@@ -184,7 +186,7 @@ Behavior:
 - `set-mode`: calls ACP `session/set_mode`.
 - `set-mode` mode ids are adapter-defined; unsupported values are rejected by the adapter (often `Invalid params`).
 - `set`: calls ACP `session/set_config_option`.
-- For codex, reasoning effort is selected through advertised ACP model ids when the adapter reports model variants.
+- Current codex-acp releases expose `model` and `reasoning_effort` as separate config options.
 - `--model <id>`: Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.
 - `set model <id>`: uses `session/set_config_option` for advertised model config options and preserves `session/set_model` for explicitly advertised legacy models.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
@@ -268,6 +270,7 @@ Behavior:
 - `--allowed-tools <list>`: comma-separated tool whitelist (use `""` for no tools)
 - `--max-turns <count>`: cap session turn count
 - `--prompt-retries <count>`: retry failed prompt turns on transient errors (default `0`)
+- `--no-fs`: advertise both ACP filesystem capabilities as disabled so compatible agents use their native file operations
 - `--no-terminal`: do not advertise the ACP terminal capability — useful for review-only or sandboxed agent invocations
 - `--verbose`: verbose ACP/debug logs to stderr
 
@@ -332,7 +335,7 @@ Supported keys:
 - `ttl` (seconds)
 - `timeout` (seconds or `null`)
 - `format` (`text`, `json`, `quiet`)
-- `agents` map (`name -> { command, args? }`)
+- `agents` map (`name -> { argv: [executable, ...args] }`); structured argv is required on Windows, and legacy `{ command, args }` entries migrate automatically
 - `auth` map (`authMethodId -> credential`)
 
 Use `acpx config show` to inspect the resolved config and `acpx config init` to create the global template.

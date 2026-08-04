@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import { AGENT_ARGV_REGISTRY, AGENT_REGISTRY } from "../src/agent-registry.js";
 import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import {
   fileExists,
@@ -16,6 +17,8 @@ import {
 type SessionModule = typeof import("../src/session/session.js");
 
 const SESSION_MODULE_URL = new URL("../src/session/session.js", import.meta.url);
+const SESSION_REPOSITORY_URL = new URL("../src/session/persistence/repository.js", import.meta.url);
+const SESSION_WRITE_LOCK_URL = new URL("../src/session/persistence/write-lock.js", import.meta.url);
 
 test("SessionRecord allows optional closed and closedAt fields", () => {
   const record = makeSessionRecord({
@@ -27,6 +30,70 @@ test("SessionRecord allows optional closed and closedAt fields", () => {
 
   assert.equal(record.closed, false);
   assert.equal(record.closedAt, undefined);
+});
+
+test("parseSessionRecord preserves structured agent argv", () => {
+  const serialized = serializeSessionRecordForDisk(
+    makeSessionRecord({
+      acpxRecordId: "structured-agent-argv",
+      acpSessionId: "structured-agent-argv",
+      agentCommand: '"C:\\\\tools\\\\bin\\\\agent.sh"',
+      agentArgv: ["C:\\tools\\bin\\agent.sh", "--pipe", "\\\\.\\pipe\\acpx-agent"],
+      cwd: "/tmp/structured-agent-argv",
+    }),
+  );
+
+  const parsed = parseSessionRecord(serialized);
+
+  assert.ok(parsed);
+  assert.deepEqual(parsed.agentArgv, [
+    "C:\\tools\\bin\\agent.sh",
+    "--pipe",
+    "\\\\.\\pipe\\acpx-agent",
+  ]);
+});
+
+test("parseSessionRecord backfills argv for legacy built-in records", () => {
+  const serialized = serializeSessionRecordForDisk(
+    makeSessionRecord({
+      acpxRecordId: "legacy-built-in-argv",
+      acpSessionId: "legacy-built-in-argv",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: "/tmp/legacy-built-in-argv",
+    }),
+  );
+  delete serialized.agent_argv;
+
+  const parsed = parseSessionRecord(serialized);
+
+  assert.ok(parsed);
+  assert.deepEqual(parsed.agentArgv, AGENT_ARGV_REGISTRY.codex);
+});
+
+test("parseSessionRecord backfills argv for historical built-in commands", () => {
+  for (const [agentCommand, expectedArgv] of [
+    ["npx @zed-industries/codex-acp@^0.12.0", AGENT_ARGV_REGISTRY.codex],
+    ["npm exec @agentclientprotocol/claude-agent-acp@^0.37.0", AGENT_ARGV_REGISTRY.claude],
+    ["npx -y mux@^0.27.0 acp", AGENT_ARGV_REGISTRY.mux],
+    ["gemini --experimental-acp", AGENT_ARGV_REGISTRY.gemini],
+    ["kiro-cli acp", AGENT_ARGV_REGISTRY.kiro],
+    ["npx opencode-ai", AGENT_ARGV_REGISTRY.opencode],
+  ] as const) {
+    const serialized = serializeSessionRecordForDisk(
+      makeSessionRecord({
+        acpxRecordId: agentCommand,
+        acpSessionId: agentCommand,
+        agentCommand,
+        cwd: "/tmp/historical-built-in-argv",
+      }),
+    );
+    delete serialized.agent_argv;
+
+    const parsed = parseSessionRecord(serialized);
+
+    assert.ok(parsed);
+    assert.deepEqual(parsed.agentArgv, expectedArgv);
+  }
 });
 
 test("parseSessionRecord preserves persisted session env", () => {
@@ -498,6 +565,388 @@ test("writeSessionRecord maintains an index and listSessions rebuilds it when mi
   });
 });
 
+test("a dirty marker rebuilds index metadata after an interrupted record update", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const recordPath = sessionFilePath(homeDir, "dirty-index-session");
+    const dirtyPath = path.join(sessionDir, ".index.dirty");
+    const cwd = path.join(homeDir, "repo");
+    const initial = makeSessionRecord({
+      acpxRecordId: "dirty-index-session",
+      acpSessionId: "dirty-index-session",
+      agentCommand: "agent-a",
+      cwd,
+      closed: false,
+    });
+    await writeSessionRecord(homeDir, initial);
+    await session.listSessions();
+
+    await fs.writeFile(
+      recordPath,
+      `${JSON.stringify(
+        serializeSessionRecordForDisk({
+          ...initial,
+          closed: true,
+          closedAt: "2026-01-01T00:00:00.000Z",
+        }),
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await fs.writeFile(dirtyPath, "interrupted\n", "utf8");
+
+    const found = await session.findSession({
+      agentCommand: "agent-a",
+      cwd,
+    });
+    assert.equal(found, undefined);
+    assert.equal(await fileExists(dirtyPath), false);
+  });
+});
+
+test("writeSessionRecord serializes cross-process record and index publication", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const indexPath = path.join(sessionDir, "index.json");
+    const firstReadyPath = path.join(homeDir, "first-index-ready");
+    const releaseFirstPath = path.join(homeDir, "release-first-index");
+    const firstRecord = makeSessionRecord({
+      acpxRecordId: "concurrent-first",
+      acpSessionId: "concurrent-first",
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "first"),
+    });
+    const secondRecord = makeSessionRecord({
+      acpxRecordId: "concurrent-second",
+      acpSessionId: "concurrent-second",
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "second"),
+    });
+    const first = spawnSessionRecordWriter({
+      homeDir,
+      record: firstRecord,
+      pauseIndexPath: indexPath,
+      readyPath: firstReadyPath,
+      releasePath: releaseFirstPath,
+    });
+    const firstResult = waitForSuccessfulChild(first);
+    void firstResult.catch(() => undefined);
+    let second: ChildProcess | undefined;
+
+    try {
+      await waitForFile(firstReadyPath);
+      second = spawnSessionRecordWriter({ homeDir, record: secondRecord });
+      const secondResult = waitForSuccessfulChild(second);
+
+      await Promise.race([secondResult, sleep(1_000)]);
+      await fs.writeFile(releaseFirstPath, "release\n", "utf8");
+      await Promise.all([firstResult, secondResult]);
+
+      const index = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+        entries?: Array<{ acpxRecordId?: string }>;
+      };
+      assert.deepEqual(index.entries?.map((entry) => entry.acpxRecordId).toSorted(), [
+        "concurrent-first",
+        "concurrent-second",
+      ]);
+    } finally {
+      await fs.writeFile(releaseFirstPath, "release\n", "utf8").catch(() => {});
+      stopChild(first);
+      if (second) {
+        stopChild(second);
+      }
+    }
+  });
+});
+
+test("writeSessionRecord recovers a stale cross-process write lock", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "stale-writer",
+        pid: 999_999,
+        createdAt: "2000-01-01T00:00:00.000Z",
+      })}\n`,
+      "utf8",
+    );
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?write_lock_test=${Date.now()}-${Math.random()}`
+    );
+
+    await repository.writeSessionRecord(
+      makeSessionRecord({
+        acpxRecordId: "stale-lock-recovery",
+        acpSessionId: "stale-lock-recovery",
+        agentCommand: "agent-a",
+        cwd: path.join(homeDir, "stale-lock"),
+      }),
+    );
+
+    assert.equal(await fileExists(lockPath), false);
+    assert.equal(
+      (await fs.readdir(sessionDir)).some((name) => name.startsWith(".write.lock.reaper-")),
+      false,
+    );
+  });
+});
+
+test("writeSessionRecord recovers an old malformed write lock", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(lockPath, '{"lockId":', "utf8");
+    const oldTime = new Date(Date.now() - 180_000);
+    await fs.utimes(lockPath, oldTime, oldTime);
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?malformed_write_lock_test=${Date.now()}-${Math.random()}`
+    );
+
+    await repository.writeSessionRecord(
+      makeSessionRecord({
+        acpxRecordId: "malformed-lock-recovery",
+        acpSessionId: "malformed-lock-recovery",
+        agentCommand: "agent-a",
+        cwd: path.join(homeDir, "malformed-lock"),
+      }),
+    );
+
+    assert.equal(await fileExists(lockPath), false);
+  });
+});
+
+test("writeSessionRecord preserves an old identity-less lock held by a live writer", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    const record = makeSessionRecord({
+      acpxRecordId: "live-unverifiable-lock",
+      acpSessionId: "live-unverifiable-lock",
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "live-lock"),
+    });
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "live-unverifiable-writer",
+        pid: process.pid,
+        createdAt: "2000-01-01T00:00:00.000Z",
+      })}\n`,
+      "utf8",
+    );
+    const oldTime = new Date(Date.now() - 180_000);
+    await fs.utimes(lockPath, oldTime, oldTime);
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?live_unverifiable=${Date.now()}-${Math.random()}`
+    );
+    let writeSettled = false;
+    const writing = repository.writeSessionRecord(record).then(() => {
+      writeSettled = true;
+    });
+
+    try {
+      await sleep(250);
+      assert.equal(writeSettled, false);
+      assert.equal(await fileExists(sessionFilePath(homeDir, record.acpxRecordId)), false);
+
+      await fs.rm(lockPath);
+      await writing;
+      assert.equal(await fileExists(sessionFilePath(homeDir, record.acpxRecordId)), true);
+    } finally {
+      await fs.rm(lockPath, { force: true });
+      await writing.catch(() => undefined);
+    }
+  });
+});
+
+test("session write locks are not visible until their complete record is published", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    await fs.mkdir(sessionDir, { recursive: true });
+    const { withSessionWriteLock } = await import(
+      `${SESSION_WRITE_LOCK_URL.href}?atomic_publication=${Date.now()}-${Math.random()}`
+    );
+    const originalWriteFile = fs.writeFile.bind(fs);
+    let releaseWrite: (() => void) | undefined;
+    const writeReleased = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let partialWriteReady: (() => void) | undefined;
+    const partialWriteStarted = new Promise<void>((resolve) => {
+      partialWriteReady = resolve;
+    });
+    let intercepted = false;
+
+    Object.defineProperty(fs, "writeFile", {
+      configurable: true,
+      value: async (
+        file: Parameters<typeof fs.writeFile>[0],
+        data: Parameters<typeof fs.writeFile>[1],
+        options?: Parameters<typeof fs.writeFile>[2],
+      ) => {
+        const fileName =
+          typeof file === "string"
+            ? path.basename(file)
+            : file instanceof URL
+              ? path.basename(file.pathname)
+              : Buffer.isBuffer(file)
+                ? path.basename(file.toString())
+                : "";
+        if (!intercepted && fileName.startsWith(".write.lock")) {
+          intercepted = true;
+          await originalWriteFile(file, '{"lockId":', options);
+          partialWriteReady?.();
+          await writeReleased;
+          await originalWriteFile(file, data, {
+            encoding: "utf8",
+            flag: "w",
+            mode: 0o600,
+          });
+          return;
+        }
+        return await originalWriteFile(file, data, options);
+      },
+    });
+
+    const lockedOperation = withSessionWriteLock(sessionDir, async () => {});
+    let publishedWhilePartial = false;
+    try {
+      await partialWriteStarted;
+      publishedWhilePartial = await fileExists(lockPath);
+    } finally {
+      Object.defineProperty(fs, "writeFile", {
+        configurable: true,
+        value: originalWriteFile,
+      });
+      releaseWrite?.();
+      await lockedOperation;
+    }
+
+    assert.equal(publishedWhilePartial, false);
+    assert.equal(
+      (await fs.readdir(sessionDir)).some((name) => name.startsWith(".write.lock.")),
+      false,
+    );
+  });
+});
+
+test("session write lock reentrancy canonicalizes symlink aliases", async () => {
+  await withTempHome(async (homeDir) => {
+    const realSessionDir = path.join(homeDir, "real-sessions");
+    const aliasSessionDir = path.join(homeDir, "session-alias");
+    await fs.mkdir(realSessionDir, { recursive: true });
+    await fs.symlink(
+      realSessionDir,
+      aliasSessionDir,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const { withSessionWriteLock } = await import(
+      `${SESSION_WRITE_LOCK_URL.href}?symlink_reentrancy=${Date.now()}-${Math.random()}`
+    );
+    let nestedOperationRan = false;
+
+    await withSessionWriteLock(aliasSessionDir, async () => {
+      await withSessionWriteLock(realSessionDir, async () => {
+        nestedOperationRan = true;
+      });
+    });
+
+    assert.equal(nestedOperationRan, true);
+  });
+});
+
+test("session write locks preserve live owners without a verifiable process identity", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionDir = path.join(homeDir, "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "live-legacy-writer",
+        pid: process.pid,
+        createdAt: "2000-01-01T00:00:00.000Z",
+      })}\n`,
+      "utf8",
+    );
+    const staleTime = new Date("2000-01-01T00:00:00.000Z");
+    await fs.utimes(lockPath, staleTime, staleTime);
+    const writeLockModule = await import(
+      `${SESSION_WRITE_LOCK_URL.href}?live_legacy=${Date.now()}-${Math.random()}`
+    );
+
+    assert.equal(
+      await writeLockModule.sessionWriteLockIsStale(lockPath, await fs.lstat(lockPath)),
+      false,
+    );
+  });
+});
+
+test("pruneSessions waits for a concurrent session writer before selecting records", async () => {
+  await withTempHome(async (homeDir) => {
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?prune_writer_test=${Date.now()}-${Math.random()}`
+    );
+    const session = await loadSessionModule();
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const indexPath = path.join(sessionDir, "index.json");
+    const readyPath = path.join(homeDir, "writer-holds-session-lock");
+    const releasePath = path.join(homeDir, "release-session-writer");
+    const initial = makeSessionRecord({
+      acpxRecordId: "prune-writer-session",
+      acpSessionId: "prune-writer-session",
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "prune-writer"),
+      closed: true,
+      closedAt: "2020-01-01T00:00:00.000Z",
+    });
+    await repository.writeSessionRecord(initial);
+
+    const writer = spawnSessionRecordWriter({
+      homeDir,
+      record: {
+        ...initial,
+        closed: false,
+        closedAt: undefined,
+        lastUsedAt: new Date().toISOString(),
+      },
+      pauseIndexPath: indexPath,
+      readyPath,
+      releasePath,
+    });
+    const writerResult = waitForSuccessfulChild(writer);
+    void writerResult.catch(() => undefined);
+    let pruneSettled = false;
+
+    try {
+      await waitForFile(readyPath);
+      const pruneResult = session.pruneSessions({ agentCommand: "agent-a" }).then((result) => {
+        pruneSettled = true;
+        return result;
+      });
+      await sleep(250);
+      assert.equal(pruneSettled, false);
+
+      await fs.writeFile(releasePath, "release\n", "utf8");
+      await writerResult;
+      const result = await pruneResult;
+      assert.equal(result.pruned.length, 0);
+      assert.equal(await fileExists(sessionFilePath(homeDir, initial.acpxRecordId)), true);
+    } finally {
+      await fs.writeFile(releasePath, "release\n", "utf8").catch(() => undefined);
+      stopChild(writer);
+    }
+  });
+});
+
 test("closeSession soft-closes and terminates matching process", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
@@ -543,6 +992,89 @@ test("closeSession soft-closes and terminates matching process", async () => {
   });
 });
 
+test("closeSession does not signal a live process that does not match the recorded agent", async () => {
+  await withTempHome(async (homeDir) => {
+    const repository = await import(
+      `${SESSION_REPOSITORY_URL.href}?close_process_match=${Date.now()}-${Math.random()}`
+    );
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+      stdio: "ignore",
+    });
+    await once(child, "spawn");
+
+    const sessionId = "mismatched-live-session";
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: sessionId,
+        acpSessionId: sessionId,
+        agentCommand: "definitely-not-the-node-runtime",
+        cwd: path.join(homeDir, "repo"),
+        pid: child.pid,
+      }),
+    );
+
+    try {
+      await repository.closeSession(sessionId);
+      await sleep(100);
+      assert.equal(await waitForExit(child.pid), false);
+    } finally {
+      stopChild(child);
+    }
+  });
+});
+
+test("closeSession reads and updates the record while holding the session write lock", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const sessionDir = path.join(homeDir, ".acpx", "sessions");
+    const lockPath = path.join(sessionDir, ".write.lock");
+    const sessionId = "concurrent-close";
+    const initial = makeSessionRecord({
+      acpxRecordId: sessionId,
+      acpSessionId: sessionId,
+      agentCommand: "agent-a",
+      cwd: path.join(homeDir, "repo"),
+      title: "initial title",
+    });
+    await writeSessionRecord(homeDir, initial);
+    await session.listSessions();
+    await fs.writeFile(
+      lockPath,
+      `${JSON.stringify({
+        lockId: "active-writer",
+        pid: process.pid,
+        createdAt: new Date().toISOString(),
+      })}\n`,
+      "utf8",
+    );
+
+    const closing = session.closeSession(sessionId);
+    await sleep(200);
+    await fs.writeFile(
+      sessionFilePath(homeDir, sessionId),
+      `${JSON.stringify(
+        serializeSessionRecordForDisk({
+          ...initial,
+          title: "concurrent title",
+        }),
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await fs.unlink(lockPath);
+
+    await closing;
+    const stored = parseSessionRecord(
+      JSON.parse(await fs.readFile(sessionFilePath(homeDir, sessionId), "utf8")),
+    );
+    assert.ok(stored);
+    assert.equal(stored.closed, true);
+    assert.equal(stored.title, "concurrent title");
+  });
+});
+
 test("normalizeQueueOwnerTtlMs applies default and edge-case normalization", async () => {
   await withTempHome(async () => {
     const session = await loadSessionModule();
@@ -576,6 +1108,82 @@ function makeSessionRecord(
   overrides: Parameters<typeof makeSessionRecordFixture>[0],
 ): ReturnType<typeof makeSessionRecordFixture> {
   return makeSessionRecordFixture(overrides, { defaultName: false, defaultAcpx: false });
+}
+
+function spawnSessionRecordWriter(options: {
+  homeDir: string;
+  record: ReturnType<typeof makeSessionRecord>;
+  pauseIndexPath?: string;
+  readyPath?: string;
+  releasePath?: string;
+}): ChildProcess {
+  const script = `
+    import fs from "node:fs/promises";
+    const pauseIndexPath = ${JSON.stringify(options.pauseIndexPath)};
+    const readyPath = ${JSON.stringify(options.readyPath)};
+    const releasePath = ${JSON.stringify(options.releasePath)};
+    if (pauseIndexPath && readyPath && releasePath) {
+      const originalRename = fs.rename.bind(fs);
+      let paused = false;
+      fs.rename = async (source, destination) => {
+        if (!paused && String(destination) === pauseIndexPath) {
+          paused = true;
+          await fs.writeFile(readyPath, "ready\\n", "utf8");
+          for (;;) {
+            try {
+              await fs.access(releasePath);
+              break;
+            } catch {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+          }
+        }
+        return await originalRename(source, destination);
+      };
+    }
+    const repository = await import(${JSON.stringify(SESSION_REPOSITORY_URL.href)});
+    await repository.writeSessionRecord(${JSON.stringify(options.record)});
+  `;
+  return spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: options.homeDir },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+}
+
+async function waitForSuccessfulChild(child: ChildProcess): Promise<void> {
+  const stderrChunks: Buffer[] = [];
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderrChunks.push(chunk);
+  });
+  const [code, signal] = (await once(child, "close")) as [number | null, string | null];
+  assert.equal(
+    code,
+    0,
+    `session writer failed: signal=${signal ?? "none"} stderr=${Buffer.concat(stderrChunks).toString("utf8")}`,
+  );
+}
+
+function stopChild(child: ChildProcess): void {
+  if (child.exitCode == null && child.signalCode == null) {
+    child.kill("SIGKILL");
+  }
+}
+
+async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fileExists(filePath)) {
+      return;
+    }
+    await sleep(10);
+  }
+  throw new Error(`Timed out waiting for file: ${filePath}`);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function waitForExit(pid: number | undefined): Promise<boolean> {

@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 env:
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
   NODE_VERSION: 24.11.0
 
 jobs:
@@ -175,6 +175,11 @@ jobs:
           # Copyleft terms would change acpx's distribution terms, and the
           # single executable ships every dependency inside one file.
           deny-licenses: AGPL-3.0, GPL-3.0
+          # Dependency Review reported EPL-2.0 OR GPL-3.0-or-later for the
+          # dev-only replay viewer dependency; acpx elects EPL-2.0.
+          # This exemption skips every license check for exactly that package version;
+          # any elkjs upgrade must be reviewed and re-pinned explicitly.
+          allow-dependencies-licenses: pkg:npm/elkjs@0.12.0
 
   audit:
     name: Dependency audit
@@ -203,8 +208,8 @@ jobs:
         # the build on one trains people to ignore this job.
         run: |
           set -uo pipefail
-          # Distinguish "found advisories" from "could not run". pnpm 10.33.2
-          # crashes on a gzipped audit response with
+          # Distinguish "found advisories" from "could not run". Some pnpm
+          # versions crash on a gzipped audit response with
           # `Unexpected token '\x1f' ... is not valid JSON`, which is a
           # transport bug, not a finding. Failing the build on it would make a
           # red audit job mean nothing, and a real advisory would be ignored
